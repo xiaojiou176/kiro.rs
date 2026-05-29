@@ -5,6 +5,8 @@ mod common;
 mod http_client;
 mod kiro;
 mod model;
+mod observability;
+mod image_resize;
 pub mod token;
 
 use std::collections::HashMap;
@@ -23,21 +25,48 @@ async fn main() {
     // 解析命令行参数
     let args = Args::parse();
 
-    // 初始化日志
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
-    // 解析配置/凭证路径
+    // 解析配置/凭证路径（先于日志初始化，因为日志目录与凭据目录对齐）
     let config_path = args
         .config
+        .clone()
         .unwrap_or_else(|| Config::default_config_path().to_string());
     let credentials_path = args
         .credentials
+        .clone()
         .unwrap_or_else(|| KiroCredentials::default_credentials_path().to_string());
+
+    // 初始化日志：stdout（无 ANSI、人类可读）+ structured/info.jsonl + structured/error.jsonl
+    // 日志目录优先：$KIRO_RS_LOG_DIR > <credentials_dir>/../logs > ./logs
+    let log_dir = std::env::var("KIRO_RS_LOG_DIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::path::Path::new(&credentials_path)
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|p| p.join("logs"))
+        })
+        .unwrap_or_else(|| std::path::PathBuf::from("logs"));
+    let _logging_guards = match observability::init_logging(&log_dir) {
+        Ok(g) => {
+            tracing::info!(
+                log_dir = %log_dir.display(),
+                "observability initialized: structured JSON + rolling daily + sidecar capture/error dirs ready"
+            );
+            Some(g)
+        }
+        Err(e) => {
+            eprintln!("初始化日志失败: {e}; 退化为简易 stdout 模式");
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
+                .with_ansi(false)
+                .init();
+            None
+        }
+    };
 
     // 文件不存在时自动初始化（Docker 首次部署友好）
     ensure_config_files(&config_path, &credentials_path);

@@ -5,16 +5,19 @@ use std::sync::Arc;
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::{HeaderValue, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
 use parking_lot::RwLock;
+use tracing::Instrument;
+use uuid::Uuid;
 
 use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
+use crate::observability;
 
 use super::types::ErrorResponse;
 
@@ -126,6 +129,83 @@ pub async fn auth_middleware(
 
     let error = ErrorResponse::authentication_error();
     (StatusCode::UNAUTHORIZED, Json(error)).into_response()
+}
+
+/// Per-request observability middleware.
+///
+/// For every inbound HTTP request:
+/// 1. Reads `x-request-id` from the client; if absent, mints a fresh UUIDv4.
+/// 2. Reads `traceparent` (W3C trace-context); if absent or malformed, mints a
+///    new 32-hex `trace_id`. Either way, generates a fresh per-hop `span_id`.
+/// 3. Stuffs both into the tokio task-local scope so any downstream `async fn`
+///    can call `observability::current_request_id()` / `current_traceparent()`
+///    without threading them through every signature.
+/// 4. Wraps the rest of the request in a `tracing::info_span!` carrying
+///    `request_id` and `trace_id`, so every structured-JSON log line under
+///    this span auto-includes them — no manual `request_id=%rid` per log call.
+/// 5. Echoes `x-request-id` and `traceparent` back to the client so callers
+///    (or upstream proxies like CPA / Codex) can correlate.
+pub async fn request_id_middleware(mut request: Request<Body>, next: Next) -> Response {
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+
+    let request_id = request
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .filter(|s| !s.is_empty() && s.len() <= 128)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    let incoming_traceparent = request
+        .headers()
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+
+    let inherited_trace_id = incoming_traceparent
+        .as_deref()
+        .and_then(observability::extract_trace_id);
+    let traceparent =
+        observability::generate_traceparent(inherited_trace_id.as_deref());
+    let trace_id = observability::extract_trace_id(&traceparent).unwrap_or_default();
+
+    // Inject the upstream-facing traceparent into the request so downstream
+    // code (provider, http_client) can read it via header-stripping if needed.
+    if let Ok(tp_val) = HeaderValue::from_str(&traceparent) {
+        request.headers_mut().insert("traceparent", tp_val);
+    }
+    if let Ok(rid_val) = HeaderValue::from_str(&request_id) {
+        request.headers_mut().insert("x-request-id", rid_val);
+    }
+
+    let span = tracing::info_span!(
+        "http_request",
+        request_id = %request_id,
+        trace_id = %trace_id,
+        method = %method,
+        path = %path,
+    );
+
+    let response_request_id = request_id.clone();
+    let response_traceparent = traceparent.clone();
+
+    let mut response = observability::REQUEST_ID
+        .scope(request_id, async move {
+            observability::TRACE_PARENT
+                .scope(traceparent, async move { next.run(request).await })
+                .await
+        })
+        .instrument(span)
+        .await;
+
+    if let Ok(v) = HeaderValue::from_str(&response_request_id) {
+        response.headers_mut().insert("x-request-id", v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&response_traceparent) {
+        response.headers_mut().insert("traceparent", v);
+    }
+    response
 }
 
 /// CORS 中间件层

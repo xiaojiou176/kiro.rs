@@ -17,6 +17,7 @@ use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
+use crate::observability;
 use parking_lot::Mutex;
 
 /// 每个凭据的最大重试次数
@@ -171,13 +172,44 @@ impl KiroProvider {
             let url = endpoint.mcp_url(&rctx);
             let body = endpoint.transform_mcp_body(request_body, &rctx);
 
+            let traceparent = observability::current_traceparent();
             let base = self
                 .client_for(&ctx.credentials)?
                 .post(&url)
-                .body(body)
+                .body(body.clone())
                 .header("content-type", endpoint.content_type())
                 .header("Connection", "close");
+            let base = if !traceparent.is_empty() {
+                base.header("traceparent", traceparent)
+            } else {
+                base
+            };
             let request = endpoint.decorate_mcp(base, &rctx);
+
+            // KIRO_RS_CAPTURE=1 时也抓 MCP/WebSearch 出站包
+            if observability::capture_enabled() {
+                if let Ok(built) = request.try_clone().map(|r| r.build()).transpose() {
+                    if let Some(req) = built {
+                        let captured_headers: Vec<(String, String)> = req
+                            .headers()
+                            .iter()
+                            .map(|(k, v)| {
+                                (
+                                    k.as_str().to_string(),
+                                    v.to_str().unwrap_or("<binary>").to_string(),
+                                )
+                            })
+                            .collect();
+                        observability::capture_outbound(
+                            "POST",
+                            req.url().as_str(),
+                            &captured_headers,
+                            &body,
+                            "outbound-kiro-mcp",
+                        );
+                    }
+                }
+            }
 
             let response = match request.send().await {
                 Ok(resp) => resp,
@@ -331,12 +363,18 @@ impl KiroProvider {
             tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
             tracing::debug!("实际发送请求体: {}", body);
 
+            let traceparent = observability::current_traceparent();
             let base = self
                 .client_for(&ctx.credentials)?
                 .post(&url)
-                .body(body)
+                .body(body.clone())
                 .header("content-type", endpoint.content_type())
                 .header("Connection", "close");
+            let base = if !traceparent.is_empty() {
+                base.header("traceparent", traceparent)
+            } else {
+                base
+            };
             let request = endpoint.decorate_api(base, &rctx);
 
             // 打印实际发送的请求头（RUST_LOG=debug 时输出，便于排查问题）
@@ -346,6 +384,28 @@ impl KiroProvider {
                     tracing::debug!("  header {}: {}", k, v.to_str().unwrap_or("<binary>"));
                 }
             }
+
+            // KIRO_RS_CAPTURE=1 时把真发包落盘 — 不挂 mitm 也能验证 output_config.effort=max 之类
+            if observability::capture_enabled() {
+                let captured_headers: Vec<(String, String)> = request
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.as_str().to_string(),
+                            v.to_str().unwrap_or("<binary>").to_string(),
+                        )
+                    })
+                    .collect();
+                observability::capture_outbound(
+                    "POST",
+                    request.url().as_str(),
+                    &captured_headers,
+                    &body,
+                    "outbound-kiro-api",
+                );
+            }
+
             let response = match self.client_for(&ctx.credentials)?.execute(request).await {
                 Ok(resp) => resp,
                 Err(e) => {

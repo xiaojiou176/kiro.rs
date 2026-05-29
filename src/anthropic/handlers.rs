@@ -121,12 +121,62 @@ fn extract_api_key_from_headers(headers: &HeaderMap) -> String {
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
+///
+/// 同时把上游原始 body 落到 `logs/errors/{ts}-{request_id}-{kind}.json`,
+/// 方便事后用 `replay/` 工具复现 — 这样 Anthropic 400 / Bedrock 协议错位
+/// 一类的问题不需要靠 client 重发就能定位。
+/// Image-budget warning threshold (in raw base64 chars, not decoded bytes).
+/// 当一次请求里所有 image 内容的 base64 字符总数 > 这个阈值时，主动 warn。
+/// 这个阈值并不会拒收请求（让上游做最终决定），只是给运维更精准的诊断。
+const IMAGE_BUDGET_WARN_BYTES: usize = 800 * 1024;
+
+/// 一次入站请求里 image content 的预算统计。
+struct ImageBudget {
+    count: usize,
+    total_b64_bytes: usize,
+    largest_b64_bytes: usize,
+}
+
+/// 数一遍 payload 里 image 的总数 + base64 字节量。
+/// 只看 inline base64 (image source.type == "base64")，跳过 url-mode（那些不会
+/// 直接进 Bedrock 单消息体）。这是一个轻量 O(N) 扫描，不解码 base64。
+fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
+    let mut count = 0usize;
+    let mut total = 0usize;
+    let mut largest = 0usize;
+    for msg in &payload.messages {
+        if let serde_json::Value::Array(arr) = &msg.content {
+            for item in arr {
+                if item.get("type").and_then(|v| v.as_str()) != Some("image") {
+                    continue;
+                }
+                let Some(src) = item.get("source") else { continue };
+                if src.get("type").and_then(|v| v.as_str()) != Some("base64") {
+                    continue;
+                }
+                let n = src.get("data").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
+                count += 1;
+                total += n;
+                if n > largest {
+                    largest = n;
+                }
+            }
+        }
+    }
+    ImageBudget {
+        count,
+        total_b64_bytes: total,
+        largest_b64_bytes: largest,
+    }
+}
+
 fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
         tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
+        crate::observability::archive_error_body("context-window-full", &err_str);
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
@@ -140,6 +190,7 @@ fn map_provider_error(err: Error) -> Response {
     // 单次输入太长（请求体本身超出上游限制）
     if err_str.contains("Input is too long") {
         tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
+        crate::observability::archive_error_body("input-too-long", &err_str);
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
@@ -149,7 +200,31 @@ fn map_provider_error(err: Error) -> Response {
         )
             .into_response();
     }
+
+    // Bedrock 客户端校验错误 (tool_use ↔ tool_result 配对错乱、消息序列违规等)
+    // 这类错误的根因在 client 发的 messages 数组本身, 不是上游故障, 不应映射成 5xx
+    // 否则会触发上游 cooldown 把 1 次 client 错放大成 30+ 次 503 风暴
+    if err_str.contains("TOOL_USE_RESULT_MISMATCH")
+        || err_str.contains("ValidationException")
+        || err_str.contains("Expected toolResult blocks")
+    {
+        tracing::warn!(
+            error = %err,
+            "client 发送的 messages 数组协议违规 (Bedrock validation, 映射为 400 防止误判 cooldown)"
+        );
+        crate::observability::archive_error_body("tool-use-result-mismatch", &err_str);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse::new(
+                "invalid_request_error",
+                format!("Invalid message sequence rejected by upstream: {}", err),
+            )),
+        )
+            .into_response();
+    }
+
     tracing::error!("Kiro API 调用失败: {}", err);
+    crate::observability::archive_error_body("upstream-bad-gateway", &err_str);
     (
         StatusCode::BAD_GATEWAY,
         Json(ErrorResponse::new(
@@ -321,13 +396,25 @@ pub async fn post_messages(
     headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
+    // 入站时统计 image 预算，给后续 context-window-full 提供精准诊断
+    let img_stats = count_image_budget(&payload);
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
         stream = %payload.stream,
         message_count = %payload.messages.len(),
+        image_count = %img_stats.count,
+        image_total_b64_kb = %(img_stats.total_b64_bytes / 1024),
+        image_largest_b64_kb = %(img_stats.largest_b64_bytes / 1024),
         "Received POST /v1/messages request"
     );
+    if img_stats.total_b64_bytes > IMAGE_BUDGET_WARN_BYTES {
+        tracing::warn!(
+            image_count = %img_stats.count,
+            image_total_b64_kb = %(img_stats.total_b64_bytes / 1024),
+            "incoming image payload is large; if upstream rejects with CONTENT_LENGTH_EXCEEDS_THRESHOLD, reduce image count or use lower-resolution screenshots"
+        );
+    }
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
     // 检查 KiroProvider 是否可用
     let provider = match &state.kiro_provider {
@@ -390,10 +477,13 @@ pub async fn post_messages(
         }
     };
 
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
+    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入；
+    // additional_model_request_fields 来自客户端 output_config，是 AWS Q 后端
+    // 识别 effort 的真协议字段，跟 XML 前缀双发出最高效力）
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -990,10 +1080,13 @@ pub async fn post_messages_cc(
         }
     };
 
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入）
+    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入；
+    // additional_model_request_fields 来自客户端 output_config，是 AWS Q 后端
+    // 识别 effort 的真协议字段，跟 XML 前缀双发出最高效力）
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
+        additional_model_request_fields: conversion_result.additional_model_request_fields,
     };
 
     let request_body = match serde_json::to_string(&kiro_request) {
@@ -1228,5 +1321,55 @@ mod tests {
 
         assert!(ids.contains(&"claude-opus-4-7"));
         assert!(ids.contains(&"claude-opus-4-7-thinking"));
+    }
+
+    #[test]
+    fn count_image_budget_handles_empty() {
+        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+            "model": "claude-opus-4-7",
+            "max_tokens": 100,
+            "messages": []
+        }"#).unwrap();
+        let stats = count_image_budget(&req);
+        assert_eq!(stats.count, 0);
+        assert_eq!(stats.total_b64_bytes, 0);
+        assert_eq!(stats.largest_b64_bytes, 0);
+    }
+
+    #[test]
+    fn count_image_budget_counts_inline_base64() {
+        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+            "model": "claude-opus-4-7",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA1111"}},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "BBBBBBBBBB"}},
+                    {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}
+                ]
+            }]
+        }"#).unwrap();
+        let stats = count_image_budget(&req);
+        assert_eq!(stats.count, 2);
+        assert_eq!(stats.total_b64_bytes, 18);
+        assert_eq!(stats.largest_b64_bytes, 10);
+    }
+
+    #[test]
+    fn count_image_budget_skips_url_only_images() {
+        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
+            "model": "claude-opus-4-7",
+            "max_tokens": 100,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}
+                ]
+            }]
+        }"#).unwrap();
+        let stats = count_image_budget(&req);
+        assert_eq!(stats.count, 0);
     }
 }

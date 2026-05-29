@@ -19,7 +19,8 @@ reqwest = { version = "0.12", default-features = false, features = ["stream", "j
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
 anyhow = "1.0"
 http = "1.0"
 futures = "0.3"
@@ -34,6 +35,13 @@ tower-http = { version = "0.6", features = ["cors"] }
 clap = { version = "4.5", features = ["derive"] }
 urlencoding = "2"
 parking_lot = "0.12"  # 高性能同步原语
+# Image resize for inbound user/MCP images so AWS Q stays within request size
+# limit. Pure-Rust, no C deps. PNG/JPEG/WebP/GIF only — keeps build slim.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+base64 = "0.22"
+thiserror = "1"
+
+
 subtle = "2.6"        # 常量时间比较（防止时序攻击）
 rust-embed = "8"      # 嵌入静态文件
 mime_guess = "2"      # MIME 类型推断

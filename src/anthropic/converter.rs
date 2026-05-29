@@ -11,11 +11,14 @@ use crate::kiro::model::requests::conversation::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, KiroImage, Message, UserInputMessage, UserInputMessageContext, UserMessage,
 };
+use crate::kiro::model::requests::kiro::{AdditionalModelRequestFields, KiroOutputConfig};
 use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
 
 use super::types::{ContentBlock, MessagesRequest};
+
+use crate::image_resize::{ResizeConfig, maybe_shrink_image};
 
 /// 规范化 JSON Schema，修复 MCP 工具定义中常见的类型问题
 /// 规范化 JSON Schema，修复工具定义中常见的类型问题
@@ -182,6 +185,9 @@ pub struct ConversionResult {
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
+    /// 附加模型请求字段（含 `output_config.effort`），由客户端 Anthropic 请求
+    /// 里的 `output_config` 字段翻译而来。空时不发送。
+    pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
 }
 
 /// 转换错误
@@ -385,9 +391,34 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         );
     }
 
+    // 14. 提取 effort 到 AdditionalModelRequestFields（Kiro CLI 真包字段）
+    //
+    // 实测 2026-05-25：AWS Q 后端真协议是 `additionalModelRequestFields.output_config.effort`，
+    // 跟 system prompt 里塞 `<thinking_effort>` XML 标签不是同一个东西。
+    // 客户端传入的 `req.output_config.effort` 在这里被翻译到真协议字段，
+    // 现有的 XML 前缀逻辑（generate_thinking_prefix）保留不动，
+    // 双发出最高效力（ladder F case 实测比单发 4x 思考深度）。
+    //
+    // P0 patch 2026-05-25：Codex APP schema 的 ReasoningEffort.enum 锁死到 xhigh，
+    // 没有 "max" 选项；而 Kiro CLI 真包发的就是 "max"。
+    // 为了让 Codex 顶档 xhigh 真打到 Kiro 顶档 max（完美复刻 Kiro CLI Max 模式），
+    // 在这里做 xhigh -> max 的字面值映射，其它档位字面透传。
+    let additional_model_request_fields = req.output_config.as_ref().map(|oc| {
+        let mapped_effort = match oc.effort.as_str() {
+            "xhigh" => "max".to_string(),
+            other => other.to_string(),
+        };
+        AdditionalModelRequestFields {
+            output_config: Some(KiroOutputConfig {
+                effort: mapped_effort,
+            }),
+        }
+    });
+
     Ok(ConversionResult {
         conversation_state,
         tool_name_map,
+        additional_model_request_fields,
     })
 }
 
@@ -421,7 +452,16 @@ fn process_message_content(
                         "image" => {
                             if let Some(source) = block.source {
                                 if let Some(format) = get_image_format(&source.media_type) {
-                                    images.push(KiroImage::from_base64(format, source.data));
+                                    let cfg = ResizeConfig::from_env();
+                                    let processed = maybe_shrink_image(
+                                        cfg,
+                                        &format,
+                                        &source.data,
+                                    );
+                                    images.push(KiroImage::from_base64(
+                                        processed.format,
+                                        processed.data_base64,
+                                    ));
                                 }
                             }
                         }
