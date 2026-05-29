@@ -7,32 +7,7 @@ use std::collections::HashMap;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::anthropic::cache::CacheResult;
 use crate::kiro::model::events::Event;
-
-fn compute_uncached_input_tokens(
-    total_input_tokens: i32,
-    cache_creation_input_tokens: i32,
-    cache_read_input_tokens: i32,
-) -> i32 {
-    (total_input_tokens - cache_creation_input_tokens - cache_read_input_tokens).max(0)
-}
-
-fn resolve_usage_input_tokens(
-    fallback_total_input_tokens: i32,
-    context_total_input_tokens: Option<i32>,
-    cache_result: &CacheResult,
-) -> i32 {
-    if cache_result.cache_creation_input_tokens > 0 || cache_result.cache_read_input_tokens > 0 {
-        return cache_result.uncached_input_tokens;
-    }
-
-    compute_uncached_input_tokens(
-        context_total_input_tokens.unwrap_or(fallback_total_input_tokens),
-        cache_result.cache_creation_input_tokens,
-        cache_result.cache_read_input_tokens,
-    )
-}
 
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
@@ -562,15 +537,19 @@ pub struct StreamContext {
     pub thinking_block_index: Option<i32>,
     /// 文本块索引（thinking 启用时动态分配）
     pub text_block_index: Option<i32>,
-    /// 缓存结果
-    pub cache_result: CacheResult,
     /// 是否需要剥离 thinking 内容开头的换行符
     /// 模型输出 `<thinking>\n` 时，`\n` 可能与标签在同一 chunk 或下一 chunk
     strip_thinking_leading_newline: bool,
+    /// 缓存写入（创建）token：来自中转层 PromptCache 计费
+    pub cache_creation_input_tokens: i32,
+    /// 缓存命中（读取）token：来自中转层 PromptCache 计费
+    pub cache_read_input_tokens: i32,
+    /// meteringEvent 上报的 credit 计费量（上游真实下发）
+    pub credits: f64,
 }
 
 impl StreamContext {
-    /// 创建启用thinking的StreamContext
+    /// 创建 StreamContext
     pub fn new_with_thinking(
         model: impl Into<String>,
         input_tokens: i32,
@@ -592,35 +571,10 @@ impl StreamContext {
             thinking_extracted: false,
             thinking_block_index: None,
             text_block_index: None,
-            cache_result: CacheResult::default(),
             strip_thinking_leading_newline: false,
-        }
-    }
-
-    /// 创建带缓存结果的StreamContext
-    pub fn new_with_cache(
-        model: impl Into<String>,
-        cache_result: CacheResult,
-        thinking_enabled: bool,
-        tool_name_map: HashMap<String, String>,
-    ) -> Self {
-        Self {
-            state_manager: SseStateManager::new(),
-            model: model.into(),
-            message_id: format!("msg_{}", Uuid::new_v4().to_string().replace('-', "")),
-            input_tokens: cache_result.uncached_input_tokens,
-            context_input_tokens: None,
-            output_tokens: 0,
-            tool_block_indices: HashMap::new(),
-            tool_name_map,
-            thinking_enabled,
-            thinking_buffer: String::new(),
-            in_thinking_block: false,
-            thinking_extracted: false,
-            thinking_block_index: None,
-            text_block_index: None,
-            cache_result,
-            strip_thinking_leading_newline: false,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            credits: 0.0,
         }
     }
 
@@ -639,8 +593,8 @@ impl StreamContext {
                 "usage": {
                     "input_tokens": self.input_tokens,
                     "output_tokens": 1,
-                    "cache_creation_input_tokens": self.cache_result.cache_creation_input_tokens,
-                    "cache_read_input_tokens": self.cache_result.cache_read_input_tokens
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
                 }
             }
         })
@@ -706,6 +660,12 @@ impl StreamContext {
                     context_usage.context_usage_percentage,
                     actual_input_tokens
                 );
+                Vec::new()
+            }
+            Event::Metering(metering) => {
+                // 上游 meteringEvent 只下发 credit；token / cache 字段不存在。
+                self.credits += metering.usage;
+                tracing::debug!("metering credits +{:.6}", metering.usage);
                 Vec::new()
             }
             Event::Error {
@@ -1171,19 +1131,15 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(" "));
         }
 
-        // contextUsageEvent 给出的是总输入，Anthropic usage.input_tokens 需返回未缓存部分
-        let final_input_tokens = resolve_usage_input_tokens(
-            self.input_tokens,
-            self.context_input_tokens,
-            &self.cache_result,
-        );
+        // input: contextUsage 真实值优先；否则用客户端估算
+        let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
 
         // 生成最终事件
         events.extend(self.state_manager.generate_final_events(
             final_input_tokens,
             self.output_tokens,
-            self.cache_result.cache_creation_input_tokens,
-            self.cache_result.cache_read_input_tokens,
+            self.cache_creation_input_tokens,
+            self.cache_read_input_tokens,
         ));
         events
     }
@@ -1212,10 +1168,6 @@ pub struct BufferedStreamContext {
 
 impl BufferedStreamContext {
     /// 创建缓冲流上下文
-    ///
-    /// 当前主流程使用 `from_stream_context` 直接复用既有上下文，本构造函数
-    /// 留给以后切换到独立缓冲流场景使用。
-    #[allow(dead_code)]
     pub fn new(
         model: impl Into<String>,
         estimated_input_tokens: i32,
@@ -1236,22 +1188,10 @@ impl BufferedStreamContext {
         }
     }
 
-    /// 创建带缓存结果的缓冲流上下文
-    pub fn new_with_cache(
-        model: impl Into<String>,
-        cache_result: CacheResult,
-        thinking_enabled: bool,
-        tool_name_map: HashMap<String, String>,
-    ) -> Self {
-        let estimated = cache_result.uncached_input_tokens;
-        let inner =
-            StreamContext::new_with_cache(model, cache_result, thinking_enabled, tool_name_map);
-        Self {
-            inner,
-            event_buffer: Vec::new(),
-            estimated_input_tokens: estimated,
-            initial_events_generated: false,
-        }
+    /// 注入由 PromptCache 计算的初始 cache_creation / cache_read tokens
+    pub fn set_initial_cache_tokens(&mut self, creation: i32, read: i32) {
+        self.inner.cache_creation_input_tokens = creation;
+        self.inner.cache_read_input_tokens = read;
     }
 
     /// 处理 Kiro 事件并缓冲结果
@@ -1284,23 +1224,26 @@ impl BufferedStreamContext {
             self.initial_events_generated = true;
         }
 
-        // 生成最终事件
+        // input: contextUsage 真实值优先；否则用客户端估算
+        let final_input_tokens = self
+            .inner
+            .context_input_tokens
+            .unwrap_or(self.estimated_input_tokens);
+        let cache_creation = self.inner.cache_creation_input_tokens;
+        let cache_read = self.inner.cache_read_input_tokens;
+
+        // 生成最终事件（StreamContext 内部会用同样的优先级）
         let final_events = self.inner.generate_final_events();
         self.event_buffer.extend(final_events);
 
-        // contextUsageEvent 给出的是总输入，回填 message_start 时需转换为未缓存部分
-        let final_input_tokens = resolve_usage_input_tokens(
-            self.estimated_input_tokens,
-            self.inner.context_input_tokens,
-            &self.inner.cache_result,
-        );
-
-        // 更正 message_start 事件中的 input_tokens
+        // 更正 message_start 事件中的 input_tokens 与 cache_* 字段
         for event in &mut self.event_buffer {
             if event.event == "message_start" {
                 if let Some(message) = event.data.get_mut("message") {
                     if let Some(usage) = message.get_mut("usage") {
                         usage["input_tokens"] = serde_json::json!(final_input_tokens);
+                        usage["cache_creation_input_tokens"] = serde_json::json!(cache_creation);
+                        usage["cache_read_input_tokens"] = serde_json::json!(cache_read);
                     }
                 }
             }
@@ -1311,24 +1254,26 @@ impl BufferedStreamContext {
 
     /// 取出最终用量（在 finish_and_get_all_events 之后调用）
     ///
-    /// 返回顺序：(input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens)
-    pub fn final_usage(&self) -> (i32, i32, i32, i32) {
-        let final_input = resolve_usage_input_tokens(
-            self.estimated_input_tokens,
-            self.inner.context_input_tokens,
-            &self.inner.cache_result,
-        );
+    /// 返回顺序：(input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits)
+    pub fn final_usage(&self) -> (i32, i32, i32, i32, f64) {
+        let final_input = self
+            .inner
+            .context_input_tokens
+            .unwrap_or(self.estimated_input_tokens);
         (
             final_input,
             self.inner.output_tokens,
-            self.inner.cache_result.cache_creation_input_tokens,
-            self.inner.cache_result.cache_read_input_tokens,
+            self.inner.cache_creation_input_tokens,
+            self.inner.cache_read_input_tokens,
+            self.inner.credits,
         )
     }
 }
 
-/// 简单的 token 估算
-fn estimate_tokens(text: &str) -> i32 {
+/// 简单的 token 估算（中英文字符混合）
+///
+/// 公开供 prompt_cache 等模块复用同一估算口径。
+pub fn estimate_tokens(text: &str) -> i32 {
     let chars: Vec<char> = text.chars().collect();
     let mut chinese_count = 0;
     let mut other_count = 0;

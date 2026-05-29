@@ -6,6 +6,84 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-05-29
+
+主题：彻底重构 prompt cache 与计费指标——上游 `meteringEvent` 实测只下发 `credit`、不带 token / cache 字段，因此把基础设施收敛到「进程内」：移除 Redis 依赖、按 Anthropic `cache_control` 多断点协议在中转层自建 prompt cache、把 `credit` 作为新维度贯穿后端聚合 → API → 前端。仪表盘同步重做：5 系列图表 + 双 Y 轴 + K/M/B 紧凑数值 + 卡片随时间窗切换。
+
+> 0.5.0 因 Credit 数值显示问题被作废（`formatCredits` 在 `value ≥ 1` 时直接打印完整浮点）；0.5.1 修复该问题并整合所有内容，请所有用户直接升级到 0.5.1，跳过 0.5.0。
+
+### 💥 Breaking — 基础设施
+
+- **彻底移除 Redis 依赖**：`anthropic/cache.rs` 整模块删除（约 740 行），`Cargo.toml` 删 `redis` crate，`docker-compose.yml` 删 `redis` 服务、`depends_on`、`redis-data` 命名卷，`config.example.json` 删 `redisUrl` / `cacheDebugLogging` / `cacheMaxReadRatio`，对应的 `Config::redis_url` / `cache_debug_logging` / `cache_max_read_ratio` 字段也删。已有部署里这三个配置字段会被忽略；不会破坏功能（只是无法识别），但**升级前请把它们从 `data/config.json` 删掉以免日后误以为还在生效**。
+- **API 响应字段含义变化**：`/v1/messages` 响应里的 `usage.cache_creation_input_tokens` / `cache_read_input_tokens` 不再是「Redis 缓存」（已下线）也不是「Anthropic 上游缓存」（实测上游不下发），而是**中转层自己根据请求体 `cache_control` 断点产出的提示词缓存计数**。详见下方"中转层 Prompt Cache"章节。
+- **`UsageRecordHook::record` 签名加 `credits: f64` 参数**；`ClientKeyManager::record_usage` 同步加。下游若 fork 了 handler 调用链需要补一个参数。
+
+### ✨ 新功能 — 中转层 Prompt Cache（无外部依赖）
+
+- **进程内提示词缓存**：新模块 `src/anthropic/prompt_cache.rs`。按 Anthropic 协议把请求体里 `cache_control` 断点（最多 4 个，分布于 `tools` / `system` / `messages[].content`）切成一组前缀段，对每段累加 SHA-256 哈希作为 key，TTL 默认 5 分钟、`cache_control.ttl="1h"` 解析为 1 小时。
+  - **命中规则**：取最深命中段索引 `i*` → `cache_read = segments[i*].cumulative_tokens`，`cache_creation = total - segments[i*].cumulative_tokens`；全部 miss 时 `cache_creation = total`、`cache_read = 0`。每次请求结束时把所有段（命中 / 未命中）写回，刷新 LRU `last_hit_at` 与 TTL。
+  - **持久化**：cache_dir 下 `prompt_cache.json`（按字节哈希 → `{tokens, expires_at, last_hit_at}`），后台 60s 一次 flush（仅 dirty 时落盘），启动时过滤过期条目重建。LRU 上限 4096 条。
+- **流式 / 非流式两路接线**：`StreamContext` / `BufferedStreamContext` 新增 `set_initial_cache_tokens(cc, cr)`。`message_start` / `message_delta.usage` 与非流响应的 `usage.cache_creation_input_tokens` / `cache_read_input_tokens` 全部由 PromptCache 真实产出，不再硬编码 0。
+- **真实验证**：两次完全相同的 `/v1/messages` 请求（带 `cache_control: ephemeral` 系统提示），第一次 `cache_creation=94 / cache_read=0`，第二次 `cache_creation=0 / cache_read=94`，精确按协议工作。
+- **9 个新单测**覆盖 lookup / record / TTL / LRU / flush + reload / 多断点命中。
+
+### ✨ 新功能 — Credit 计费维度
+
+- **解析上游 meteringEvent**：之前 `Event::Metering` 被丢成 `()`。新模块 `src/kiro/model/events/metering.rs` 严格解析真实 payload `{unit, unitPlural, usage(f64)}`（实测确认上游不下发 token / cache 字段；不做字段名候选 fallback，直接读 `usage`）。
+- **Credit 全链路**：`UsageRecord` / `BucketStats` / `TimeSeriesPoint` / `OverviewStats` / `ClientKey` 全部新增 `credits` 字段；流式 / 非流式 hook 都把 `credits` 累加并写入。
+- **API 暴露**：`GET /api/admin/stats/overview` 多 `todayCredits` / `weekCredits`；`GET /api/admin/stats/timeseries` 每个时序点多 `credits`。
+- **前端展示**：概览页顶部新增 "近 X Credit" 卡片（grid 由 4 列改为 5 列）；时序图 Tooltip 单独一行展示「本桶 Credit」（量级与 token 差异过大，不画线）。
+
+### ✨ 新功能 — 仪表盘改造
+
+- **Token 使用趋势图重做**（`time-series-chart.tsx`）：5 系列折线（Input / Output / Cache Creation / Cache Read / Cache Hit Rate），双 Y 轴：左轴 token 量级（紧凑 K/M/B），右轴 0–100% 命中率（紫色虚线，刻度固定 [0, 20, 40, 60, 80, 100]）；自定义深色 Tooltip，命中率 = `cacheRead / (input + cacheRead)`。全零数据时左轴强制显示 `0` 刻度，避免空白图表；Legend 改空心圆 + 英文标签。
+- **顶部卡片随时间窗切换**：之前调用 / Token 卡片永远显示「今日」，新增 `useMemo` 把当前 `seriesData` 按 24h / 7d / 30d 聚合，标题动态变成"近 24 小时调用 / 输入 Token"等。`activeClientKeys` 仍是当前活跃数。
+- **数值紧凑格式 K/M/B**：新增 `formatNumber()` 工具（基于 `Intl.NumberFormat` compact notation），覆盖概览卡片 / 模型表 / 凭据柱图 / 时序图 / 凭据列表 Badge。`formatCredits()` 对 credit 浮点专用：`≤ 0` → `"0"`、`< 1000` → 3 位小数、`≥ 1000` → K/M/B。Y 轴 / Tooltip / 表格全走同一格式器。
+- **凭据柱图按 email 显示**：之前 X 轴 label 是 `#id`（email 字段始终空），后端 `stats_by_credential` 在 handler 拼装时已经反查注入了 `email`，前端改为以 email 为主、`#id` 兜底；过长 email 截断到 22 字符（保留 @domain），完整 email 在 Tooltip 显示。
+
+### ✨ 新功能 — KAM 凭据导出
+
+- **新端点 `GET /api/admin/credentials/export?ids=...`**：导出选中凭据为 KAM 1.8.3+ 平铺 JSON 格式，含 `refreshToken` / `accessToken` / `clientSecret` 等敏感字段。
+- **`MultiTokenManager::clone_all_credentials`** 用于 admin 服务层取完整凭据快照（脱敏由调用方控制）。
+- **新 admin-ui 类型 `KamExportAccount` / `KamExportResponse`**，前端凭据列表批量选择后可一键下载。
+
+### ✨ 新功能 — 体验改进
+
+- **在线更新对话框 Release Notes 支持 Markdown 渲染**：之前折叠面板里的 Changelog 只走 `whitespace-pre-wrap` 渲染原文，标题 / 列表 / 链接全都显示成纯文本。改用项目内自带的轻量 markdown 渲染器（`admin-ui/src/components/markdown.tsx`，~280 行单文件、无外部依赖）：覆盖 `# – ####` 标题、`-/*/+` 与 `1. 2. 3.` 列表、`> 引用`、`---` 分隔线、围栏代码块、行内 `code`、`**加粗**` / `*斜体*` / `[文本](url)`。不引入 markdown-it / remark 等大型依赖，体积可忽略。
+- **KAM 导入支持多文件批量合并**：`KamImportDialog` 文件选择器加 `multiple` 属性，一次可选多个 KAM 导出 JSON；前端把每个文件的 `accounts` 数组合并成一份再走原有解析与预览流程，单文件失败不影响其他文件继续导入；toast 总结展示成功合并的记录数与失败文件名。
+
+### ✨ 新功能 — KAM 导入兼容
+- **兼容 KAM 1.6.9+ 的毫秒时间戳 `expiresAt`**：旧版导出 RFC3339 字符串、新版改为毫秒数字。前端在解析时统一规范化为 ISO 字符串，下游导入逻辑无需关心两种格式。
+- **打开对话框自动触发文件选择器**：减少一次点击，用户打开 KAM 导入对话框后直接进入选文件流程。
+
+### 🛠 修复
+
+- **Credit 数值小数位失控（0.5.0 → 0.5.1）**：`formatCredits()` 中 `value ≥ 1` 的分支会回退到 `formatNumber`，而 `formatNumber` 对 `< 1000` 的数直接 `String(value)`，导致 `1.5755479141293534` 这类长浮点被原样打印。修复后统一规则：
+  - `≤ 0 / null / NaN` → `"0"`
+  - `0 < value < 1000` → 保留 3 位小数（`1.576` / `0.017`）
+  - `value ≥ 1000` → `Intl.NumberFormat` compact notation（`1.2K` / `3.4M`）
+- **重启后用量统计丢失**：根因是当 `--credentials credentials.json`（无目录前缀）启动时，`PathBuf::from("credentials.json").parent()` 返回 `Some("")`，导致 `cache_dir = ""`：`UsageRecorder` 把 `usage_log.*.jsonl` 写到 CWD（路径无前缀），`UsageAggregator::rebuild_from_logs("")` 调用 `read_dir("")` 失败，重启后历史记录看似全丢。修复：`MultiTokenManager::cache_dir()` 与 `UsageRecorder::new` / `rebuild_from_logs` 都把空路径归一为 `.`，并把"创建目录失败 / 读取目录失败"由静默 `_` 改成 `tracing::warn!` 显式打印路径。重建完成日志带上目录与条目数。
+- **`StatsResponse` 不再有 `let mut overview = ...` + `let _ = (&mut overview).today_calls;` 这种 dead-code 黑魔法**——直接用不可变 `overview`。
+
+### 🎨 体验
+
+- **API Key 随机生成器收紧**：之前默认 40 字节 base64url，会产生 `sk-admin--Wt2ZN...` 这种双连字符的视觉断裂。改为：字符表只含 `a-zA-Z0-9`（拒绝采样保证均匀），32 字符（~190 bit 熵），按对话框模式选择前缀（admin Key 用 `sk-admin-`，业务 Key 仍用 `sk-kiro-`）。**移除 `Math.random` 弱熵 fallback**，缺 `crypto.getRandomValues` 时直接抛错。
+
+### 📦 依赖 / 构建
+
+- **删除依赖**：Rust 端 `redis = "0.27"`。
+- **前端构建分块**：`recharts` 及其 d3 依赖链单独成块（约 410 KB / gzip 106 KB），仅"概览"路由懒加载触发；`vendor` chunk 从 510 KB 缩到 69 KB；`sonner` 也单独成块；`chunkSizeWarningLimit` 提到 600 KB。
+- **`.gitignore` / `.dockerignore`** 新增 `prompt_cache.json`（运行时落盘，不入库）。
+- **测试覆盖**：单测从 233 增到 237（PromptCache 9 + Metering 2 - 现有路径调整）。
+
+### 📦 升级指南
+
+1. **`docker compose pull && docker compose up -d`** 即可。如果之前部署了 `redis` 服务，可以一并停掉删掉（数据无价值）。
+2. **删除过时配置**：编辑 `data/config.json`，删除 `redisUrl` / `cacheDebugLogging` / `cacheMaxReadRatio` 三个字段（保留也只是被忽略，不会报错）。
+3. **下游客户端**：响应里的 `cache_creation_input_tokens` / `cache_read_input_tokens` 字段含义变了——现在反映的是中转层提示词缓存而非上游缓存。如果下游用这两个字段做计费对账，需要重新理解口径（中转层缓存命中并不会减少上游 credit 消耗，是 SDK 体验优化）。
+4. **历史用量**：`usage_log.*.jsonl` 的旧记录会被自动加载（`credits` 字段缺失时默认 0），重启不丢趋势。新的请求开始会带 credit。
+5. **若你已经升级到 0.5.0**：直接升 0.5.1；不需要清理任何状态文件。
+
 ## [0.4.0] - 2026-05-22
 
 主题：把 kiro.rs 从「单 Key 的 Anthropic 协议适配器」推进到 Key 分发场景——加入面向下游用户的客户端 Key 分发、按 Key/凭据/模型维度的 Token 用量统计与仪表盘趋势可视化。

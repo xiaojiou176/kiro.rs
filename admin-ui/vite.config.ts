@@ -21,14 +21,17 @@ export default defineConfig({
   build: {
     outDir: 'dist',
     emptyOutDir: true,
+    chunkSizeWarningLimit: 600,
     rolldownOptions: {
       output: {
         codeSplitting: {
           groups: [
             { name: 'react', test: /node_modules[\\/](react|react-dom|scheduler)[\\/]/ },
+            { name: 'recharts', test: /node_modules[\\/](recharts|d3-[^\\/]+|victory-vendor|internmap|robust-predicates)[\\/]/ },
             { name: 'radix', test: /node_modules[\\/]@radix-ui[\\/]/ },
             { name: 'query', test: /node_modules[\\/]@tanstack[\\/]/ },
             { name: 'icons', test: /node_modules[\\/]lucide-react[\\/]/ },
+            { name: 'sonner', test: /node_modules[\\/]sonner[\\/]/ },
             { name: 'vendor', test: /node_modules[\\/]/ },
           ],
         },

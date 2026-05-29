@@ -57,6 +57,43 @@ export async function getCredentials(): Promise<CredentialsStatusResponse> {
   return data
 }
 
+// ============ KAM 导出 ============
+
+/** KAM 导出账号（KAM 1.8.3+ 平铺格式） */
+export interface KamExportAccount {
+  email?: string
+  nickname?: string
+  idp?: string
+  provider?: string
+  status?: string
+  authMethod?: string
+  region?: string
+  startUrl?: string
+  clientId?: string
+  clientSecret?: string
+  refreshToken?: string
+  accessToken?: string
+  profileArn?: string
+  expiresAt?: string
+  machineId?: string
+}
+
+export interface KamExportResponse {
+  version: string
+  exportedAt: string
+  accounts: KamExportAccount[]
+}
+
+/** 导出凭据为 KAM 兼容 JSON（含 refreshToken 等敏感字段）。
+ *  传入 `ids` 时仅导出这些凭据；省略则导出全部。 */
+export async function exportKamCredentials(
+  ids?: number[]
+): Promise<KamExportResponse> {
+  const params = ids && ids.length > 0 ? { ids: ids.join(',') } : undefined
+  const { data } = await api.get<KamExportResponse>('/credentials/export', { params })
+  return data
+}
+
 // 设置凭据禁用状态
 export async function setCredentialDisabled(
   id: number,

@@ -41,6 +41,9 @@ pub struct UsageRecord {
     pub cache_creation_tokens: u64,
     #[serde(default)]
     pub cache_read_tokens: u64,
+    /// 上游 meteringEvent.usage 上报的 credit 计费量（浮点）
+    #[serde(default)]
+    pub credits: f64,
     /// 端到端耗时（毫秒）
     #[serde(default)]
     pub duration_ms: u64,
@@ -62,8 +65,16 @@ struct RecorderState {
 
 impl UsageRecorder {
     pub fn new(dir: PathBuf) -> Self {
+        // 兜底：调用方传入空路径时归一为 "."，避免 join 出无目录前缀的路径导致写入 CWD
+        let dir = if dir.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            dir
+        };
         if !dir.exists() {
-            let _ = std::fs::create_dir_all(&dir);
+            if let Err(e) = std::fs::create_dir_all(&dir) {
+                tracing::warn!("创建 usage_log 目录失败 {}: {}", dir.display(), e);
+            }
         }
         Self {
             inner: Mutex::new(RecorderState {
@@ -151,6 +162,7 @@ pub struct BucketStats {
     pub cache_read_tokens: u64,
     pub calls: u64,
     pub errors: u64,
+    pub credits: f64,
 }
 
 impl BucketStats {
@@ -159,6 +171,7 @@ impl BucketStats {
         self.output_tokens += rec.output_tokens;
         self.cache_creation_tokens += rec.cache_creation_tokens;
         self.cache_read_tokens += rec.cache_read_tokens;
+        self.credits += rec.credits;
         self.calls += 1;
         if rec.status != "success" {
             self.errors += 1;
@@ -218,6 +231,7 @@ pub struct TimeSeriesPoint {
     pub cache_read_tokens: u64,
     pub calls: u64,
     pub errors: u64,
+    pub credits: f64,
 }
 
 /// 模型分布
@@ -250,10 +264,12 @@ pub struct OverviewStats {
     pub today_input_tokens: u64,
     pub today_output_tokens: u64,
     pub today_errors: u64,
+    pub today_credits: f64,
     /// 最近 7 天累计
     pub week_calls: u64,
     pub week_input_tokens: u64,
     pub week_output_tokens: u64,
+    pub week_credits: f64,
 }
 
 impl UsageAggregator {
@@ -268,9 +284,20 @@ impl UsageAggregator {
 
     /// 启动时从历史 JSONL 重建聚合
     pub fn rebuild_from_logs(&self, dir: &Path) {
+        // 兜底：空路径归一为 "."，否则 read_dir("") 会失败导致重建为 0
+        let dir_buf;
+        let dir = if dir.as_os_str().is_empty() {
+            dir_buf = PathBuf::from(".");
+            dir_buf.as_path()
+        } else {
+            dir
+        };
         let entries = match std::fs::read_dir(dir) {
             Ok(it) => it,
-            Err(_) => return,
+            Err(e) => {
+                tracing::warn!("读取 usage_log 目录失败 {}: {}", dir.display(), e);
+                return;
+            }
         };
         let cutoff = Local::now().date_naive() - Duration::days(RETENTION_DAYS);
         let mut count = 0u64;
@@ -299,7 +326,11 @@ impl UsageAggregator {
                 }
             }
         }
-        tracing::info!("UsageAggregator 重建完成：装载 {} 条历史记录", count);
+        tracing::info!(
+            "UsageAggregator 重建完成：从 {} 装载 {} 条历史记录",
+            dir.display(),
+            count
+        );
     }
 
     /// 接收一条记录并落入对应桶
@@ -353,6 +384,7 @@ impl UsageAggregator {
                 cache_read_tokens: b.overall.cache_read_tokens,
                 calls: b.overall.calls,
                 errors: b.overall.errors,
+                credits: b.overall.credits,
             })
             .collect();
         points.sort_by_key(|p| p.ts.clone());
@@ -453,6 +485,7 @@ impl UsageAggregator {
             today.output_tokens += b.overall.output_tokens;
             today.calls += b.overall.calls;
             today.errors += b.overall.errors;
+            today.credits += b.overall.credits;
         }
 
         let week_cutoff = Utc::now().timestamp() - 7 * 24 * 3600;
@@ -461,6 +494,7 @@ impl UsageAggregator {
             week.input_tokens += b.overall.input_tokens;
             week.output_tokens += b.overall.output_tokens;
             week.calls += b.overall.calls;
+            week.credits += b.overall.credits;
         }
 
         OverviewStats {
@@ -468,9 +502,11 @@ impl UsageAggregator {
             today_input_tokens: today.input_tokens,
             today_output_tokens: today.output_tokens,
             today_errors: today.errors,
+            today_credits: today.credits,
             week_calls: week.calls,
             week_input_tokens: week.input_tokens,
             week_output_tokens: week.output_tokens,
+            week_credits: week.credits,
         }
     }
 }
@@ -547,6 +583,7 @@ mod tests {
             output_tokens: 200,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            credits: 0.05,
             duration_ms: 1500,
             status: "success".to_string(),
         };
@@ -582,6 +619,7 @@ mod tests {
             output_tokens: 0,
             cache_creation_tokens: 0,
             cache_read_tokens: 0,
+            credits: 0.0,
             duration_ms: 100,
             status: "error".to_string(),
         };

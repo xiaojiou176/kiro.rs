@@ -17,6 +17,7 @@ use crate::kiro::provider::KiroProvider;
 use super::{
     handlers::{count_tokens, get_models, post_messages, post_messages_cc},
     middleware::{AppState, auth_middleware, cors_layer, request_id_middleware},
+    prompt_cache::SharedPromptCache,
 };
 
 /// 请求体最大大小限制 (50MB)
@@ -33,7 +34,15 @@ pub fn create_router_with_provider(
     extract_thinking: bool,
 ) -> Router {
     let shared_key = Arc::new(RwLock::new(api_key.into()));
-    create_router_with_shared_key(shared_key, kiro_provider, extract_thinking, None, None, None)
+    create_router_with_shared_key(
+        shared_key,
+        kiro_provider,
+        extract_thinking,
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 /// 与 `create_router_with_provider` 相同，但允许调用方共享 api_key 内存
@@ -45,12 +54,14 @@ pub fn create_router_with_shared_key(
     client_keys: Option<SharedClientKeyManager>,
     usage_recorder: Option<SharedRecorder>,
     usage_aggregator: Option<SharedAggregator>,
+    prompt_cache: Option<SharedPromptCache>,
 ) -> Router {
     let mut state = AppState::with_shared_api_key(api_key, extract_thinking);
     if let Some(provider) = kiro_provider {
         state = state.with_kiro_provider(provider);
     }
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
+    state = state.with_prompt_cache(prompt_cache);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()

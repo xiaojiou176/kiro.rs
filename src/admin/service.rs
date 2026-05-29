@@ -21,11 +21,11 @@ use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
     AddCredentialRequest, AddCredentialResponse, AssignProxyRequest, BalanceResponse,
     BatchAddProxyRequest, CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse,
-    EnableOverageAllResult, GitHubRateLimitInfo, ImageUpdateResponse, LoadBalancingModeResponse,
-    PollIdcLoginResponse, ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult,
-    SetLoadBalancingModeRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
-    StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
-    UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    EnableOverageAllResult, GitHubRateLimitInfo, ImageUpdateResponse, KamExportAccount,
+    KamExportResponse, LoadBalancingModeResponse, PollIdcLoginResponse, ProxyPoolEntry,
+    ProxyPoolResponse, QuotaExceededResult, SetLoadBalancingModeRequest, SetUpdateConfigRequest,
+    StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
+    UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -267,6 +267,55 @@ fn cleanup_other_staged(exe: &std::path::Path, keep_version: &str) {
     }
 }
 
+/// 将单个凭据映射为 KAM 1.8.3+ 平铺格式的账号结构
+///
+/// API Key 凭据无 refreshToken，KAM 无对应字段，跳过。
+/// 空字符串字段会被过滤为 None，保持导出 JSON 整洁。
+fn credential_to_kam_account(cred: KiroCredentials) -> Option<KamExportAccount> {
+    let refresh_token = cred
+        .refresh_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)?;
+
+    fn non_empty(value: Option<String>) -> Option<String> {
+        value
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    let auth_method = non_empty(cred.auth_method.clone());
+    let provider = non_empty(cred.provider.clone());
+    // KAM 旧版字段：idp 与 provider 同义，二者都填以最大兼容
+    let idp = provider.clone();
+    let status = if cred.disabled {
+        Some("disabled".to_string())
+    } else {
+        Some("active".to_string())
+    };
+
+    Some(KamExportAccount {
+        email: non_empty(cred.email),
+        nickname: None,
+        idp,
+        provider,
+        status,
+        auth_method,
+        region: non_empty(cred.region.clone())
+            .or_else(|| non_empty(cred.auth_region.clone()))
+            .or_else(|| non_empty(cred.api_region.clone())),
+        start_url: None,
+        client_id: non_empty(cred.client_id),
+        client_secret: non_empty(cred.client_secret),
+        refresh_token: Some(refresh_token),
+        access_token: non_empty(cred.access_token),
+        profile_arn: non_empty(cred.profile_arn),
+        expires_at: non_empty(cred.expires_at),
+        machine_id: non_empty(cred.machine_id),
+    })
+}
+
 /// GitHub Release 仓库名（owner/repo）。
 /// 在线更新所需的版本号、changelog、二进制资产都从这里取。
 const GITHUB_RELEASES_REPO: &str = "ZyphrZero/kiro.rs";
@@ -371,6 +420,33 @@ impl AdminService {
             available: snapshot.available,
             current_id: snapshot.current_id,
             credentials,
+        }
+    }
+
+    /// 导出凭据为 KAM 兼容 JSON（KAM 1.8.3+ 平铺格式）
+    ///
+    /// 返回的结构体含 refreshToken、accessToken、clientSecret 等敏感字段，
+    /// 调用方需自行保证传输与存储安全；按 priority 升序排序，与 UI 列表一致。
+    /// `id_filter` 为 None 时导出全部凭据；为 Some 时仅导出集合内的 ID。
+    pub fn export_kam_credentials(
+        &self,
+        id_filter: Option<&HashSet<u64>>,
+    ) -> KamExportResponse {
+        let mut credentials = self.token_manager.clone_all_credentials();
+        if let Some(filter) = id_filter {
+            credentials.retain(|c| c.id.map(|id| filter.contains(&id)).unwrap_or(false));
+        }
+        credentials.sort_by_key(|c| c.priority);
+
+        let accounts = credentials
+            .into_iter()
+            .filter_map(credential_to_kam_account)
+            .collect();
+
+        KamExportResponse {
+            version: "1.8.3".to_string(),
+            exported_at: Utc::now().to_rfc3339(),
+            accounts,
         }
     }
 

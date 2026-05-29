@@ -62,6 +62,7 @@ kiro_stats.json
 proxy_pool.json
 usage_log.*.jsonl
 usage_stats.json
+prompt_cache.json
 data/
 
 # 在线更新产物（GitHub Releases 二进制暂存 + 备份）
@@ -83,3 +84,7 @@ Dockerfile.*
 .dockerignore
 docker-compose*.yml
 docker-compose.*.yml
+
+.ace-tool/
+.codegraph/
+.claude/

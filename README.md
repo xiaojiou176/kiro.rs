@@ -41,7 +41,7 @@
 - **Thinking 模式**: 支持 Claude 的 extended thinking 功能
 - **工具调用**: 完整支持 function calling / tool use
 - **WebSearch**: 内置 WebSearch 工具转换逻辑
-- **多模型支持**: Sonnet / Opus / Haiku 全系列，**Opus 4.7、Opus 4.6、Sonnet 4.6 支持 1M 上下文**，其他默认 200K
+- **多模型支持**: Sonnet / Opus / Haiku 全系列，**Opus 4.8 / 4.7 / 4.6、Sonnet 4.8 / 4.6 支持 1M 上下文**，其他默认 200K
 - **Admin 管理**: 可选的 Web 管理界面和 API，支持凭据管理、余额查询等
 - **客户端 Key 分发**（v0.4.0+）：在 Admin 面板生成多把 `csk_*` 客户端 Key 分发给下游用户/项目，每把 Key 独立启用/禁用与计数，泄露不影响其他用户
 - **用量统计与仪表盘**（v0.4.0+）：按请求记录 token 消耗（按日滚动 JSONL），仪表盘展示时间趋势、模型分布、上游凭据贡献
@@ -193,10 +193,9 @@ docker compose up -d
     └── proxy_pool.json            # 代理池（如启用）
 ```
 
-`docker-compose.yml` 默认包含 `kiro-rs` + `redis` 两个服务：
+`docker-compose.yml` 默认包含 `kiro-rs` 服务：
 
 - **kiro-rs**：监听 `8990`，挂载 `./data/:/app/config/`，`restart: unless-stopped`
-- **redis**：用于 prompt cache 加速；`appendonly` 开启，数据持久化到 named volume `redis-data`，附带 healthcheck
 
 #### 二、首次启动获取密钥
 
@@ -242,7 +241,7 @@ KIRO_RS_IMAGE=zyphrzero/kiro-rs:0.4.0 docker compose up -d
 KIRO_RS_IMAGE=zyphrzero/kiro-rs:0.4.0
 ```
 
-**关闭 Redis**：如果不需要 prompt cache，删除 `docker-compose.yml` 里的 `redis` 服务和 `kiro-rs.depends_on`，并把 `data/config.json` 中的 `redisUrl` 字段删除（或保持留空）。
+**关闭 Redis**：v0.4.0+ 已移除 prompt cache 与 Redis 依赖，无需额外配置。如果你之前在 `data/config.json` 里留有 `redisUrl` / `cacheDebugLogging` / `cacheMaxReadRatio` 字段，可以一并删除。
 
 **配置 HTTP 代理**：在 `data/config.json` 加 `proxyUrl`，或在 Admin UI 的代理池里管理。
 
@@ -276,7 +275,6 @@ tar -czf kiro-rs-backup-$(date +%F).tar.gz /opt/kiro-rs/data/
 
 - **首次启动看不到日志中的密钥** — 改用 `docker compose logs --tail=200 kiro-rs`，或直接看 `data/config.json` 里的 `apiKey` / `adminApiKey` 字段
 - **想从 Docker Hub 之外的镜像源拉取** — 把 `docker-compose.yml` 里的 `image:` 改成你自己镜像源的地址（如 `ghcr.io/...`、阿里云镜像加速等）
-- **客户端连接 Redis 失败** — 容器之间用服务名通信，`redisUrl` 应保持为 `redis://redis:6379`（不是 `127.0.0.1`）
 - **Admin UI 显示 "暂无数据"** — 仪表盘需要至少一次请求才会有数据，先用 curl 调一次 `/v1/messages` 即可看到趋势开始填充
 
 ## 配置详解
@@ -559,16 +557,18 @@ RUST_LOG=debug ./target/release/kiro-rs
 
 | Anthropic 模型（关键词） | Kiro 模型 | 上下文窗口 |
 |---|---|---|
+| `*sonnet*` 含 `4-8` / `4.8` | `claude-sonnet-4.8` | **1M** |
 | `*sonnet*` 含 `4-6` / `4.6` | `claude-sonnet-4.6` | **1M** |
 | `*sonnet*`（其他，默认） | `claude-sonnet-4.5` | 200K |
+| `*opus*` 含 `4-8` / `4.8` | `claude-opus-4.8` | **1M** |
 | `*opus*` 含 `4-7` / `4.7` | `claude-opus-4.7` | **1M** |
 | `*opus*` 含 `4-6` / `4.6` | `claude-opus-4.6` | **1M** |
 | `*opus*` 含 `4-5` / `4.5` | `claude-opus-4.5` | 200K |
 | `*haiku*` | `claude-haiku-4.5` | 200K |
 
-> **1M 上下文支持**：Kiro 于 2026-03-24 将 Sonnet 4.6 / Opus 4.6 升级到 1M 上下文窗口，Opus 4.7 同样为 1M。其余模型仍为 200K。本服务在收到这三类模型请求时会按 1M 计算 `contextUsageEvent` 的实际 `input_tokens`，前端发起 `max_tokens` 大请求时不需要额外配置。
+> **1M 上下文支持**：Kiro 于 2026-03-24 将 Sonnet 4.6 / Opus 4.6 升级到 1M 上下文窗口，Opus 4.7 / 4.8 与 Sonnet 4.8 同样为 1M。其余模型仍为 200K。本服务在收到上述模型请求时会按 1M 计算 `contextUsageEvent` 的实际 `input_tokens`，前端发起 `max_tokens` 大请求时不需要额外配置。
 >
-> 模型名带 `-thinking` 后缀（如 `claude-opus-4-7-thinking`）会自动覆写 `thinking` 配置：Opus 4.6 走 `adaptive` 模式，其他走 `enabled` 模式，`budget_tokens` 固定 20000。Opus 4.6 同时强制 `output_config.effort = "high"`。
+> 模型名带 `-thinking` 后缀（如 `claude-opus-4-8-thinking`）会自动覆写 `thinking` 配置：Opus 4.6 走 `adaptive` 模式，其他走 `enabled` 模式，`budget_tokens` 固定 20000。Opus 4.6 同时强制 `output_config.effort = "high"`。
 
 可用模型完整列表通过 `GET /v1/models` 查询。
 

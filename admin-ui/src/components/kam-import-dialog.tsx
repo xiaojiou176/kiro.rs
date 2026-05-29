@@ -1,7 +1,7 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useRef } from 'react'
 import { toast } from 'sonner'
 import { useQuery } from '@tanstack/react-query'
-import { CheckCircle2, XCircle, AlertCircle, Loader2 } from 'lucide-react'
+import { CheckCircle2, XCircle, AlertCircle, Loader2, Upload } from 'lucide-react'
 import {
   Dialog,
   DialogContent,
@@ -29,7 +29,8 @@ interface KamAccount {
     refreshToken: string
     accessToken?: string
     profileArn?: string
-    expiresAt?: string
+    // KAM 1.6.9+ 新版导出为毫秒时间戳数字，旧版为 RFC3339 字符串
+    expiresAt?: string | number
     clientId?: string
     clientSecret?: string
     region?: string
@@ -39,6 +40,22 @@ interface KamAccount {
   }
   machineId?: string
   status?: string
+}
+
+// 把 KAM 的 expiresAt 字段统一规范化为 RFC3339 字符串
+// - 数字（毫秒时间戳）→ 转 ISO 字符串
+// - 字符串 → trim 后返回，空串视为 undefined
+// - 其他 → undefined
+function normalizeExpiresAt(value: unknown): string | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    const date = new Date(value)
+    return Number.isNaN(date.getTime()) ? undefined : date.toISOString()
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    return trimmed.length > 0 ? trimmed : undefined
+  }
+  return undefined
 }
 
 interface VerificationResult {
@@ -74,7 +91,10 @@ function normalizeKamAccount(item: unknown): unknown {
     const machineId = typeof obj.machineId === 'string' ? obj.machineId : undefined
     const accessToken = typeof obj.accessToken === 'string' ? obj.accessToken : undefined
     const profileArn = typeof obj.profileArn === 'string' ? obj.profileArn : undefined
-    const expiresAt = typeof obj.expiresAt === 'string' ? obj.expiresAt : undefined
+    const expiresAt =
+      typeof obj.expiresAt === 'string' || typeof obj.expiresAt === 'number'
+        ? (obj.expiresAt as string | number)
+        : undefined
     const clientId = typeof obj.clientId === 'string' ? obj.clientId : undefined
     const clientSecret = typeof obj.clientSecret === 'string' ? obj.clientSecret : undefined
     const region = typeof obj.region === 'string' ? obj.region : undefined
@@ -164,6 +184,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
   const [progress, setProgress] = useState({ current: 0, total: 0 })
   const [currentProcessing, setCurrentProcessing] = useState<string>('')
   const [results, setResults] = useState<VerificationResult[]>([])
+  const fileInputRef = useRef<HTMLInputElement>(null)
 
   const { data: existingCredentials } = useCredentials()
   const { mutateAsync: addCredential } = useAddCredential()
@@ -193,6 +214,64 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
     setProgress({ current: 0, total: 0 })
     setCurrentProcessing('')
     setResults([])
+    if (fileInputRef.current) fileInputRef.current.value = ''
+  }
+
+  const handleFileSelect = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files ?? [])
+    if (files.length === 0) return
+
+    try {
+      // 读取所有文件并合并 accounts，保留各自版本元信息以便排错
+      const fileTexts = await Promise.all(
+        files.map(async (f) => ({ name: f.name, text: await f.text() }))
+      )
+
+      const merged: unknown[] = []
+      const failed: { name: string; reason: string }[] = []
+
+      for (const { name, text } of fileTexts) {
+        try {
+          const parsed = JSON.parse(text)
+          if (parsed && Array.isArray(parsed.accounts)) {
+            merged.push(...parsed.accounts)
+          } else if (Array.isArray(parsed)) {
+            merged.push(...parsed)
+          } else if (parsed && typeof parsed === 'object') {
+            // 单账号对象（新/旧格式）
+            merged.push(parsed)
+          } else {
+            failed.push({ name, reason: '无法识别的 JSON 结构' })
+          }
+        } catch (e) {
+          failed.push({ name, reason: extractErrorMessage(e) })
+        }
+      }
+
+      if (merged.length === 0) {
+        toast.error(`所有文件均解析失败：${failed.map((f) => `${f.name}（${f.reason}）`).join('；')}`)
+        return
+      }
+
+      // 合并后按统一格式输出，复用 textarea 现有的解析与预览逻辑
+      const mergedJson = JSON.stringify({ version: 'merged', accounts: merged }, null, 2)
+      setJsonInput(mergedJson)
+      setResults([])
+
+      const fileSummary = files.length === 1 ? files[0].name : `${files.length} 个文件`
+      if (failed.length > 0) {
+        toast.warning(
+          `已加载 ${fileSummary}，合并 ${merged.length} 条记录；${failed.length} 个文件解析失败：${failed.map((f) => f.name).join('、')}`
+        )
+      } else {
+        toast.success(`已加载 ${fileSummary}，合并 ${merged.length} 条记录`)
+      }
+    } catch (error) {
+      toast.error('读取文件失败: ' + extractErrorMessage(error))
+    } finally {
+      // 清空 value 以便再次选择同名文件也能触发 onChange
+      event.target.value = ''
+    }
   }
 
   const handleImport = async () => {
@@ -307,7 +386,7 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
             refreshToken: token,
             accessToken: cred.accessToken?.trim() || undefined,
             profileArn: cred.profileArn?.trim() || undefined,
-            expiresAt: cred.expiresAt?.trim() || undefined,
+            expiresAt: normalizeExpiresAt(cred.expiresAt),
             authMethod,
             provider,
             authRegion: cred.region?.trim() || undefined,
@@ -449,9 +528,31 @@ export function KamImportDialog({ open, onOpenChange }: KamImportDialogProps) {
 
         <div className="flex-1 overflow-y-auto space-y-4 py-4">
           <div className="space-y-2">
-            <label className="text-sm font-medium">KAM 导出 JSON</label>
+            <div className="flex items-center justify-between">
+              <label className="text-sm font-medium">KAM 导出 JSON</label>
+              <div>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept="application/json,.json"
+                  multiple
+                  className="hidden"
+                  onChange={handleFileSelect}
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={importing}
+                >
+                  <Upload className="w-4 h-4 mr-1.5" />
+                  选择文件
+                </Button>
+              </div>
+            </div>
             <textarea
-              placeholder={'粘贴 Kiro Account Manager 导出的 JSON\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
+              placeholder={'粘贴 Kiro Account Manager 导出的 JSON，或点击右上角“选择文件”导入\n\n支持 KAM 1.8.3+ 新版平铺格式：\n[\n  {\n    "email": "...",\n    "refreshToken": "...",\n    "clientId": "...",\n    "clientSecret": "...",\n    "region": "us-east-1"\n  }\n]\n\n（可选的 authMethod 字段会被忽略，系统会根据 clientId/clientSecret 自动判断）\n\n也支持旧版嵌套格式：\n{\n  "version": "1.5.0",\n  "accounts": [\n    {\n      "email": "...",\n      "credentials": {\n        "refreshToken": "...",\n        "clientId": "...",\n        "clientSecret": "...",\n        "region": "us-east-1"\n      }\n    }\n  ]\n}'}
               value={jsonInput}
               onChange={(e) => setJsonInput(e.target.value)}
               disabled={importing}

@@ -14,7 +14,7 @@ use axum::{
     Json as JsonExtractor,
     body::Body,
     extract::{Extension, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{StatusCode, header},
     response::{IntoResponse, Json, Response},
 };
 use bytes::Bytes;
@@ -33,7 +33,6 @@ use super::types::{
     OutputConfig, Thinking,
 };
 use super::websearch;
-use crate::anthropic::cache;
 
 /// 请求结束时记录用量的钩子
 ///
@@ -71,6 +70,7 @@ impl UsageRecordHook {
         output_tokens: i32,
         cache_creation_tokens: i32,
         cache_read_tokens: i32,
+        credits: f64,
         status: &str,
     ) {
         let rec = UsageRecord {
@@ -82,6 +82,11 @@ impl UsageRecordHook {
             output_tokens: output_tokens.max(0) as u64,
             cache_creation_tokens: cache_creation_tokens.max(0) as u64,
             cache_read_tokens: cache_read_tokens.max(0) as u64,
+            credits: if credits.is_finite() && credits > 0.0 {
+                credits
+            } else {
+                0.0
+            },
             duration_ms: self.started_at.elapsed().as_millis() as u64,
             status: status.to_string(),
         };
@@ -99,25 +104,11 @@ impl UsageRecordHook {
                     rec.output_tokens,
                     rec.cache_creation_tokens,
                     rec.cache_read_tokens,
+                    rec.credits,
                 );
             }
         }
     }
-}
-
-/// 从 HeaderMap 中提取 API Key（用于缓存隔离）
-fn extract_api_key_from_headers(headers: &HeaderMap) -> String {
-    if let Some(key) = headers.get("x-api-key").and_then(|v| v.to_str().ok()) {
-        return key.to_string();
-    }
-    if let Some(key) = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-    {
-        return key.to_string();
-    }
-    "anonymous".to_string()
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -235,33 +226,52 @@ fn map_provider_error(err: Error) -> Response {
         .into_response()
 }
 
-/// 计算 Anthropic usage 口径的 input_tokens（未缓存部分）
-fn compute_uncached_input_tokens(
-    total_input_tokens: i32,
-    cache_creation_input_tokens: i32,
-    cache_read_input_tokens: i32,
-) -> i32 {
-    (total_input_tokens - cache_creation_input_tokens - cache_read_input_tokens).max(0)
-}
-
+/// 计算 Anthropic usage 口径的 input_tokens
 fn resolve_usage_input_tokens(
     fallback_total_input_tokens: i32,
     context_total_input_tokens: Option<i32>,
-    cache_result: &cache::CacheResult,
 ) -> i32 {
-    if cache_result.cache_creation_input_tokens > 0 || cache_result.cache_read_input_tokens > 0 {
-        return cache_result.uncached_input_tokens;
-    }
-
-    compute_uncached_input_tokens(
-        context_total_input_tokens.unwrap_or(fallback_total_input_tokens),
-        cache_result.cache_creation_input_tokens,
-        cache_result.cache_read_input_tokens,
-    )
+    context_total_input_tokens.unwrap_or(fallback_total_input_tokens)
 }
 
 fn available_models() -> Vec<Model> {
     vec![
+        Model {
+            id: "claude-opus-4-8".to_string(),
+            object: "model".to_string(),
+            created: 1779897600, // May 28, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.8".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-opus-4-8-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1779897600, // May 28, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Opus 4.8 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-4-8".to_string(),
+            object: "model".to_string(),
+            created: 1779897600, // May 28, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.8".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
+        Model {
+            id: "claude-sonnet-4-8-thinking".to_string(),
+            object: "model".to_string(),
+            created: 1779897600, // May 28, 2026
+            owned_by: "anthropic".to_string(),
+            display_name: "Claude Sonnet 4.8 (Thinking)".to_string(),
+            model_type: "chat".to_string(),
+            max_tokens: 64000,
+        },
         Model {
             id: "claude-opus-4-7".to_string(),
             object: "model".to_string(),
@@ -393,7 +403,6 @@ pub async fn get_models() -> impl IntoResponse {
 pub async fn post_messages(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
-    headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     // 入站时统计 image 预算，给后续 context-window-full 提供精准诊断
@@ -421,7 +430,7 @@ pub async fn post_messages(
         Some(p) => p.clone(),
         None => {
             tracing::error!("KiroProvider 未配置");
-            hook.record(0, 0, 0, 0, 0, "error");
+            hook.record(0, 0, 0, 0, 0, 0.0, "error");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse::new(
@@ -451,7 +460,7 @@ pub async fn post_messages(
         let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
         // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
         let status = if resp.status().is_success() { "success" } else { "error" };
-        hook.record(0, input_tokens, 0, 0, 0, status);
+        hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
     }
 
@@ -468,7 +477,7 @@ pub async fn post_messages(
                 }
             };
             tracing::warn!("请求转换失败: {}", e);
-            hook.record(0, 0, 0, 0, 0, "error");
+            hook.record(0, 0, 0, 0, 0, 0.0, "error");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
@@ -490,7 +499,7 @@ pub async fn post_messages(
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
-            hook.record(0, 0, 0, 0, 0, "error");
+            hook.record(0, 0, 0, 0, 0, 0.0, "error");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -504,9 +513,6 @@ pub async fn post_messages(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    // 提取 API key（用于缓存隔离）
-    let api_key = extract_api_key_from_headers(&headers);
-
     // 估算输入 tokens
     let total_input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -514,18 +520,6 @@ pub async fn post_messages(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
-
-    // 计算缓存断点并查询 Redis
-    let cache_result = if cache::is_redis_available() {
-        let breakpoints =
-            cache::compute_cache_breakpoints(&payload.tools, &payload.system, &payload.messages);
-        cache::lookup_or_create(&api_key, &breakpoints, total_input_tokens).await
-    } else {
-        cache::CacheResult {
-            uncached_input_tokens: total_input_tokens,
-            ..Default::default()
-        }
-    };
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -536,6 +530,13 @@ pub async fn post_messages(
 
     let tool_name_map = conversion_result.tool_name_map;
 
+    // PromptCache：根据 cache_control 断点查 / 写中转层提示词缓存
+    let (cache_creation_tokens, cache_read_tokens) = state
+        .prompt_cache
+        .as_ref()
+        .map(|cache| super::prompt_cache::compute_cache_usage(cache, &payload))
+        .unwrap_or((0, 0));
+
     if payload.stream {
         // 流式响应
         handle_stream_request(
@@ -545,8 +546,9 @@ pub async fn post_messages(
             total_input_tokens,
             thinking_enabled,
             tool_name_map,
-            cache_result,
             hook,
+            cache_creation_tokens,
+            cache_read_tokens,
         )
         .await
     } else {
@@ -559,8 +561,9 @@ pub async fn post_messages(
             total_input_tokens,
             extract_thinking,
             tool_name_map,
-            cache_result,
             hook,
+            cache_creation_tokens,
+            cache_read_tokens,
         )
         .await
     }
@@ -574,14 +577,15 @@ async fn handle_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
-    cache_result: cache::CacheResult,
     hook: UsageRecordHook,
+    cache_creation_tokens: i32,
+    cache_read_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => {
-            hook.record(0, input_tokens, 0, 0, 0, "error");
+            hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
             return map_provider_error(e);
         }
     };
@@ -589,11 +593,9 @@ async fn handle_stream_request(
     let credential_id = call_result.credential_id;
 
     // 创建流处理上下文
-    let mut ctx = if cache::is_redis_available() {
-        StreamContext::new_with_cache(model, cache_result, thinking_enabled, tool_name_map)
-    } else {
-        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map)
-    };
+    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map);
+    ctx.cache_creation_input_tokens = cache_creation_tokens;
+    ctx.cache_read_input_tokens = cache_read_tokens;
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -722,16 +724,14 @@ fn record_stream_usage(
     credential_id: u64,
     status: &str,
 ) {
-    let input = ctx
-        .context_input_tokens
-        .unwrap_or(ctx.input_tokens)
-        .max(ctx.cache_result.uncached_input_tokens);
+    let input = ctx.context_input_tokens.unwrap_or(ctx.input_tokens);
     hook.record(
         credential_id,
         input,
         ctx.output_tokens,
-        ctx.cache_result.cache_creation_input_tokens,
-        ctx.cache_result.cache_read_input_tokens,
+        ctx.cache_creation_input_tokens,
+        ctx.cache_read_input_tokens,
+        ctx.credits,
         status,
     );
 }
@@ -746,14 +746,15 @@ async fn handle_non_stream_request(
     input_tokens: i32,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
-    cache_result: cache::CacheResult,
     hook: UsageRecordHook,
+    initial_cache_creation: i32,
+    initial_cache_read: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider.call_api(request_body).await {
         Ok(resp) => resp,
         Err(e) => {
-            hook.record(0, input_tokens, 0, 0, 0, "error");
+            hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
             return map_provider_error(e);
         }
     };
@@ -765,7 +766,7 @@ async fn handle_non_stream_request(
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!("读取响应体失败: {}", e);
-            hook.record(credential_id, input_tokens, 0, 0, 0, "error");
+            hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -789,6 +790,12 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
+    // meteringEvent 上报的 token 与缓存数据
+    // 上游 metering 只给 credit；input 来自 contextUsage，output 来自估算
+    // cache_creation / cache_read 由调用方（PromptCache）传入初值
+    let cache_creation_tokens: i32 = initial_cache_creation;
+    let cache_read_tokens: i32 = initial_cache_read;
+    let mut credits: f64 = 0.0;
 
     // 收集工具调用的增量 JSON
     let mut tool_json_buffers: std::collections::HashMap<String, String> =
@@ -856,6 +863,11 @@ async fn handle_non_stream_request(
                                 actual_input_tokens
                             );
                         }
+                        Event::Metering(metering) => {
+                            // 上游只下发 credit；token / cache 字段不存在
+                            credits += metering.usage;
+                            tracing::debug!("metering credits +{:.6}", metering.usage);
+                        }
                         Event::Exception { exception_type, .. } => {
                             if exception_type == "ContentLengthExceededException" {
                                 stop_reason = "max_tokens".to_string();
@@ -906,12 +918,11 @@ async fn handle_non_stream_request(
 
     content.extend(tool_uses);
 
-    // 估算输出 tokens
+    // 估算输出 tokens（上游不下发 token，全部走估算）
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // contextUsageEvent 给出的是总输入，Anthropic usage.input_tokens 需返回未缓存部分
-    let final_input_tokens =
-        resolve_usage_input_tokens(input_tokens, context_input_tokens, &cache_result);
+    // 输入 tokens：contextUsage 真实值优先，否则用客户端估算
+    let final_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -925,8 +936,8 @@ async fn handle_non_stream_request(
         "usage": {
             "input_tokens": final_input_tokens,
             "output_tokens": output_tokens,
-            "cache_creation_input_tokens": cache_result.cache_creation_input_tokens,
-            "cache_read_input_tokens": cache_result.cache_read_input_tokens
+            "cache_creation_input_tokens": cache_creation_tokens,
+            "cache_read_input_tokens": cache_read_tokens
         }
     });
 
@@ -934,8 +945,9 @@ async fn handle_non_stream_request(
         credential_id,
         final_input_tokens,
         output_tokens,
-        cache_result.cache_creation_input_tokens,
-        cache_result.cache_read_input_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+        credits,
         "success",
     );
     (StatusCode::OK, Json(response_body)).into_response()
@@ -1008,7 +1020,6 @@ pub async fn count_tokens(
 pub async fn post_messages_cc(
     State(state): State<AppState>,
     Extension(key_ctx): Extension<KeyContext>,
-    headers: HeaderMap,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
     tracing::info!(
@@ -1025,7 +1036,7 @@ pub async fn post_messages_cc(
         Some(p) => p.clone(),
         None => {
             tracing::error!("KiroProvider 未配置");
-            hook.record(0, 0, 0, 0, 0, "error");
+            hook.record(0, 0, 0, 0, 0, 0.0, "error");
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(ErrorResponse::new(
@@ -1054,7 +1065,7 @@ pub async fn post_messages_cc(
 
         let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
         let status = if resp.status().is_success() { "success" } else { "error" };
-        hook.record(0, input_tokens, 0, 0, 0, status);
+        hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
     }
 
@@ -1071,7 +1082,7 @@ pub async fn post_messages_cc(
                 }
             };
             tracing::warn!("请求转换失败: {}", e);
-            hook.record(0, 0, 0, 0, 0, "error");
+            hook.record(0, 0, 0, 0, 0, 0.0, "error");
             return (
                 StatusCode::BAD_REQUEST,
                 Json(ErrorResponse::new(error_type, message)),
@@ -1093,7 +1104,7 @@ pub async fn post_messages_cc(
         Ok(body) => body,
         Err(e) => {
             tracing::error!("序列化请求失败: {}", e);
-            hook.record(0, 0, 0, 0, 0, "error");
+            hook.record(0, 0, 0, 0, 0, 0.0, "error");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse::new(
@@ -1107,9 +1118,6 @@ pub async fn post_messages_cc(
 
     tracing::debug!("Kiro request body: {}", request_body);
 
-    // 提取 API key（用于缓存隔离）
-    let api_key = extract_api_key_from_headers(&headers);
-
     // 计算总 input tokens
     let total_input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -1117,18 +1125,6 @@ pub async fn post_messages_cc(
         payload.messages.clone(),
         payload.tools.clone(),
     ) as i32;
-
-    // 计算缓存断点并查询 Redis
-    let cache_result = if cache::is_redis_available() {
-        let breakpoints =
-            cache::compute_cache_breakpoints(&payload.tools, &payload.system, &payload.messages);
-        cache::lookup_or_create(&api_key, &breakpoints, total_input_tokens).await
-    } else {
-        cache::CacheResult {
-            uncached_input_tokens: total_input_tokens,
-            ..Default::default()
-        }
-    };
 
     // 检查是否启用了thinking
     let thinking_enabled = payload
@@ -1139,17 +1135,25 @@ pub async fn post_messages_cc(
 
     let tool_name_map = conversion_result.tool_name_map;
 
+    // PromptCache：根据 cache_control 断点查 / 写中转层提示词缓存
+    let (cache_creation_tokens, cache_read_tokens) = state
+        .prompt_cache
+        .as_ref()
+        .map(|cache| super::prompt_cache::compute_cache_usage(cache, &payload))
+        .unwrap_or((0, 0));
+
     if payload.stream {
         // 流式响应（缓冲模式）
         handle_stream_request_buffered(
             provider,
             &request_body,
             &payload.model,
-            cache_result,
             thinking_enabled,
             tool_name_map,
             hook,
             total_input_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
         )
         .await
     } else {
@@ -1162,8 +1166,9 @@ pub async fn post_messages_cc(
             total_input_tokens,
             extract_thinking,
             tool_name_map,
-            cache_result,
             hook,
+            cache_creation_tokens,
+            cache_read_tokens,
         )
         .await
     }
@@ -1177,17 +1182,18 @@ async fn handle_stream_request_buffered(
     provider: std::sync::Arc<crate::kiro::provider::KiroProvider>,
     request_body: &str,
     model: &str,
-    cache_result: cache::CacheResult,
     thinking_enabled: bool,
     tool_name_map: std::collections::HashMap<String, String>,
     hook: UsageRecordHook,
     fallback_input_tokens: i32,
+    cache_creation_tokens: i32,
+    cache_read_tokens: i32,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
     let call_result = match provider.call_api_stream(request_body).await {
         Ok(resp) => resp,
         Err(e) => {
-            hook.record(0, fallback_input_tokens, 0, 0, 0, "error");
+            hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
             return map_provider_error(e);
         }
     };
@@ -1195,8 +1201,13 @@ async fn handle_stream_request_buffered(
     let credential_id = call_result.credential_id;
 
     // 创建缓冲流处理上下文
-    let ctx =
-        BufferedStreamContext::new_with_cache(model, cache_result, thinking_enabled, tool_name_map);
+    let mut ctx = BufferedStreamContext::new(
+        model,
+        fallback_input_tokens,
+        thinking_enabled,
+        tool_name_map,
+    );
+    ctx.set_initial_cache_tokens(cache_creation_tokens, cache_read_tokens);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx, hook, credential_id);
@@ -1282,8 +1293,8 @@ fn create_buffered_sse_stream(
                                 tracing::error!("读取响应流失败: {}", e);
                                 // 发生错误，完成处理并返回所有事件
                                 let all_events = ctx.finish_and_get_all_events();
-                                let (i, o, cc, cr) = ctx.final_usage();
-                                hook.record(credential_id, i, o, cc, cr, "error");
+                                let (i, o, cc, cr, credits) = ctx.final_usage();
+                                hook.record(credential_id, i, o, cc, cr, credits, "error");
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -1293,8 +1304,8 @@ fn create_buffered_sse_stream(
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
                                 let all_events = ctx.finish_and_get_all_events();
-                                let (i, o, cc, cr) = ctx.final_usage();
-                                hook.record(credential_id, i, o, cc, cr, "success");
+                                let (i, o, cc, cr, credits) = ctx.final_usage();
+                                hook.record(credential_id, i, o, cc, cr, credits, "success");
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -1371,5 +1382,16 @@ mod tests {
         }"#).unwrap();
         let stats = count_image_budget(&req);
         assert_eq!(stats.count, 0);
+    }
+
+    #[test]
+    fn available_models_include_4_8_variants() {
+        let models = available_models();
+        let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+
+        assert!(ids.contains(&"claude-opus-4-8"));
+        assert!(ids.contains(&"claude-opus-4-8-thinking"));
+        assert!(ids.contains(&"claude-sonnet-4-8"));
+        assert!(ids.contains(&"claude-sonnet-4-8-thinking"));
     }
 }

@@ -1236,9 +1236,18 @@ impl MultiTokenManager {
 
     /// 获取缓存目录（凭据文件所在目录）
     pub fn cache_dir(&self) -> Option<PathBuf> {
-        self.credentials_path
-            .as_ref()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        self.credentials_path.as_ref().and_then(|p| {
+            p.parent().map(|d| {
+                // 当传入相对路径如 "credentials.json"（无目录前缀）时 parent 为空串，
+                // 直接 join 出来的子路径会落到 CWD，且 read_dir("") 会报错导致历史日志重建为 0。
+                // 这里归一化为 "."，保证 join / read_dir 行为正确。
+                if d.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    d.to_path_buf()
+                }
+            })
+        })
     }
 
     /// 统计数据文件路径
@@ -1605,6 +1614,24 @@ impl MultiTokenManager {
     // ========================================================================
     // Admin API 方法
     // ========================================================================
+
+    /// 克隆全部凭据（含敏感字段：refreshToken、accessToken、clientSecret 等）
+    ///
+    /// 仅用于 Admin API 导出场景，调用方需自行保证脱敏与权限控制。
+    /// 返回值按调用时的顺序克隆，未做排序。
+    pub fn clone_all_credentials(&self) -> Vec<KiroCredentials> {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .map(|e| {
+                let mut cred = e.credentials.clone();
+                cred.canonicalize_auth_method();
+                cred.disabled = e.disabled;
+                cred.id = Some(e.id);
+                cred
+            })
+            .collect()
+    }
 
     /// 获取管理器状态快照（用于 Admin API）
     pub fn snapshot(&self) -> ManagerSnapshot {

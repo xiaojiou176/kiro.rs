@@ -2,12 +2,13 @@ import { useMemo, useState } from 'react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
-import { Activity, Cpu, KeyRound, Server } from 'lucide-react'
+import { Activity, Coins, Cpu, KeyRound, Server } from 'lucide-react'
 import { useByCredential, useByModel, useOverview, useTimeSeries } from '@/hooks/use-stats'
 import type { StatsRange } from '@/types/api'
 import { TimeSeriesChart } from '@/components/charts/time-series-chart'
 import { ModelPieChart } from '@/components/charts/model-pie-chart'
 import { CredentialBarChart } from '@/components/charts/credential-bar-chart'
+import { formatCredits, formatNumber } from '@/lib/utils'
 
 const RANGES: { label: string; value: StatsRange }[] = [
   { label: '24 小时', value: '24h' },
@@ -17,12 +18,6 @@ const RANGES: { label: string; value: StatsRange }[] = [
 
 function rangeLabel(range: StatsRange): string {
   return `近 ${RANGES.find((r) => r.value === range)?.label ?? range}`
-}
-
-function formatTokens(n: number): string {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
-  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K'
-  return n.toString()
 }
 
 export function OverviewPage() {
@@ -37,6 +32,22 @@ export function OverviewPage() {
   const modelData = useMemo(() => byModel ?? [], [byModel])
   const credData = useMemo(() => byCred ?? [], [byCred])
 
+  // 顶部卡片随时间窗变化：基于时序聚合，避免后端再加 range 参数
+  const rangeStats = useMemo(() => {
+    return seriesData.reduce(
+      (acc, p) => {
+        acc.calls += p.calls
+        acc.errors += p.errors
+        acc.inputTokens += p.inputTokens
+        acc.outputTokens += p.outputTokens
+        acc.credits += p.credits ?? 0
+        return acc
+      },
+      { calls: 0, errors: 0, inputTokens: 0, outputTokens: 0, credits: 0 },
+    )
+  }, [seriesData])
+  const rangeText = RANGES.find((r) => r.value === range)?.label ?? range
+
   return (
     <div>
       <div className="mb-6">
@@ -47,34 +58,42 @@ export function OverviewPage() {
       </div>
 
       {/* 顶部卡片 */}
-      <div className="grid gap-4 md:grid-cols-4 mb-6">
+      <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-5 mb-6">
         <StatCard
           icon={<Activity className="h-4 w-4" />}
-          label="今日调用"
-          value={overview?.todayCalls ?? 0}
+          label={`近 ${rangeText}调用`}
+          value={formatNumber(rangeStats.calls)}
           extra={
-            overview && overview.todayErrors > 0 ? (
-              <Badge variant="destructive">异常 {overview.todayErrors}</Badge>
+            rangeStats.errors > 0 ? (
+              <Badge variant="destructive">异常 {formatNumber(rangeStats.errors)}</Badge>
             ) : null
           }
         />
         <StatCard
           icon={<Cpu className="h-4 w-4" />}
-          label="今日输入 Token"
-          value={formatTokens(overview?.todayInputTokens ?? 0)}
+          label={`近 ${rangeText}输入 Token`}
+          value={formatNumber(rangeStats.inputTokens)}
         />
         <StatCard
           icon={<Cpu className="h-4 w-4" />}
-          label="今日输出 Token"
-          value={formatTokens(overview?.todayOutputTokens ?? 0)}
+          label={`近 ${rangeText}输出 Token`}
+          value={formatNumber(rangeStats.outputTokens)}
+        />
+        <StatCard
+          icon={<Coins className="h-4 w-4" />}
+          label={`近 ${rangeText} Credit`}
+          value={formatCredits(rangeStats.credits)}
+          extra={
+            <span className="text-[11px] text-muted-foreground">上游计费量</span>
+          }
         />
         <StatCard
           icon={<KeyRound className="h-4 w-4" />}
           label="启用的客户端 Key"
-          value={`${overview?.activeClientKeys ?? 0}`}
+          value={formatNumber(overview?.activeClientKeys ?? 0)}
           extra={
             <span className="text-[11px] text-muted-foreground">
-              上游 {overview?.activeCredentials ?? 0}
+              上游 {formatNumber(overview?.activeCredentials ?? 0)}
             </span>
           }
         />
@@ -85,7 +104,7 @@ export function OverviewPage() {
         <CardContent className="p-5">
           <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
             <div>
-              <h2 className="text-base font-semibold tracking-tight">Token 消耗趋势</h2>
+              <h2 className="text-base font-semibold tracking-tight">Token 使用趋势</h2>
               <p className="text-[12px] text-muted-foreground">
                 按 {range === '30d' ? '天' : '小时'} 聚合 · 输入/输出/缓存读写
               </p>
@@ -132,9 +151,9 @@ export function OverviewPage() {
                     {byModel.map((m) => (
                       <tr key={m.model} className="border-t border-border/40">
                         <td className="py-1 truncate">{m.model}</td>
-                        <td className="text-right tabular-nums">{m.calls}</td>
-                        <td className="text-right tabular-nums">{formatTokens(m.inputTokens)}</td>
-                        <td className="text-right tabular-nums">{formatTokens(m.outputTokens)}</td>
+                        <td className="text-right tabular-nums">{formatNumber(m.calls)}</td>
+                        <td className="text-right tabular-nums">{formatNumber(m.inputTokens)}</td>
+                        <td className="text-right tabular-nums">{formatNumber(m.outputTokens)}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -168,7 +187,7 @@ function StatCard({
 }: {
   icon: React.ReactNode
   label: string
-  value: number | string
+  value: string
   extra?: React.ReactNode
 }) {
   return (

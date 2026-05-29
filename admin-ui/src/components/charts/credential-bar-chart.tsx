@@ -2,6 +2,7 @@ import { memo, useMemo } from 'react'
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts'
 import type { CredentialDistribution } from '@/types/api'
 import { tooltipContentStyle, tooltipCursorStyle, tooltipItemStyle, tooltipLabelStyle } from './tooltip-style'
+import { formatNumber } from '@/lib/utils'
 
 interface Props {
   data: CredentialDistribution[]
@@ -11,7 +12,8 @@ function CredentialBarChartImpl({ data }: Props) {
   const formatted = useMemo(
     () =>
       data.slice(0, 12).map((d) => ({
-        label: d.email ? `#${d.credentialId} ${shortenEmail(d.email)}` : `#${d.credentialId}`,
+        label: d.email ? truncateEmail(d.email) : `#${d.credentialId}`,
+        fullLabel: d.email ?? `#${d.credentialId}`,
         inputTokens: d.inputTokens,
         outputTokens: d.outputTokens,
         calls: d.calls,
@@ -29,23 +31,32 @@ function CredentialBarChartImpl({ data }: Props) {
   }
 
   return (
-    <ResponsiveContainer width="100%" height={320}>
-      <BarChart data={formatted} margin={{ top: 8, right: 16, left: 0, bottom: 48 }}>
+    <ResponsiveContainer width="100%" height={340}>
+      <BarChart data={formatted} margin={{ top: 8, right: 16, left: 0, bottom: 64 }}>
         <CartesianGrid strokeDasharray="3 3" className="stroke-border/50" />
         <XAxis
           dataKey="label"
           tick={{ fontSize: 10 }}
-          angle={-25}
+          angle={-30}
           textAnchor="end"
           interval={0}
-          height={56}
+          height={72}
         />
-        <YAxis tick={{ fontSize: 11 }} />
+        <YAxis
+          tick={{ fontSize: 11 }}
+          tickFormatter={(v: number) => formatNumber(v)}
+          width={48}
+        />
         <Tooltip
           contentStyle={tooltipContentStyle}
           labelStyle={tooltipLabelStyle}
           itemStyle={tooltipItemStyle}
           cursor={tooltipCursorStyle}
+          formatter={(value: number) => formatNumber(value)}
+          labelFormatter={(_label: string, payload) => {
+            const item = payload?.[0]?.payload as { fullLabel?: string } | undefined
+            return item?.fullLabel ?? _label
+          }}
         />
         <Legend
           verticalAlign="top"
@@ -62,9 +73,13 @@ function CredentialBarChartImpl({ data }: Props) {
 
 export const CredentialBarChart = memo(CredentialBarChartImpl)
 
-function shortenEmail(email: string): string {
+/** 仅用于 X 轴展示：保留 @ 后域名前 1-2 段，整体最长 22 字符 */
+function truncateEmail(email: string): string {
+  if (email.length <= 22) return email
   const at = email.indexOf('@')
-  if (at < 0) return email.length > 14 ? email.slice(0, 12) + '...' : email
+  if (at < 0) return email.slice(0, 20) + '…'
   const name = email.slice(0, at)
-  return name.length > 10 ? name.slice(0, 8) + '..' : name
+  const domain = email.slice(at + 1)
+  const shortName = name.length > 12 ? name.slice(0, 11) + '…' : name
+  return `${shortName}@${domain}`
 }

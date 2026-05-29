@@ -197,16 +197,6 @@ async fn main() {
         tls_backend: config.tls_backend,
     });
 
-    anthropic::cache::set_debug_logging(config.cache_debug_logging);
-    anthropic::cache::set_max_read_ratio(config.cache_max_read_ratio);
-
-    // 初始化 Redis（如果配置了）
-    if let Some(redis_url) = &config.redis_url {
-        if let Err(e) = anthropic::cache::init_redis(redis_url).await {
-            tracing::warn!("Failed to initialize Redis cache: {}", e);
-        }
-    }
-
     // 客户端 Key 管理器 + 用量记录器 + 聚合器（与凭据文件同目录）
     let cache_dir = token_manager
         .cache_dir()
@@ -237,6 +227,14 @@ async fn main() {
     // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
     // 把 api_key 包成 Arc<RwLock<...>>，以便 Admin 模块运行时改 key 后立刻生效
     let shared_api_key = std::sync::Arc::new(parking_lot::RwLock::new(api_key.clone()));
+
+    // PromptCache：基于 cache_control 断点的进程内提示词缓存
+    // 持久化到 cache_dir/prompt_cache.json，启动时自动加载有效条目
+    let prompt_cache = std::sync::Arc::new(anthropic::prompt_cache::PromptCache::new(Some(
+        cache_dir.join("prompt_cache.json"),
+    )));
+    prompt_cache.clone().spawn_background();
+
     let anthropic_app = anthropic::create_router_with_shared_key(
         shared_api_key.clone(),
         Some(kiro_provider),
@@ -244,6 +242,7 @@ async fn main() {
         Some(client_key_manager.clone()),
         Some(usage_recorder.clone()),
         Some(usage_aggregator.clone()),
+        Some(prompt_cache.clone()),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）

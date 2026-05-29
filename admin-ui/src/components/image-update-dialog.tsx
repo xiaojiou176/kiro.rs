@@ -44,6 +44,7 @@ import {
 } from '@/api/credentials'
 import { extractErrorMessage } from '@/lib/utils'
 import type { GitHubRateLimitInfo } from '@/types/api'
+import { Markdown } from '@/components/markdown'
 
 interface ImageUpdateDialogProps {
   open: boolean
@@ -554,10 +555,7 @@ interface ReleaseNotesPanelProps {
 
 /**
  * 折叠面板：展示当前版本的 Changelog（GitHub Release body 原文）。
- *
- * 内容是 markdown 文本，但使用方写得比较朴素（标题 / 列表 / 代码块），
- * 直接用 `whitespace-pre-wrap` 渲染原文足够清晰，不引入 markdown 渲染器
- * 以保持产物体积。需要打开浏览器查看完整渲染时点击「在 GitHub 查看」。
+ * 使用轻量 markdown 渲染器还原标题/列表/代码块/链接等，复杂样式仍可点击「在 GitHub 查看」打开。
  */
 function ReleaseNotesPanel({ version, title, notes, href }: ReleaseNotesPanelProps) {
   const [open, setOpen] = useState(false)
@@ -581,9 +579,9 @@ function ReleaseNotesPanel({ version, title, notes, href }: ReleaseNotesPanelPro
       </button>
       {open && (
         <div className="border-t px-3 py-2.5 text-xs">
-          <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words leading-relaxed text-muted-foreground">
-            {notes}
-          </pre>
+          <div className="max-h-72 overflow-auto pr-1 text-muted-foreground">
+            <Markdown text={notes} />
+          </div>
           {href && (
             <div className="mt-2">
               <a

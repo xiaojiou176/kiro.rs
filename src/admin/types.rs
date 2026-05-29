@@ -642,6 +642,59 @@ fn default_oauth_path() -> String {
 
 // ============ 通用响应 ============
 
+// ============ KAM 导出 ============
+
+/// Kiro Account Manager 导出文件中的单个账号（KAM 1.8.3+ 平铺格式）
+///
+/// 字段命名与 KAM 导入逻辑对齐（见 `admin-ui/src/components/kam-import-dialog.tsx`），
+/// 仅在凭据 `Some(value)` 时输出，避免 `null` 字段。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KamExportAccount {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nickname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idp: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_arn: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+}
+
+/// KAM 导出响应（含版本号 + 账号数组，兼容 KAM 旧版导入器）
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KamExportResponse {
+    /// 导出格式版本号
+    pub version: String,
+    /// 导出时间（RFC3339）
+    pub exported_at: String,
+    /// 账号列表（KAM 1.8.3+ 平铺格式）
+    pub accounts: Vec<KamExportAccount>,
+}
+
 /// 操作成功响应
 #[derive(Debug, Serialize)]
 pub struct SuccessResponse {

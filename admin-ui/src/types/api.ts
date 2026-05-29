@@ -331,9 +331,11 @@ export interface OverviewStats {
   todayInputTokens: number
   todayOutputTokens: number
   todayErrors: number
+  todayCredits: number
   weekCalls: number
   weekInputTokens: number
   weekOutputTokens: number
+  weekCredits: number
   activeClientKeys: number
   activeCredentials: number
 }
@@ -346,6 +348,7 @@ export interface TimeSeriesPoint {
   cacheReadTokens: number
   calls: number
   errors: number
+  credits: number
 }
 
 export interface ModelDistribution {

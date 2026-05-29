@@ -213,7 +213,9 @@ export function TopbarTools() {
                 size="sm"
                 variant="outline"
                 onClick={() => {
-                  const key = generateApiKey()
+                  const key = generateApiKey(
+                    keyEditMode === 'admin' ? 'sk-admin-' : 'sk-kiro-',
+                  )
                   setNewKey(key)
                   setShowPlain(true)
                 }}

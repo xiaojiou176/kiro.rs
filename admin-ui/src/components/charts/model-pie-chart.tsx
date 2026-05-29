@@ -2,6 +2,7 @@ import { memo, useMemo } from 'react'
 import { PieChart, Pie, Cell, Tooltip, ResponsiveContainer, Legend } from 'recharts'
 import type { ModelDistribution } from '@/types/api'
 import { tooltipContentStyle, tooltipItemStyle, tooltipLabelStyle } from './tooltip-style'
+import { formatNumber } from '@/lib/utils'
 
 interface Props {
   data: ModelDistribution[]
@@ -59,7 +60,7 @@ function ModelPieChartImpl({ data }: Props) {
             const pct = ((value / total) * 100).toFixed(1)
             const payload = (item?.payload ?? {}) as { inputTokens?: number; outputTokens?: number }
             return [
-              `${value} 次（${pct}%）  in ${payload.inputTokens ?? 0} / out ${payload.outputTokens ?? 0}`,
+              `${formatNumber(value)} 次（${pct}%）  in ${formatNumber(payload.inputTokens ?? 0)} / out ${formatNumber(payload.outputTokens ?? 0)}`,
               item?.payload?.name as string,
             ]
           }}
