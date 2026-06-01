@@ -161,7 +161,7 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
     }
 }
 
-fn map_provider_error(err: Error) -> Response {
+pub(super) fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
 
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
@@ -462,6 +462,15 @@ pub async fn post_messages(
         let status = if resp.status().is_success() { "success" } else { "error" };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
+    }
+
+    let payload_stream = payload.stream;
+    // 混合工具(web_search + exec...)场景:web_search 与其它工具并存,会落普通对话路径,
+    // 上游可能回 name=web_search 的 tool_use。走内部 agentic loop,内部搜索并回灌。
+    if websearch::has_web_search_among_tools(&payload) {
+        tracing::info!("检测到混合工具含 web_search，进入 web_search agentic loop");
+        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream)
+            .await;
     }
 
     // 转换请求
@@ -1067,6 +1076,15 @@ pub async fn post_messages_cc(
         let status = if resp.status().is_success() { "success" } else { "error" };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
+    }
+
+    let payload_stream = payload.stream;
+    // 混合工具(web_search + exec...)场景:web_search 与其它工具并存,会落普通对话路径,
+    // 上游可能回 name=web_search 的 tool_use。走内部 agentic loop,内部搜索并回灌。
+    if websearch::has_web_search_among_tools(&payload) {
+        tracing::info!("检测到混合工具含 web_search，进入 web_search agentic loop");
+        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream)
+            .await;
     }
 
     // 转换请求

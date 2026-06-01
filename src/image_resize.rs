@@ -145,12 +145,41 @@ pub fn maybe_shrink_image(
 
 fn passthrough(format: String, data_base64: &str) -> ProcessedImage {
     let n = data_base64.len();
+    // 用真实字节的 magic bytes 校正 format：宿主侧可能标 png 但字节实为 jpeg，
+    // 忠实透传会让 Bedrock 严格 MIME 校验报 IMAGE_MIME_MISMATCH。探测失败则保持原标签（不丢图）。
+    let format = match detect_format_from_bytes(data_base64) {
+        Some(real) if real != format => {
+            debug!(
+                target: "kiro_rs::image_resize",
+                declared = %format,
+                actual = %real,
+                "passthrough format corrected from magic bytes"
+            );
+            real
+        }
+        _ => format,
+    };
     ProcessedImage {
         format,
         data_base64: data_base64.to_string(),
         was_resized: false,
         original_bytes: n,
         final_bytes: n,
+    }
+}
+
+/// 按真实字节的 magic bytes 探测格式，返回 "png"/"jpeg"/"gif"/"webp"。
+/// 只 decode 前 ~16 字节（base64 前 24 字符）足够覆盖全部 magic，省 CPU。
+/// 探测不出（解码失败/未知格式）返回 None，由调用方安全兜底保持原标签。
+fn detect_format_from_bytes(data_base64: &str) -> Option<String> {
+    let head: String = data_base64.chars().take(24).collect();
+    let bytes = BASE64.decode(head.as_bytes()).ok()?;
+    match image::guess_format(&bytes).ok()? {
+        ImageFormat::Png => Some("png".to_string()),
+        ImageFormat::Jpeg => Some("jpeg".to_string()),
+        ImageFormat::Gif => Some("gif".to_string()),
+        ImageFormat::WebP => Some("webp".to_string()),
+        _ => None,
     }
 }
 
@@ -356,6 +385,72 @@ mod tests {
         let out = maybe_shrink_image(cfg, "png", &bogus);
         assert!(!out.was_resized, "corrupt input should fall through");
         assert_eq!(out.format, "png");
+        assert_eq!(out.data_base64, bogus);
+    }
+
+    fn make_jpeg(w: u32, h: u32) -> String {
+        use image::{Rgb, RgbImage};
+        let mut img = RgbImage::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                img.put_pixel(x, y, Rgb([(x % 256) as u8, (y % 256) as u8, 128]));
+            }
+        }
+        let mut buf = Vec::new();
+        img.write_to(&mut Cursor::new(&mut buf), ImageFormat::Jpeg)
+            .unwrap();
+        BASE64.encode(&buf)
+    }
+
+    #[test]
+    fn mislabeled_png_header_jpeg_bytes_corrected_to_jpeg() {
+        let cfg = ResizeConfig {
+            enabled: true,
+            max_long_side: 1568,
+            max_bytes: 400_000,
+            jpeg_quality: 85,
+        };
+        // 真实 JPEG 字节，但调用方误标 format="png"（宿主侧头体不一致，CPA 忠实透传）。
+        // 小图走 passthrough。出站 format 必须按真实字节校正成 jpeg，否则 Bedrock 报 IMAGE_MIME_MISMATCH。
+        let jpeg = make_jpeg(64, 64);
+        let out = maybe_shrink_image(cfg, "png", &jpeg);
+        assert_eq!(out.data_base64, jpeg, "must not mutate image bytes");
+        assert_eq!(
+            out.format, "jpeg",
+            "format must be corrected to match actual JPEG bytes"
+        );
+    }
+
+    #[test]
+    fn matching_png_kept_as_png() {
+        let cfg = ResizeConfig::from_env();
+        let png = make_png(64, 64);
+        let out = maybe_shrink_image(cfg, "png", &png);
+        assert_eq!(out.format, "png", "real png must stay png");
+        assert_eq!(out.data_base64, png);
+    }
+
+    #[test]
+    fn matching_jpeg_kept_as_jpeg() {
+        let cfg = ResizeConfig::from_env();
+        let jpeg = make_jpeg(64, 64);
+        let out = maybe_shrink_image(cfg, "jpeg", &jpeg);
+        assert_eq!(out.format, "jpeg", "real jpeg must stay jpeg");
+        assert_eq!(out.data_base64, jpeg);
+    }
+
+    #[test]
+    fn undetectable_bytes_keep_declared_format() {
+        // 坏数据探测失败 -> 保持传入 format，绝不丢图。
+        let cfg = ResizeConfig {
+            enabled: false,
+            max_long_side: 1568,
+            max_bytes: 400_000,
+            jpeg_quality: 85,
+        };
+        let bogus = "X".repeat(40);
+        let out = maybe_shrink_image(cfg, "png", &bogus);
+        assert_eq!(out.format, "png", "undetectable bytes keep declared format");
         assert_eq!(out.data_base64, bogus);
     }
 }

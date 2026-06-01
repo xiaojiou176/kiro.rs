@@ -604,7 +604,7 @@ pub struct MultiTokenManager {
 }
 
 /// 每个凭据最大 API 调用失败次数
-const MAX_FAILURES_PER_CREDENTIAL: u32 = 3;
+const MAX_FAILURES_PER_CREDENTIAL: u32 = 10;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 
@@ -2720,19 +2720,24 @@ mod tests {
             MultiTokenManager::new(config, vec![cred1, cred2], None, None, false).unwrap();
 
         // 凭据会自动分配 ID（从 1 开始）
-        // 前两次失败不会禁用（使用 ID 1）
-        assert!(manager.report_failure(1));
-        assert!(manager.report_failure(1));
+        // 连续失败 MAX_FAILURES_PER_CREDENTIAL 次才禁用（用常量，跟阈值联动）
+        let n = MAX_FAILURES_PER_CREDENTIAL;
+
+        // ID 1：前 n-1 次失败不禁用
+        for _ in 0..(n - 1) {
+            assert!(manager.report_failure(1));
+        }
         assert_eq!(manager.available_count(), 2);
 
-        // 第三次失败会禁用第一个凭据
+        // 第 n 次失败禁用第一个凭据
         assert!(manager.report_failure(1));
         assert_eq!(manager.available_count(), 1);
 
-        // 继续失败第二个凭据（使用 ID 2）
-        assert!(manager.report_failure(2));
-        assert!(manager.report_failure(2));
-        assert!(!manager.report_failure(2)); // 所有凭据都禁用了
+        // ID 2：再失败 n 次，最后一次返回 false（全部禁用）
+        for _ in 0..(n - 1) {
+            assert!(manager.report_failure(2));
+        }
+        assert!(!manager.report_failure(2));
         assert_eq!(manager.available_count(), 0);
     }
 

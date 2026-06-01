@@ -16,7 +16,7 @@ use crate::kiro::model::requests::tool::{
     InputSchema, Tool, ToolResult, ToolSpecification, ToolUseEntry,
 };
 
-use super::types::{ContentBlock, MessagesRequest};
+use super::types::{ContentBlock, ImageSource, MessagesRequest};
 
 use crate::image_resize::{ResizeConfig, maybe_shrink_image};
 
@@ -444,6 +444,16 @@ fn determine_chat_trigger_type(_req: &MessagesRequest) -> String {
 fn process_message_content(
     content: &serde_json::Value,
 ) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
+    process_message_content_dedup(content, None)
+}
+
+/// 与 `process_message_content` 相同，但当 `dedup` 为 `Some` 时对图片做 SHA256 去重：
+/// 历史消息里重复出现的同一张图（同 base64）只保留首次，后续替换成占位文本，
+/// 避免多轮对话里同一截图反复重发 base64 烧 token。
+fn process_message_content_dedup(
+    content: &serde_json::Value,
+    mut dedup: Option<&mut std::collections::HashSet<String>>,
+) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
     let mut tool_results = Vec::new();
@@ -462,24 +472,17 @@ fn process_message_content(
                             }
                         }
                         "image" => {
-                            if let Some(source) = block.source {
-                                if let Some(format) = get_image_format(&source.media_type) {
-                                    let cfg = ResizeConfig::from_env();
-                                    let processed = maybe_shrink_image(
-                                        cfg,
-                                        &format,
-                                        &source.data,
-                                    );
-                                    images.push(KiroImage::from_base64(
-                                        processed.format,
-                                        processed.data_base64,
-                                    ));
-                                }
+                            if let Some(source) = block.source
+                                && let Some(placeholder) =
+                                    extract_kiro_image(&source, &mut dedup, &mut images)
+                            {
+                                text_parts.push(placeholder);
                             }
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
-                                let result_content = extract_tool_result_content(&block.content);
+                                let result_content =
+                                    extract_tool_result_content(&block.content, &mut dedup, &mut images);
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -518,18 +521,65 @@ fn get_image_format(media_type: &str) -> Option<String> {
     }
 }
 
+/// 把一个 image block 的 source 转成 `KiroImage` 推到顶层 `images`。
+///
+/// 复用顶层 image 的同一条转换链（格式校验 + SHA256 去重 + resize + `from_base64`），
+/// 让 tool_result 里的 image 走同样的路上提到顶层 images 字段。
+/// 返回 `Some(占位文本)` 表示命中历史去重、图被省略；`None` 表示已上提或格式不支持。
+fn extract_kiro_image(
+    source: &ImageSource,
+    dedup: &mut Option<&mut std::collections::HashSet<String>>,
+    images: &mut Vec<KiroImage>,
+) -> Option<String> {
+    let format = get_image_format(&source.media_type)?;
+    // 历史去重：命中过的同图省略 base64，返回占位文本
+    if let Some(seen) = dedup.as_deref_mut() {
+        let mut hasher = Sha256::new();
+        hasher.update(source.data.as_bytes());
+        let digest = format!("{:x}", hasher.finalize());
+        if !seen.insert(digest) {
+            return Some("[image omitted: identical to an earlier screenshot]".to_string());
+        }
+    }
+    let cfg = ResizeConfig::from_env();
+    let processed = maybe_shrink_image(cfg, &format, &source.data);
+    images.push(KiroImage::from_base64(processed.format, processed.data_base64));
+    None
+}
+
 /// 提取工具结果内容
-fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
+///
+/// 文本元素留作 tool_result 占位文本；`type=="image"` 的 block 抽成 `KiroImage`
+/// 上提到顶层 `images`（Amazon Q 的 `ToolResult` 没有图字段，图只能走顶层通道）。
+/// 若 tool_result 只有图没有文本，留占位文本 "[image attached]"。
+fn extract_tool_result_content(
+    content: &Option<serde_json::Value>,
+    dedup: &mut Option<&mut std::collections::HashSet<String>>,
+    images: &mut Vec<KiroImage>,
+) -> String {
     match content {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Array(arr)) => {
             let mut parts = Vec::new();
+            let mut had_image = false;
             for item in arr {
                 if let Some(text) = item.get("text").and_then(|v| v.as_str()) {
                     parts.push(text.to_string());
+                } else if item.get("type").and_then(|v| v.as_str()) == Some("image")
+                    && let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone())
+                    && let Some(source) = block.source
+                {
+                    had_image = true;
+                    if let Some(placeholder) = extract_kiro_image(&source, dedup, images) {
+                        parts.push(placeholder);
+                    }
                 }
             }
-            parts.join("\n")
+            if parts.is_empty() && had_image {
+                "[image attached]".to_string()
+            } else {
+                parts.join("\n")
+            }
         }
         Some(v) => v.to_string(),
         None => String::new(),
@@ -819,6 +869,8 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     // 收集并配对消息
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
     let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
+    // 历史图片 SHA256 去重集合，贯穿整个历史；同图重复出现只保留首次
+    let mut image_dedup: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for i in 0..history_end_index {
         let msg = &messages[i];
@@ -834,7 +886,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
         } else if msg.role == "assistant" {
             // 先处理累积的 user 消息
             if !user_buffer.is_empty() {
-                let merged_user = merge_user_messages(&user_buffer, model_id)?;
+                let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
                 history.push(Message::User(merged_user));
                 user_buffer.clear();
             }
@@ -851,7 +903,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 
     // 处理结尾的孤立 user 消息
     if !user_buffer.is_empty() {
-        let merged_user = merge_user_messages(&user_buffer, model_id)?;
+        let merged_user = merge_user_messages(&user_buffer, model_id, &mut image_dedup)?;
         history.push(Message::User(merged_user));
 
         // 自动配对一个 "OK" 的 assistant 响应
@@ -866,13 +918,15 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
 fn merge_user_messages(
     messages: &[&super::types::Message],
     model_id: &str,
+    dedup: &mut std::collections::HashSet<String>,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut all_images = Vec::new();
     let mut all_tool_results = Vec::new();
 
     for msg in messages {
-        let (text, images, tool_results) = process_message_content(&msg.content)?;
+        let (text, images, tool_results) =
+            process_message_content_dedup(&msg.content, Some(dedup))?;
         if !text.is_empty() {
             content_parts.push(text);
         }
@@ -1932,5 +1986,112 @@ mod tests {
             }
         }
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
+    }
+
+    // 1x1 PNG 的 base64（合法 PNG header，resize 直接 passthrough）
+    const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+
+    #[test]
+    fn test_tool_result_image_lifts_to_top_level() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // user 提问 -> assistant tool_use -> user tool_result（含图 + 文本）
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("take a screenshot"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tool-1", "name": "screenshot", "input": {}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": [
+                            {"type": "text", "text": "here is the screen"},
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": TINY_PNG_B64}}
+                        ]}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+
+        // 图被上提到顶层 images
+        assert_eq!(msg.images.len(), 1, "tool_result 里的图应上提到顶层 images");
+        assert_eq!(msg.images[0].format, "png");
+        assert_eq!(msg.images[0].source.bytes, TINY_PNG_B64);
+
+        // tool_result 自身只保留文本占位（图已剥离）
+        let tr = &msg.user_input_message_context.tool_results;
+        assert_eq!(tr.len(), 1);
+        assert_eq!(
+            tr[0].content[0].get("text").and_then(|v| v.as_str()),
+            Some("here is the screen"),
+            "tool_result content 应保留文本，不含 base64"
+        );
+    }
+
+    #[test]
+    fn test_tool_result_text_only_unchanged() {
+        use super::super::types::Message as AnthropicMessage;
+
+        // 纯文本 tool_result：回归不变，不应产生顶层图
+        let req = MessagesRequest {
+            model: "claude-sonnet-4.5".to_string(),
+            max_tokens: 1024,
+            messages: vec![
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!("read the file"),
+                },
+                AnthropicMessage {
+                    role: "assistant".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_use", "id": "tool-1", "name": "read", "input": {"path": "/a.txt"}}
+                    ]),
+                },
+                AnthropicMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!([
+                        {"type": "tool_result", "tool_use_id": "tool-1", "content": "file content"}
+                    ]),
+                },
+            ],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: None,
+            metadata: None,
+        };
+
+        let result = convert_request(&req).unwrap();
+        let msg = &result.conversation_state.current_message.user_input_message;
+
+        assert!(msg.images.is_empty(), "纯文本 tool_result 不应产生顶层图");
+        let tr = &msg.user_input_message_context.tool_results;
+        assert_eq!(tr.len(), 1);
+        assert_eq!(
+            tr[0].content[0].get("text").and_then(|v| v.as_str()),
+            Some("file content"),
+            "纯文本 tool_result content 应原样保留"
+        );
     }
 }
