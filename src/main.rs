@@ -208,17 +208,38 @@ async fn main() {
             admin::ClientKeyManager::new()
         }),
     );
-    let usage_recorder = std::sync::Arc::new(admin::UsageRecorder::new(cache_dir.clone()));
+    let usage_recorder = std::sync::Arc::new(admin::UsageRecorder::with_retention(
+        cache_dir.clone(),
+        config.usage_log_retention_days as i64,
+    ));
     let usage_aggregator = std::sync::Arc::new(admin::UsageAggregator::new());
     usage_aggregator.rebuild_from_logs(&cache_dir);
-    // 启动后定期清理过期 usage_log
+
+    // 请求链路追踪存储（SQLite，traces.db）。失败不致命：trace 不可用但服务正常。
+    let trace_store: Option<admin::SharedTraceStore> = match admin::TraceStore::open(
+        cache_dir.join("traces.db"),
+        config.trace_enabled,
+        config.trace_retention_days,
+    ) {
+        Ok(s) => Some(std::sync::Arc::new(s)),
+        Err(e) => {
+            tracing::warn!("打开 traces.db 失败，请求链路追踪不可用: {}", e);
+            None
+        }
+    };
+
+    // 启动后定期清理过期 usage_log 与 trace 记录
     {
         let recorder = usage_recorder.clone();
+        let trace_store = trace_store.clone();
         tokio::spawn(async move {
             let day = std::time::Duration::from_secs(24 * 3600);
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             loop {
                 recorder.cleanup_old_logs();
+                if let Some(ts) = &trace_store {
+                    ts.cleanup();
+                }
                 tokio::time::sleep(day).await;
             }
         });
@@ -243,6 +264,7 @@ async fn main() {
         Some(usage_recorder.clone()),
         Some(usage_aggregator.clone()),
         Some(prompt_cache.clone()),
+        trace_store.clone(),
     );
 
     // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
@@ -258,14 +280,26 @@ async fn main() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
             anthropic_app
         } else {
+            // Admin 查询需要一个确定的 store；traces.db 打开失败时用内存兜底（仅本进程有效）
+            let admin_trace_store = trace_store.clone().unwrap_or_else(|| {
+                std::sync::Arc::new(
+                    admin::TraceStore::open_in_memory()
+                        .expect("内存 trace store 初始化失败"),
+                )
+            });
             let admin_service =
-                admin::AdminService::new(token_manager.clone(), endpoint_names.clone());
+                admin::AdminService::new(token_manager.clone(), endpoint_names.clone())
+                    .with_log_governance(
+                        Some(admin_trace_store.clone()),
+                        Some(usage_recorder.clone()),
+                    );
             let admin_state = admin::AdminState::new(
                 admin_key,
                 shared_api_key.clone(),
                 admin_service,
                 client_key_manager.clone(),
                 usage_aggregator.clone(),
+                admin_trace_store,
             );
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）

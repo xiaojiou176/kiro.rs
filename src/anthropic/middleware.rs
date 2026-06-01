@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
+use crate::admin::trace_db::SharedTraceStore;
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 use crate::observability;
@@ -47,6 +48,8 @@ pub struct AppState {
     pub usage_aggregator: Option<SharedAggregator>,
     /// 中转层 prompt cache（基于 cache_control 断点的内存缓存）
     pub prompt_cache: Option<SharedPromptCache>,
+    /// 请求链路追踪存储（SQLite，可选）
+    pub trace_store: Option<SharedTraceStore>,
 }
 
 impl AppState {
@@ -64,6 +67,7 @@ impl AppState {
             usage_recorder: None,
             usage_aggregator: None,
             prompt_cache: None,
+            trace_store: None,
         }
     }
 
@@ -77,6 +81,7 @@ impl AppState {
             usage_recorder: None,
             usage_aggregator: None,
             prompt_cache: None,
+            trace_store: None,
         }
     }
 
@@ -102,6 +107,12 @@ impl AppState {
     /// 注入 PromptCache
     pub fn with_prompt_cache(mut self, cache: Option<SharedPromptCache>) -> Self {
         self.prompt_cache = cache;
+        self
+    }
+
+    /// 注入链路追踪存储
+    pub fn with_trace_store(mut self, store: Option<SharedTraceStore>) -> Self {
+        self.trace_store = store;
         self
     }
 }

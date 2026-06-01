@@ -9,6 +9,19 @@ use uuid::Uuid;
 
 use crate::kiro::model::events::Event;
 
+/// thinking 块的 signature 占位字符串
+///
+/// Anthropic Messages API 协议规定 thinking 模式下，assistant 消息的
+/// `{type:"thinking", ...}` 块必须带 `signature` 字段并在下一轮原样回传，
+/// 否则 SDK / 服务端会拒绝请求并报：
+/// `The content[].thinking in the thinking mode must be passed back to the API`。
+///
+/// 上游 Kiro 不下发真实签名（它本身不是 Anthropic 服务端），因此 kiro.rs 在
+/// thinking 块结束时插入一个非空占位字符串以满足客户端本地校验。
+/// converter 在解析 assistant 消息回传 Kiro 时只读 `block.thinking`，不读
+/// signature，因此该占位字符串只在客户端 ↔ kiro.rs 之间存在，不会影响转发。
+pub(super) const THINKING_SIGNATURE_PLACEHOLDER: &str = "kiro-rs-thinking-signature";
+
 /// 找到小于等于目标位置的最近有效UTF-8字符边界
 ///
 /// UTF-8字符可能占用1-4个字节，直接按字节位置切片可能会切在多字节字符中间导致panic。
@@ -805,6 +818,8 @@ impl StreamContext {
                     if let Some(thinking_index) = self.thinking_block_index {
                         // 先发送空的 thinking_delta
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        // signature_delta：满足客户端 thinking 模式下的本地校验
+                        events.push(self.create_signature_delta_event(thinking_index));
                         // 再发送 content_block_stop
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
@@ -930,6 +945,30 @@ impl StreamContext {
         )
     }
 
+    /// 创建 signature_delta 事件
+    ///
+    /// Anthropic 协议下 thinking 块流式结束前必须发一个 signature_delta，
+    /// SDK 会把它聚合到 thinking 块的 `signature` 字段。客户端在下一轮把
+    /// assistant 消息回传时本地校验 thinking 块必须带非空 signature，否则抛出
+    /// `The content[].thinking in the thinking mode must be passed back to the API`。
+    ///
+    /// 上游 Kiro 不是 Anthropic 服务端，不会下发真实签名，因此这里发一个非空
+    /// 占位字符串以满足客户端本地校验。该字段不参与转发回 Kiro 的逻辑
+    /// （converter 只读 `block.thinking`，不读 signature）。
+    fn create_signature_delta_event(&self, index: i32) -> SseEvent {
+        SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": THINKING_SIGNATURE_PLACEHOLDER,
+                }
+            }),
+        )
+    }
+
     /// 处理工具使用事件
     fn process_tool_use(
         &mut self,
@@ -961,6 +1000,8 @@ impl StreamContext {
                 if let Some(thinking_index) = self.thinking_block_index {
                     // 先发送空的 thinking_delta
                     events.push(self.create_thinking_delta_event(thinking_index, ""));
+                    // signature_delta：满足客户端 thinking 模式下的本地校验
+                    events.push(self.create_signature_delta_event(thinking_index));
                     // 再发送 content_block_stop
                     if let Some(stop_event) =
                         self.state_manager.handle_content_block_stop(thinking_index)
@@ -1077,6 +1118,8 @@ impl StreamContext {
                     // 关闭 thinking 块：先发送空的 thinking_delta，再发送 content_block_stop
                     if let Some(thinking_index) = self.thinking_block_index {
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        // signature_delta：满足客户端 thinking 模式下的本地校验
+                        events.push(self.create_signature_delta_event(thinking_index));
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
                         {
@@ -1104,6 +1147,8 @@ impl StreamContext {
                     if let Some(thinking_index) = self.thinking_block_index {
                         // 先发送空的 thinking_delta
                         events.push(self.create_thinking_delta_event(thinking_index, ""));
+                        // signature_delta：满足客户端 thinking 模式下的本地校验
+                        events.push(self.create_signature_delta_event(thinking_index));
                         // 再发送 content_block_stop
                         if let Some(stop_event) =
                             self.state_manager.handle_content_block_stop(thinking_index)
@@ -1692,6 +1737,43 @@ mod tests {
         assert!(
             pos_thinking_stop.unwrap() < pos_tool_start.unwrap(),
             "thinking block should stop before tool_use block starts"
+        );
+    }
+
+    #[test]
+    fn test_thinking_block_emits_signature_delta_before_stop() {
+        // 客户端在 thinking 模式下要求 thinking 块带 signature 字段，否则下一轮回传时
+        // 会抛出 "must be passed back to the API"。本测试验证 thinking 块结束前发送了
+        // 一个非空的 signature_delta 事件。
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response("<thinking>abc</thinking>\n\nhello"));
+        all.extend(ctx.generate_final_events());
+
+        let thinking_index = ctx
+            .thinking_block_index
+            .expect("thinking block index should exist");
+
+        let pos_sig = all.iter().position(|e| {
+            e.event == "content_block_delta"
+                && e.data["index"].as_i64() == Some(thinking_index as i64)
+                && e.data["delta"]["type"] == "signature_delta"
+                && e.data["delta"]["signature"]
+                    .as_str()
+                    .is_some_and(|s| !s.is_empty())
+        });
+        let pos_stop = all.iter().position(|e| {
+            e.event == "content_block_stop"
+                && e.data["index"].as_i64() == Some(thinking_index as i64)
+        });
+
+        assert!(pos_sig.is_some(), "signature_delta should be emitted");
+        assert!(pos_stop.is_some(), "content_block_stop should be emitted");
+        assert!(
+            pos_sig.unwrap() < pos_stop.unwrap(),
+            "signature_delta must precede content_block_stop"
         );
     }
 

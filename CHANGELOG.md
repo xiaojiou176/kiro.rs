@@ -6,11 +6,127 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.5.1] - 2026-05-29
+## [0.5.7] - 2026-05-30
 
-主题：彻底重构 prompt cache 与计费指标——上游 `meteringEvent` 实测只下发 `credit`、不带 token / cache 字段，因此把基础设施收敛到「进程内」：移除 Redis 依赖、按 Anthropic `cache_control` 多断点协议在中转层自建 prompt cache、把 `credit` 作为新维度贯穿后端聚合 → API → 前端。仪表盘同步重做：5 系列图表 + 双 Y 轴 + K/M/B 紧凑数值 + 卡片随时间窗切换。
+主题：凭据失败次数从单一"连续失败计数器"升级为**累计统计 + 按类型三色分类展示**。此前卡片"失败次数"绑定 `failure_count`（连续失败计数器，成功即清零、账号风控与瞬态不计入），导致鉴权失败被其他凭据救回后立即清零、账号风控压根不显示，与用户对"这个凭据到底失败了多少次、什么原因"的直觉不符。
 
-> 0.5.0 因 Credit 数值显示问题被作废（`formatCredits` 在 `value ≥ 1` 时直接打印完整浮点）；0.5.1 修复该问题并整合所有内容，请所有用户直接升级到 0.5.1，跳过 0.5.0。
+### ✨ 新功能 — 累计失败统计
+
+- **拆分计数,避免误禁用**：`token_manager` 新增 `total_failure_count`——所有失败类型（鉴权 / 额度 / 风控 / 瞬态 / 网络）都 +1、只增不减、仅手动「重置失败计数 / 恢复异常」(`reset_and_enable`) 时归零。原 `failure_count` 保持"连续失败、成功清零"语义,继续驱动"连续失败 N 次自动禁用",因此健康凭据不会被终身累计的失败数误禁用。持久化到 `kiro_stats.json`（`serde(default)` 向后兼容旧文件）,贯通快照 → admin API → 前端。
+
+### ✨ 新功能 — 失败次数按类型三色分类
+
+- **三色展示（鉴权 / 风控 / 其他）**：卡片"失败次数"改为 `auth / throttle / other` 三个分色数字（如 `3/1/2`,鉴权红、账号风控橙、其他灰）。数据来自 trace 库聚合——新增 `trace_db::failure_stats()` 对 `trace_attempts` 按 `credential_id + outcome` 分组 COUNT 并归并三类（鉴权=`auth_failed`、风控=`account_throttled`、其他=额度/瞬态/网络/请求错误/未知）。
+- **新接口 `GET /api/admin/traces/failure-stats`**：返回 `{credentialId: {auth, throttle, other}}`。前端 dashboard 每 30s 拉一次并按凭据分发给各卡片;无 trace 数据（trace 关闭 / 已过期清理）时回退显示 `totalFailureCount`。鼠标悬停 title 说明各类含义,点击仍打开失败日志详情弹框。
+
+## [0.5.6] - 2026-05-30
+
+维护版本：仅版本号递增，无功能或代码变更（内容同 0.5.5）。用于刷新发布产物 / 镜像。
+
+## [0.5.5] - 2026-05-30
+
+主题：新增**请求链路追踪（Trace）+ 「请求日志」排查页面**。此前 `/v1/messages` 的失败链路几乎不可观测——provider 重试循环里每跳失败（402 禁用 / 429 风控冷却 / 401/403 鉴权 / 5xx / 网络错误）只有 `tracing::warn!` 日志，handler 最终只写一条 `UsageRecord` 且失败时 `credential_id=0`、status 仅 success/error，无错误类型、无重试次数、无上游错误体；流式中途断开也只记 `error`。这一版把每个外部请求的完整重试链路（含每跳命中凭据、HTTP 状态码、失败分类、上游错误体片段、耗时）落到 SQLite，并提供可筛选、可展开链路的前端页面，专门用于排查"中断"类问题。配套加日志治理（trace 开关 / 保留天数可配且运行时可改），以及一批凭据卡片交互改进（拖拽排序优先级、失败日志详情弹框、卡片等高对齐等）、Kiro 账号无痕登录选项。
+
+> 0.5.3 / 0.5.4 因发布间隔过短被合并进 0.5.5，请直接使用 0.5.5。下方为合并后的完整内容。
+
+### ✨ 新功能 — Kiro 账号无痕登录
+
+- **「使用无痕窗口登录」选项**：Social 登录对话框新增勾选框。勾选后发起登录不自动 `window.open`（浏览器不允许网页 JS 直控无痕模式，远程部署后端也无法拉起访客本地浏览器），改为把登录链接复制到剪贴板并提示用户自行用无痕 / 隐身窗口（Ctrl+Shift+N）打开，避免与当前已登录的 Google / GitHub 账号串号；waiting 界面提供「复制登录链接」按钮可重复复制。不勾选维持原自动打开行为。
+
+### 🛠 修复 — 凭据失败详情查询与展示
+
+- **失败记录覆盖"中间跳失败但整体成功"**：此前凭据失败详情弹框用 `credentialId`（最终凭据）+ `onlyFailed`（最终状态）过滤，导致"某凭据某一跳失败、但请求最终被其他凭据救回成功"的记录查不到——而这正是凭据因失败过多被禁用的典型成因。`TraceQuery` 新增 `failed_attempt_credential_id`，用 `EXISTS` 子查询匹配 `trace_attempts` 里该凭据 `outcome != 'success'` 的跳（不论 trace 最终状态）；`GET /api/admin/traces` 新增 `failedAttemptCredentialId` 参数。前端弹框改用该维度查询。
+- **失败次数与日志条数一致**：弹框原按 trace 渲染、每条只取该凭据第一个失败跳，导致同一请求里该凭据连续失败多跳被折叠成一行（如 3 次 403 只显示 1 条）。改为摊平该凭据的所有失败跳逐条展示，每行标注「第 N/M 跳」，单跳只显示本跳的 outcome / HTTP / 错误体；整条 trace 最终成功时标注"本次请求最终由其他凭据成功"。
+
+### ✨ 新功能 — 请求链路追踪（尝试级）
+
+- **SQLite 持久化**：新增 `src/admin/trace_db.rs`（rusqlite + bundled，自带 SQLite 源码静态编译，无系统库依赖）。`traces.db` 与凭据文件同目录，WAL 模式。两张表：`traces`（请求级汇总）+ `trace_attempts`（每跳明细，外键 trace_id）。一个外部请求 = 1 条 trace + N 条 attempt。
+- **每跳结构化记录**：provider 重试循环（`src/kiro/provider.rs`）每一跳结束时通过 `TraceSink` 上报：第几次尝试、命中凭据 id、endpoint、HTTP 状态码（网络层失败为 null）、失败分类、上游错误体片段（截断 2KB）、单跳耗时。失败分类复用现有判别：`quota_exhausted` / `account_throttled` / `auth_failed` / `transient` / `network_error` / `bad_request` / `unknown` / `success`。
+- **请求级汇总**：handler 层 `RequestTracer`（`src/anthropic/handlers.rs`）累积 attempts，请求结束时 finalize：`final_status`（success / error / interrupted）、`final_credential_id`、顶层 `error_type`（提升自最后一跳分类，便于筛选）、`error_message`、总尝试次数、端到端耗时。
+- **流式中断检测**：流式 / 缓冲流式两路的 SSE unfold 都累计已发送字节数，上游中途断流时标记 `final_status=interrupted` + `interrupted_after_bytes`，区分"完整失败"与"半截中断"。
+- **保留期可配**：后台任务（复用现有 cleanup tokio 循环）每天 `DELETE` 掉超过保留天数的 traces + 关联 attempts，保留天数默认 7 天、运行时可改（见下方"日志治理"）。`traces.db` 打开失败不致命——降级为内存库，trace 不可用但服务正常。
+- **零侵入**：`KiroCallResult` 签名不变，attempt 走 `TraceSink` 旁路上报；未启用 trace（开关关闭或 store 为 None）时所有路径零开销。MCP（WebSearch）路径本期不接 trace。
+
+### ✨ 新功能 — Admin API + 「请求日志」页面
+
+- **`GET /api/admin/traces`**：query 参数 `status` / `errorType` / `credentialId` / `model` / `onlyFailed` / `limit`（默认 200，上限 1000），动态拼参数化 WHERE + `ORDER BY ts_epoch DESC LIMIT`，返回含每跳明细的链路；附带 credential email 反查（与 `stats_by_credential` 一致）。
+- **前端独立「请求日志」Tab**（`admin-ui/src/components/trace-log-page.tsx`）：与概览 / 凭据管理 / 客户端 Key 并列。表格列：时间、模型、状态徽章（成功绿 / 失败红 / 中断橙）、最终凭据（email）、错误类型、重试次数、耗时。顶部筛选：状态下拉 + 错误类型下拉 + "只看失败"开关 + 刷新。点击行展开完整重试链路时间线，每跳显示凭据 / endpoint / HTTP 状态 / outcome 徽章 / 耗时，失败跳展示上游错误体片段（等宽可折叠）。
+- **新增前端文件**：`api/traces.ts`、`hooks/use-traces.ts`（复刻 stats 的 30s 刷新 + keepPreviousData）、类型 `TraceAttempt` / `TraceRecord` / `TraceQuery`。
+
+### ✨ 新功能 — 日志治理（可配置 + 运行时可改）
+
+- **三个 config 字段**（`src/model/config.rs`，camelCase）：`traceEnabled`（默认 true）/ `traceRetentionDays`（默认 7）/ `usageLogRetentionDays`（默认 31）。启动时读入，分别初始化 `TraceStore` 与 `UsageRecorder`。`config.example.json` 已补充示例。
+- **运行时可改 + 持久化**：保留期与 trace 开关改为 `AtomicBool` / `AtomicU64`（参照 `account_throttle` 的运行时可变模式）。`GET/PUT /api/admin/config/log-governance` 改完立即生效并回写 `config.json`，无需重启；保留天数校验 `1..=365`，写盘失败时运行时值仍生效并 warn。关闭 `traceEnabled` 后 `TraceStore::insert` 直接短路，不再写新链路（历史记录仍可查）。
+- **前端治理面板**：「请求日志」页筛选栏新增"治理设置"下拉（参照顶栏风控配置）——trace 启用开关 + trace 保留天数输入 + usage 日志保留天数输入，保存即调 `PUT /config/log-governance`。
+
+### ✨ 新功能 — 凭据卡片交互改进
+
+- **拖拽排序优先级**（`@dnd-kit`）：每张凭据卡片操作区新增 `⋮⋮` 拖拽手柄，按住手柄即可在当前页内拖动重排。松手后按新视觉顺序赋连续递增的 `priority`（全局位置 = 页起始索引 + 页内序号），只对实际变化的卡片发 `set_priority`，乐观更新 + 失败回滚。手柄带 `data-no-rect-select`，与既有矩形框选 / 点击选中完全隔离；拖拽中关掉 Card 的 `transition-all` 与 hover 位移，保证"跟手"。**移除原优先级 ↑/↓ 按钮**，操作区恢复单行。仅当前页内排序，翻页清除本地顺序覆盖。
+- **失败日志详情弹框**：卡片"失败次数"改为可点击，弹框（`credential-failures-dialog.tsx`）展示该凭据最近 50 条失败链路（复用 `GET /traces?credentialId=X&onlyFailed=true`，懒加载——弹框未打开不查询）。每条含时间、错误类型徽章、HTTP 状态、错误消息、上游错误体片段。补足了卡面"失败次数"计数器看不到的瞬态 / 网络失败历史（该计数器是连续失败计数、成功即清零、瞬态错误故意不计入，语义不变）。
+- **可交互数值统一标识**：优先级（`Pencil` 编辑）/ 失败次数（`ScrollText` 看日志）/ 成功次数（`RotateCcw` 重置）三个可点击数值统一加图标 + `hover:bg-accent` 悬停反馈 + `cursor-pointer`，此前无可点击标识。
+- **启用凭据后自动刷新余额**：在卡片开关把凭据从禁用切到启用且成功后，自动触发一次该卡片的余额查询。
+- **卡片等高对齐**：Card 改 `flex h-full flex-col` 填满 grid 行高、CardContent `flex-1`、操作区 `mt-auto` 固定贴底；余额面板加 `min-h-[150px]`，未查询 / 查询中 / 已查询三态高度一致。同行卡片整体对齐。
+- **徽章合并减少换行**：标题下的配置元信息徽章（endpoint / Profile ARN）合并为单个 `endpoint · ARN` 徽章；状态类徽章（订阅 / 活跃 / 已禁用 / 已超额 / 冷却）保留独立以维持颜色语义。
+
+### 📦 依赖 / 构建
+
+- **新增 Rust 依赖**：`rusqlite = { version = "0.32", features = ["bundled"] }`。bundled 自带 SQLite C 源码静态编译，跨平台一致、无需系统库。
+- **新增前端依赖**：`@dnd-kit/core` / `@dnd-kit/sortable` / `@dnd-kit/utilities`（凭据卡片拖拽排序，vendor chunk 约 +42KB / gzip +14KB）。
+- **`.gitignore` / `.dockerignore`** 新增 `traces.db` 及 WAL 边车文件（`traces.db-shm` / `traces.db-wal`，运行时产物不入库）。
+- **测试覆盖**：247 通过（trace_db 新增 5：insert/query roundtrip、disabled 短路、only_failed/status/model 筛选、cleanup 按保留期、错误体截断）。
+
+### 📦 升级指南
+
+1. **`docker compose pull && docker compose up -d`** 即可。`traces.db` 首次请求时自动创建于凭据文件同目录，无需手动初始化。
+2. **排查中断**：登录管理面板 → 顶栏「请求日志」Tab → 用状态 / 错误类型筛选或开"只看失败" → 点击任一行展开看完整重试链路（哪个凭据、第几跳、因为什么失败、上游原始错误体）。
+3. **日志治理**：「请求日志」页"治理设置"下拉可随时开关 trace、调整 trace / usage 日志保留天数，改完立即生效并写回 `config.json`；也可直接在 `config.json` 配 `traceEnabled` / `traceRetentionDays` / `usageLogRetentionDays`（缺省即用默认 true / 7 / 31）。
+4. **凭据排序与失败排查**：「凭据管理」Tab 拖动卡片 `⋮⋮` 手柄即可在当前页内调整优先级（实时持久化）；点击卡片"失败次数"可看该凭据的失败日志详情（依赖 trace 开启）。
+5. **无破坏性变更**：trace 与现有 usage_log / 概览统计完全独立，不影响既有功能；升级无需清理任何状态文件。
+
+## [0.5.2] - 2026-05-29
+
+主题：在 0.5.1（prompt cache 重构 + Credit 全链路 + 仪表盘改造）基础上加入**账号级风控识别与冷却失败转移**——上游 Kiro/Q-Developer 在风控触发时返回带 `suspicious-activity` body 的 429，与"高负载 429"完全不同；旧版本一刀切当成 transient 重试，导致单账号被反复打到。同时修复 thinking 模式跨轮 replay 的客户端校验失败。前端配套加风控冷却倒计时徽章、单卡刷新余额按钮、整页刷余额按钮提级、趋势图 range 切换动效等若干细节。
+
+> 0.5.0 因 Credit 数值显示问题被作废、0.5.1 在小流量场景下仍有单账号被打死风险，**0.5.2 整合三个版本所有内容，请直接升级到 0.5.2，跳过 0.5.0 / 0.5.1**。下方按特性分块罗列从 0.4.x 升上来需要知道的所有变更（标注「0.5.2 新增」的小节是相对 0.5.1 的增量，其余为 0.5.1 内容继承）。
+
+### ✨ 新功能 — 账号级风控识别与冷却失败转移（0.5.2 新增）
+
+- **`is_account_throttled` 端点判别器**：新增 `src/kiro/endpoint/mod.rs::is_account_throttled`，匹配 `429` + body 含 `suspicious-activity`（Kiro/Q-Developer 在账号触发风控时下发的标志）。同步扩展 `is_monthly_request_limit` 也匹配 `OVERAGE_REQUEST_LIMIT_EXCEEDED`，把"超额请求次数耗尽"识别为月度配额耗尽并下线该凭据。
+- **provider 拆分 429 路径**：`src/kiro/provider.rs` 把原本一刀切的 429 处理改成两路——账号风控走"放入冷却 + 失败转移到下一凭据"，high-traffic 429 仍走 transient 重试。冷却中的凭据在 `select_credential` / `available_count` / `snapshot` 全部跳过，调度器不会反复打到同一个被风控的账号。
+- **`TokenEntry::throttled_until` 字段**：`token_manager.rs` 给每条凭据加 `throttled_until: Option<Instant>`，并在 `MultiTokenManager` 暴露 `mark_account_throttled(id, secs)` / `clear_throttle(id)` 两个 API。
+- **`account_throttle_failover` / `accountThrottleCooldownSecs` 配置**：两个原子可在运行时切换，无需重启；持久化到 `config.json`。冷却时长默认 600s（10 分钟），可在面板自定义分钟数。
+- **Admin API 三件套**：
+  - `GET /api/admin/config/account-throttle` 读取当前开关 + 冷却秒数
+  - `PUT /api/admin/config/account-throttle` 修改并落盘
+  - `POST /api/admin/credentials/:id/clear-throttle` 手动解除单条凭据冷却
+- **凭据快照 `throttled_remaining_secs` 字段**：`CredentialStatus` 新增剩余秒数字段，前端按秒递减渲染倒计时。
+- **前端 UI**：
+  - 顶栏「设置」下拉新增"账号风控失败转移"开关 + 冷却预设按钮（5 / 10 / 30 / 60 分钟）+ 自定义分钟输入。
+  - 凭据卡片在风控冷却中：橙红描边 + `mm:ss` 倒计时徽章（`Clock` 图标），到期或手动解除后自动恢复调度。倒计时本地用 `setInterval` 自然递减，避免 30s 拉取间隔之间数字停顿。
+  - 卡片"更多操作"菜单冷却中显示"解除风控冷却（mm:ss）"项。
+
+### 🛠 修复 — Thinking 模式跨轮 replay 兼容（0.5.2 新增）
+
+- **thinking block 必带 `signature`**：Claude Code、Anthropic SDK 等思考模式客户端会拒绝下一轮请求中 `assistant.content[].thinking` 缺 `signature` 的消息，抛 `The content[].thinking in the thinking mode must be passed back to the API`。Kiro 上游不是 Anthropic API、永不下发真签名。修复方案：流式与非流式两路都在思考块结束前注入稳定的占位符 signature，使客户端校验通过；converter 在请求转发时只读 `block.thinking` 文本字段，占位符对上游完全不可见。
+  - 流式：每个 thinking block 的 `content_block_stop` 之前发出一个 `signature_delta` 事件（4 条收尾路径全部覆盖：正常 stop、tool_use、客户端中断、错误）。
+  - 非流式：`assemble_response` 在组装 thinking content block 时直接带上 `signature` 字段。
+  - 测试：新增"signature_delta 必须先于 content_block_stop 且非空"断言（242 通过，+1）。
+
+### ✨ 新功能 — 凭据管理体验改进（0.5.2 新增）
+
+- **每张凭据卡片单独「刷新余额」按钮**：放在「刷新 Token」旁，单 GET `/api/admin/credentials/:id/balance`，loading 时按钮 spin 不阻塞其他卡片。原来只能整页批量"查询当前页信息"才能看到单条凭据的余额。
+- **整页余额刷新按钮提升到工具栏**：之前藏在「更多操作」下拉里，新版作为独立 outline 按钮放到工具栏右侧（"添加凭据"前），并带 `刷新中… N/M` 进度。
+- **「一键开启超额」拆分两态**：之前一个按钮根据可开启数 / 待确定数文案切换，且会对待确定凭据直接调写接口（FREE 订阅 403）。现在拆成两个独立路径：
+  - 有可开启凭据 → 调写接口 `setUserPreference`，文案 `一键开启超额（N）`。
+  - 全部凭据状态待确定 → 改走只读批量查余额，文案 `重试拉取超额状态（N）`，附 `刷新中… N/M` 进度，绝不触发写接口。
+- **趋势图 range 切换动效**：`OverviewPage` 给 `<TimeSeriesChart>` 包一层 `key={range}` 强制重挂，外加 `chart-range-fade` CSS 动画（`opacity + translateY`，`prefers-reduced-motion` 自动禁用）。Recharts 折线动画 `isAnimationActive=true / 550ms ease-out` 同步打开，按下 24h / 7d / 30d 切换器有"刷新"反馈。
+- **字体栈切换到 Plus Jakarta Sans + JetBrains Mono**：`index.html` 通过 Google Fonts `preconnect` 预连 + `display=swap` 异步加载（300/400/500/600/700/800 + Mono 400/500），`tailwind.config.js` 把 `font-sans` 首位换成 `Plus Jakarta Sans`、新增 `font-mono` 栈以 `JetBrains Mono` 为先。中文回落 `PingFang SC / Hiragino Sans GB / 微软雅黑` 不变；移除原本永远不命中的 `SF Pro Display/Text` 与 `Helvetica Neue`。`display=swap` 确保字体未到达时先用回落字体渲染、不阻塞首屏。
+
+## [0.5.1] - 2026-05-29 *(superseded by 0.5.2)*
+
+> **此版本已被 0.5.2 整合并取代**——0.5.1 在小流量场景下仍存在单账号被打死的风险（账号风控 429 当 transient 重试），0.5.2 修复并整合所有功能。请直接升级到 0.5.2，跳过 0.5.1。
+
+下方为 0.5.1 的原始内容，保留以便追溯。
 
 ### 💥 Breaking — 基础设施
 
@@ -82,7 +198,8 @@ project adheres to [Semantic Versioning](https://semver.org/).
 2. **删除过时配置**：编辑 `data/config.json`，删除 `redisUrl` / `cacheDebugLogging` / `cacheMaxReadRatio` 三个字段（保留也只是被忽略，不会报错）。
 3. **下游客户端**：响应里的 `cache_creation_input_tokens` / `cache_read_input_tokens` 字段含义变了——现在反映的是中转层提示词缓存而非上游缓存。如果下游用这两个字段做计费对账，需要重新理解口径（中转层缓存命中并不会减少上游 credit 消耗，是 SDK 体验优化）。
 4. **历史用量**：`usage_log.*.jsonl` 的旧记录会被自动加载（`credits` 字段缺失时默认 0），重启不丢趋势。新的请求开始会带 credit。
-5. **若你已经升级到 0.5.0**：直接升 0.5.1；不需要清理任何状态文件。
+5. **若你已经升级到 0.5.0**：直接升 0.5.2；不需要清理任何状态文件。
+6. **0.5.2 增量项**：升 0.5.2 后，「账号风控失败转移」默认开启、冷却 600s。如不希望自动冷却（例如只用一两个账号、宁愿等冷却也不想被识别为风控），登录管理面板 → 顶栏「设置」→ 关闭"账号风控失败转移"。Thinking 模式 replay 修复无需手动操作。
 
 ## [0.4.0] - 2026-05-22
 

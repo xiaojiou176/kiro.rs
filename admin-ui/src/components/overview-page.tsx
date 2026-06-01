@@ -123,7 +123,11 @@ export function OverviewPage() {
               ))}
             </div>
           </div>
-          <TimeSeriesChart data={seriesData} range={range} />
+          {/* range 切换时整体 fade + 上移：用 key={range} 强制重挂，
+              叠加 Recharts 折线动画形成"按下按钮 → 内容刷新"的视觉反馈 */}
+          <div key={range} className="chart-range-fade">
+            <TimeSeriesChart data={seriesData} range={range} />
+          </div>
         </CardContent>
       </Card>
 

@@ -16,6 +16,7 @@ use super::client_keys::SharedClientKeyManager;
 use super::service::AdminService;
 use super::types::AdminErrorResponse;
 use super::usage_stats::SharedAggregator;
+use super::trace_db::SharedTraceStore;
 use crate::common::auth;
 
 /// Admin API 共享状态
@@ -31,6 +32,8 @@ pub struct AdminState {
     pub client_keys: SharedClientKeyManager,
     /// 用量聚合器（与 anthropic 路由共享）
     pub usage_aggregator: SharedAggregator,
+    /// 请求链路追踪存储（与 anthropic 路由共享）
+    pub trace_store: SharedTraceStore,
 }
 
 impl AdminState {
@@ -40,6 +43,7 @@ impl AdminState {
         service: AdminService,
         client_keys: SharedClientKeyManager,
         usage_aggregator: SharedAggregator,
+        trace_store: SharedTraceStore,
     ) -> Self {
         Self {
             admin_api_key: Arc::new(RwLock::new(admin_api_key.into())),
@@ -47,6 +51,7 @@ impl AdminState {
             service: Arc::new(service),
             client_keys,
             usage_aggregator,
+            trace_store,
         }
     }
 }

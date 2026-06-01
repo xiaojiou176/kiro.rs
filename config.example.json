@@ -7,5 +7,8 @@
   "adminApiKey": "sk-admin-your-secret-key",
   "defaultEndpoint": "ide",
   "updateAutoApply": false,
-  "updateAutoApplyTime": "03:00"
+  "updateAutoApplyTime": "03:00",
+  "traceEnabled": true,
+  "traceRetentionDays": 7,
+  "usageLogRetentionDays": 31
 }

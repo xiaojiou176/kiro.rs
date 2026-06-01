@@ -26,9 +26,11 @@ pub mod types;
 mod binary_update;
 pub mod client_keys;
 pub mod usage_stats;
+pub mod trace_db;
 
 pub use client_keys::ClientKeyManager;
 pub use middleware::AdminState;
 pub use router::create_admin_router;
 pub use service::AdminService;
 pub use usage_stats::{UsageAggregator, UsageRecorder};
+pub use trace_db::{SharedTraceStore, TraceStore};

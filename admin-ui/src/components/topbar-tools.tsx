@@ -1,12 +1,14 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import {
   Activity, RefreshCw, UploadCloud, Settings, Key, Wand2, Eye, EyeOff, Copy,
+  ShieldAlert, ShieldCheck,
 } from 'lucide-react'
 import { useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { storage } from '@/lib/storage'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Switch } from '@/components/ui/switch'
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription,
 } from '@/components/ui/dialog'
@@ -14,7 +16,10 @@ import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent,
   DropdownMenuItem, DropdownMenuLabel,
 } from '@/components/ui/dropdown-menu'
-import { useLoadBalancingMode, useSetLoadBalancingMode } from '@/hooks/use-credentials'
+import {
+  useLoadBalancingMode, useSetLoadBalancingMode,
+  useAccountThrottleConfig, useSetAccountThrottleConfig,
+} from '@/hooks/use-credentials'
 import { useUpdateCheck } from '@/hooks/use-update-check'
 import { updateAdminKey, updateApiKey } from '@/api/credentials'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
@@ -30,6 +35,8 @@ export function TopbarTools() {
   const queryClient = useQueryClient()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
+  const { data: throttleConfig, isLoading: isLoadingThrottle } = useAccountThrottleConfig()
+  const { mutate: setThrottleConfig, isPending: isSettingThrottle } = useSetAccountThrottleConfig()
   const { data: updateCheck } = useUpdateCheck()
 
   const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
@@ -52,6 +59,15 @@ export function TopbarTools() {
     const next = cur === 'priority' ? 'balanced' : 'priority'
     setLoadBalancingMode(next, {
       onSuccess: () => toast.success(`已切换到${next === 'priority' ? '优先级模式' : '均衡负载模式'}`),
+      onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
+    })
+  }
+
+  const handleToggleFailover = () => {
+    const cur = throttleConfig?.failover ?? true
+    const next = !cur
+    setThrottleConfig({ failover: next }, {
+      onSuccess: () => toast.success(next ? '已开启账号级风控故障转移' : '已关闭账号级风控故障转移'),
       onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
     })
   }
@@ -103,6 +119,19 @@ export function TopbarTools() {
           {isLoadingMode ? '加载中…' : (loadBalancingData?.mode === 'priority' ? '优先级' : '均衡负载')}
         </span>
       </Button>
+      <ThrottleConfigButton
+        config={throttleConfig}
+        loading={isLoadingThrottle}
+        saving={isSettingThrottle}
+        onToggleFailover={handleToggleFailover}
+        onChangeCooldown={(secs) =>
+          setThrottleConfig({ cooldownSecs: secs }, {
+            onSuccess: () =>
+              toast.success(`冷却时长已设为 ${Math.round(secs / 60)} 分钟`),
+            onError: (err) => toast.error(`保存失败: ${extractErrorMessage(err)}`),
+          })
+        }
+      />
       <Button variant="ghost" size="icon" onClick={handleRefresh} title="刷新">
         <RefreshCw className="h-4 w-4" />
       </Button>
@@ -239,5 +268,153 @@ export function TopbarTools() {
         </DialogContent>
       </Dialog>
     </>
+  )
+}
+
+interface ThrottleConfigButtonProps {
+  config?: { failover: boolean; cooldownSecs: number }
+  loading: boolean
+  saving: boolean
+  onToggleFailover: () => void
+  onChangeCooldown: (secs: number) => void
+}
+
+const COOLDOWN_PRESETS = [
+  { label: '5 分钟', secs: 5 * 60 },
+  { label: '15 分钟', secs: 15 * 60 },
+  { label: '30 分钟', secs: 30 * 60 },
+  { label: '1 小时', secs: 60 * 60 },
+  { label: '2 小时', secs: 2 * 60 * 60 },
+]
+
+/**
+ * 故障转移开关 + 冷却时长设置（紧凑下拉）
+ *
+ * 主按钮文案显示当前状态；下拉里:
+ * - 顶部一个 Switch 切换 failover
+ * - 5 个预设时长 + 一个自定义输入（分钟）
+ */
+function ThrottleConfigButton({
+  config, loading, saving, onToggleFailover, onChangeCooldown,
+}: ThrottleConfigButtonProps) {
+  const [open, setOpen] = useState(false)
+  const [customMin, setCustomMin] = useState('')
+
+  const failover = config?.failover ?? true
+  const cooldownSecs = config?.cooldownSecs ?? 1800
+  const cooldownMin = Math.round(cooldownSecs / 60)
+
+  useEffect(() => {
+    if (!open) setCustomMin('')
+  }, [open])
+
+  const submitCustom = (e: React.FormEvent) => {
+    e.preventDefault()
+    const min = parseInt(customMin, 10)
+    if (Number.isNaN(min) || min < 1 || min > 1440) {
+      toast.error('请输入 1-1440 之间的分钟数')
+      return
+    }
+    onChangeCooldown(min * 60)
+    setOpen(false)
+  }
+
+  return (
+    <DropdownMenu open={open} onOpenChange={setOpen}>
+      <DropdownMenuTrigger asChild>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={loading || saving}
+          title={
+            loading
+              ? '加载中…'
+              : failover
+                ? `账号级风控故障转移：开启（冷却 ${cooldownMin} 分钟）`
+                : '账号级风控故障转移：关闭'
+          }
+        >
+          {failover ? (
+            <ShieldCheck className="h-3.5 w-3.5 text-emerald-600" />
+          ) : (
+            <ShieldAlert className="h-3.5 w-3.5 text-amber-500" />
+          )}
+          <span className="hidden md:inline">
+            {loading ? '加载中…' : failover ? `故障转移 · ${cooldownMin}m` : '不切换'}
+          </span>
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-64">
+        <DropdownMenuLabel>账号级风控故障转移</DropdownMenuLabel>
+        <div className="px-2 pb-2">
+          <div className="flex items-center justify-between gap-2 rounded-md bg-secondary/40 px-2.5 py-2">
+            <div className="text-xs">
+              <div className="font-medium text-foreground">
+                {failover ? '开启' : '关闭'}
+              </div>
+              <div className="text-muted-foreground leading-snug">
+                {failover
+                  ? '上游对当前账号触发临时限速时，自动冷却该凭据并切换到下一个可用凭据'
+                  : '上游对当前账号触发临时限速时，仅按瞬态错误重试，不切换凭据'}
+              </div>
+            </div>
+            <Switch
+              checked={failover}
+              disabled={saving}
+              onCheckedChange={() => onToggleFailover()}
+            />
+          </div>
+        </div>
+        <DropdownMenuLabel className="pt-1">冷却时长</DropdownMenuLabel>
+        <div className={`px-2 pb-2 ${!failover ? 'opacity-60' : ''}`}>
+          <div className="grid grid-cols-3 gap-1">
+            {COOLDOWN_PRESETS.map((p) => {
+              const active = p.secs === cooldownSecs
+              return (
+                <Button
+                  key={p.secs}
+                  type="button"
+                  size="sm"
+                  variant={active ? 'default' : 'outline'}
+                  className="h-7 text-xs"
+                  disabled={saving || !failover}
+                  onClick={() => {
+                    if (!active) onChangeCooldown(p.secs)
+                    setOpen(false)
+                  }}
+                >
+                  {p.label}
+                </Button>
+              )
+            })}
+          </div>
+          <form
+            onSubmit={submitCustom}
+            className="mt-2 flex items-center gap-1.5"
+          >
+            <Input
+              type="number"
+              min={1}
+              max={1440}
+              placeholder={`自定义（当前 ${cooldownMin}）`}
+              value={customMin}
+              onChange={(e) => setCustomMin(e.target.value)}
+              disabled={saving || !failover}
+              className="h-7 text-xs"
+            />
+            <span className="text-xs text-muted-foreground">分钟</span>
+            <Button
+              type="submit"
+              size="sm"
+              variant="outline"
+              className="h-7 text-xs"
+              disabled={saving || !failover || !customMin.trim()}
+            >
+              保存
+            </Button>
+          </form>
+        </div>
+      </DropdownMenuContent>
+    </DropdownMenu>
   )
 }

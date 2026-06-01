@@ -1,6 +1,6 @@
 [package]
 name = "kiro-rs"
-version = "0.5.1"
+version = "0.5.7"
 edition = "2024"
 
 [features]
@@ -48,3 +48,4 @@ mime_guess = "2"      # MIME 类型推断
 flate2 = "1"        # tar.gz 解压（在线更新）
 tar = "0.4"         # tar 解析（在线更新）
 zip = { version = "2", default-features = false, features = ["deflate"] }  # zip 解压（Windows 在线更新）
+rusqlite = { version = "0.32", features = ["bundled"] }  # 请求链路追踪持久化（自带 SQLite 源码）

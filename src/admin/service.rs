@@ -19,13 +19,15 @@ use crate::model::config::Config;
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
-    AddCredentialRequest, AddCredentialResponse, AssignProxyRequest, BalanceResponse,
-    BatchAddProxyRequest, CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse,
-    EnableOverageAllResult, GitHubRateLimitInfo, ImageUpdateResponse, KamExportAccount,
-    KamExportResponse, LoadBalancingModeResponse, PollIdcLoginResponse, ProxyPoolEntry,
-    ProxyPoolResponse, QuotaExceededResult, SetLoadBalancingModeRequest, SetUpdateConfigRequest,
-    StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
-    UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse, AssignProxyRequest,
+    BalanceResponse, BatchAddProxyRequest, CheckRateLimitRequest, CredentialStatusItem,
+    CredentialsStatusResponse, EnableOverageAllResult, GitHubRateLimitInfo, ImageUpdateResponse,
+    KamExportAccount, KamExportResponse, LoadBalancingModeResponse, LogGovernanceConfigResponse,
+    PollIdcLoginResponse, ProxyPoolEntry, ProxyPoolResponse, QuotaExceededResult,
+    SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest,
+    SetUpdateConfigRequest, StartIdcLoginRequest,
+    StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
+    UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -109,6 +111,10 @@ pub struct AdminService {
     idc_sessions: Arc<Mutex<HashMap<String, IdcAuthSession>>>,
     /// 进行中的 Social 登录会话
     social_sessions: Arc<Mutex<HashMap<String, SocialAuthSession>>>,
+    /// 请求链路追踪存储（用于日志治理：开关 + 保留天数运行时可改）
+    trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
+    /// 用量日志记录器（用于日志治理：保留天数运行时可改）
+    usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
 }
 
 /// Social 登录会话状态
@@ -344,6 +350,8 @@ impl AdminService {
             update_check_cache: Mutex::new(None),
             idc_sessions: Arc::new(Mutex::new(HashMap::new())),
             social_sessions: Arc::new(Mutex::new(HashMap::new())),
+            trace_store: None,
+            usage_recorder: None,
         };
 
         // 后台任务：每 5 分钟清理过期的登录会话，防止内存泄漏
@@ -362,6 +370,17 @@ impl AdminService {
         }
 
         svc
+    }
+
+    /// 注入日志治理句柄（trace 存储 + 用量记录器），用于运行时改保留期/开关。
+    pub fn with_log_governance(
+        mut self,
+        trace_store: Option<crate::admin::trace_db::SharedTraceStore>,
+        usage_recorder: Option<crate::admin::usage_stats::SharedRecorder>,
+    ) -> Self {
+        self.trace_store = trace_store;
+        self.usage_recorder = usage_recorder;
+        self
     }
 
     /// 获取所有凭据状态
@@ -391,6 +410,7 @@ impl AdminService {
                     priority: entry.priority,
                     disabled: entry.disabled,
                     failure_count: entry.failure_count,
+                    total_failure_count: entry.total_failure_count,
                     is_current: entry.id == snapshot.current_id,
                     expires_at: entry.expires_at,
                     auth_method: entry.auth_method,
@@ -532,6 +552,12 @@ impl AdminService {
     pub fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager
             .reset_and_enable(id)
+            .map_err(|e| self.classify_error(e, id))
+    }
+
+    pub fn clear_throttle(&self, id: u64) -> Result<(), AdminServiceError> {
+        self.token_manager
+            .clear_throttle(id)
             .map_err(|e| self.classify_error(e, id))
     }
 
@@ -1468,6 +1494,138 @@ impl AdminService {
             .map_err(|e| AdminServiceError::InternalError(e.to_string()))?;
 
         Ok(LoadBalancingModeResponse { mode: req.mode })
+    }
+
+    /// 获取账号级风控故障转移配置
+    pub fn get_account_throttle_config(&self) -> AccountThrottleConfigResponse {
+        AccountThrottleConfigResponse {
+            failover: self.token_manager.get_account_throttle_failover(),
+            cooldown_secs: self.token_manager.get_account_throttle_cooldown_secs(),
+        }
+    }
+
+    /// 更新账号级风控故障转移配置
+    pub fn set_account_throttle_config(
+        &self,
+        req: SetAccountThrottleConfigRequest,
+    ) -> Result<AccountThrottleConfigResponse, AdminServiceError> {
+        if req.failover.is_none() && req.cooldown_secs.is_none() {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 failover 或 cooldownSecs 一个字段".to_string(),
+            ));
+        }
+
+        self.token_manager
+            .set_account_throttle_config(req.failover, req.cooldown_secs)
+            .map_err(|e| AdminServiceError::InvalidCredential(e.to_string()))?;
+
+        Ok(self.get_account_throttle_config())
+    }
+
+    /// 读取日志治理配置（trace 开关 / trace 保留天数 / usage 保留天数）
+    pub fn get_log_governance_config(&self) -> LogGovernanceConfigResponse {
+        let cfg = self.token_manager.config();
+        LogGovernanceConfigResponse {
+            trace_enabled: self
+                .trace_store
+                .as_ref()
+                .map(|s| s.is_enabled())
+                .unwrap_or(cfg.trace_enabled),
+            trace_retention_days: self
+                .trace_store
+                .as_ref()
+                .map(|s| s.retention_days() as u32)
+                .unwrap_or(cfg.trace_retention_days),
+            usage_log_retention_days: self
+                .usage_recorder
+                .as_ref()
+                .map(|r| r.retention_days() as u32)
+                .unwrap_or(cfg.usage_log_retention_days),
+        }
+    }
+
+    /// 更新日志治理配置：改运行时原子值 + 持久化到 config.json。
+    /// 任一字段缺省表示不修改。
+    pub fn set_log_governance_config(
+        &self,
+        req: SetLogGovernanceConfigRequest,
+    ) -> Result<LogGovernanceConfigResponse, AdminServiceError> {
+        if req.trace_enabled.is_none()
+            && req.trace_retention_days.is_none()
+            && req.usage_log_retention_days.is_none()
+        {
+            return Err(AdminServiceError::InvalidCredential(
+                "至少提供 traceEnabled / traceRetentionDays / usageLogRetentionDays 一个字段"
+                    .to_string(),
+            ));
+        }
+        // 校验范围：保留天数 1..=365
+        for (name, v) in [
+            ("traceRetentionDays", req.trace_retention_days),
+            ("usageLogRetentionDays", req.usage_log_retention_days),
+        ] {
+            if let Some(d) = v {
+                if !(1..=365).contains(&d) {
+                    return Err(AdminServiceError::InvalidCredential(format!(
+                        "{} 必须在 1..=365 内: {}",
+                        name, d
+                    )));
+                }
+            }
+        }
+
+        // 先改运行时原子值
+        if let Some(enabled) = req.trace_enabled {
+            if let Some(s) = &self.trace_store {
+                s.set_enabled(enabled);
+            }
+        }
+        if let Some(days) = req.trace_retention_days {
+            if let Some(s) = &self.trace_store {
+                s.set_retention_days(days);
+            }
+        }
+        if let Some(days) = req.usage_log_retention_days {
+            if let Some(r) = &self.usage_recorder {
+                r.set_retention_days(days as i64);
+            }
+        }
+
+        // 持久化到 config.json
+        if let Err(e) = self.persist_log_governance_config(&req) {
+            tracing::warn!("持久化日志治理配置失败（运行时已生效）: {}", e);
+        }
+
+        Ok(self.get_log_governance_config())
+    }
+
+    fn persist_log_governance_config(
+        &self,
+        req: &SetLogGovernanceConfigRequest,
+    ) -> anyhow::Result<()> {
+        use anyhow::Context;
+        let config_path = match self.token_manager.config().config_path() {
+            Some(p) => p.to_path_buf(),
+            None => {
+                tracing::warn!("配置文件路径未知，日志治理配置仅在当前进程生效");
+                return Ok(());
+            }
+        };
+        let mut config = crate::model::config::Config::load(&config_path)
+            .with_context(|| format!("重新加载配置失败: {}", config_path.display()))?;
+        if let Some(v) = req.trace_enabled {
+            config.trace_enabled = v;
+        }
+        if let Some(v) = req.trace_retention_days {
+            config.trace_retention_days = v;
+        }
+        if let Some(v) = req.usage_log_retention_days {
+            config.usage_log_retention_days = v;
+        }
+        config
+            .save()
+            .with_context(|| format!("持久化日志治理配置失败: {}", config_path.display()))?;
+        Ok(())
     }
 
     /// 更新指定凭据的 refreshToken（仅限已禁用凭据）

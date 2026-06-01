@@ -1,42 +1,42 @@
-import { useState, useEffect } from 'react'
-import { Lock } from 'lucide-react'
-import { storage } from '@/lib/storage'
-import { getCredentials } from '@/api/credentials'
-import { extractErrorMessage } from '@/lib/utils'
-import { Input } from '@/components/ui/input'
-import { Button } from '@/components/ui/button'
+import { useState, useEffect } from "react";
+import { Lock } from "lucide-react";
+import { storage } from "@/lib/storage";
+import { getCredentials } from "@/api/credentials";
+import { extractErrorMessage } from "@/lib/utils";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
 
 interface LoginPageProps {
-  onLogin: (apiKey: string) => void
+  onLogin: (apiKey: string) => void;
 }
 
 export function LoginPage({ onLogin }: LoginPageProps) {
-  const [apiKey, setApiKey] = useState('')
-  const [isSubmitting, setIsSubmitting] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [apiKey, setApiKey] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    const savedKey = storage.getApiKey()
-    if (savedKey) setApiKey(savedKey)
-  }, [])
+    const savedKey = storage.getApiKey();
+    if (savedKey) setApiKey(savedKey);
+  }, []);
 
   const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
-    const key = apiKey.trim()
-    if (!key || isSubmitting) return
-    setIsSubmitting(true)
-    setError(null)
-    storage.setApiKey(key)
+    e.preventDefault();
+    const key = apiKey.trim();
+    if (!key || isSubmitting) return;
+    setIsSubmitting(true);
+    setError(null);
+    storage.setApiKey(key);
     try {
-      await getCredentials()
-      onLogin(key)
+      await getCredentials();
+      onLogin(key);
     } catch (err) {
-      storage.removeApiKey()
-      setError(extractErrorMessage(err))
+      storage.removeApiKey();
+      setError(extractErrorMessage(err));
     } finally {
-      setIsSubmitting(false)
+      setIsSubmitting(false);
     }
-  }
+  };
 
   return (
     <div className="min-h-screen flex items-center justify-center p-4">
@@ -49,7 +49,9 @@ export function LoginPage({ onLogin }: LoginPageProps) {
               className="mb-4 h-20 w-20 object-contain"
               draggable={false}
             />
-            <h1 className="text-[22px] font-semibold tracking-tight">Kiro Admin</h1>
+            <h1 className="text-[22px] font-semibold tracking-tight">
+              Kiro Admin
+            </h1>
             <p className="mt-1 text-sm text-muted-foreground">
               使用 Admin API Key 登录管理面板
             </p>
@@ -62,8 +64,8 @@ export function LoginPage({ onLogin }: LoginPageProps) {
                 placeholder="Admin API Key"
                 value={apiKey}
                 onChange={(e) => {
-                  setApiKey(e.target.value)
-                  setError(null)
+                  setApiKey(e.target.value);
+                  setError(null);
                 }}
                 className="h-11 pl-10"
                 disabled={isSubmitting}
@@ -75,15 +77,17 @@ export function LoginPage({ onLogin }: LoginPageProps) {
                 {error}
               </div>
             )}
-            <Button type="submit" size="lg" className="w-full" disabled={!apiKey.trim() || isSubmitting}>
-              {isSubmitting ? '登录中…' : '登录'}
+            <Button
+              type="submit"
+              size="lg"
+              className="w-full"
+              disabled={!apiKey.trim() || isSubmitting}
+            >
+              {isSubmitting ? "登录中…" : "登录"}
             </Button>
           </form>
         </div>
-        <p className="mt-4 text-center text-xs text-muted-foreground/80">
-          Designed for macOS · Inspired by Apple Human Interface Guidelines
-        </p>
       </div>
     </div>
-  )
+  );
 }

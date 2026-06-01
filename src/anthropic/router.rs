@@ -12,6 +12,7 @@ use parking_lot::RwLock;
 
 use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
+use crate::admin::trace_db::SharedTraceStore;
 use crate::kiro::provider::KiroProvider;
 
 use super::{
@@ -42,11 +43,13 @@ pub fn create_router_with_provider(
         None,
         None,
         None,
+        None,
     )
 }
 
 /// 与 `create_router_with_provider` 相同，但允许调用方共享 api_key 内存
 /// （Admin 模块通过该 Arc 在运行时改 key 后能立刻生效）
+#[allow(clippy::too_many_arguments)]
 pub fn create_router_with_shared_key(
     api_key: Arc<RwLock<String>>,
     kiro_provider: Option<KiroProvider>,
@@ -55,6 +58,7 @@ pub fn create_router_with_shared_key(
     usage_recorder: Option<SharedRecorder>,
     usage_aggregator: Option<SharedAggregator>,
     prompt_cache: Option<SharedPromptCache>,
+    trace_store: Option<SharedTraceStore>,
 ) -> Router {
     let mut state = AppState::with_shared_api_key(api_key, extract_thinking);
     if let Some(provider) = kiro_provider {
@@ -62,6 +66,7 @@ pub fn create_router_with_shared_key(
     }
     state = state.with_usage(client_keys, usage_recorder, usage_aggregator);
     state = state.with_prompt_cache(prompt_cache);
+    state = state.with_trace_store(trace_store);
 
     // 需要认证的 /v1 路由
     let v1_routes = Router::new()

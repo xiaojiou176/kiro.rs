@@ -213,7 +213,11 @@ function TimeSeriesChartImpl({ data, range }: Props) {
             dot={false}
             strokeWidth={s.kind === 'percent' ? 1.8 : 2}
             strokeDasharray={s.kind === 'percent' ? '4 4' : undefined}
-            isAnimationActive={false}
+            // range 切换会触发整个图表 remount（外层包了 key={range}），
+            // 只在每次重建后跑一次开屏动画，时间序列内随聚合刷新不再 redraw 折线
+            isAnimationActive
+            animationDuration={550}
+            animationEasing="ease-out"
           />
         ))}
       </LineChart>

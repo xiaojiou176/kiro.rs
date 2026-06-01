@@ -55,6 +55,8 @@ pub struct UsageRecord {
 pub struct UsageRecorder {
     inner: Mutex<RecorderState>,
     dir: PathBuf,
+    /// 保留天数（运行时可改），cleanup_old_logs 时读取。
+    retention_days: std::sync::atomic::AtomicI64,
 }
 
 struct RecorderState {
@@ -64,7 +66,8 @@ struct RecorderState {
 }
 
 impl UsageRecorder {
-    pub fn new(dir: PathBuf) -> Self {
+    /// 指定初始保留天数构造
+    pub fn with_retention(dir: PathBuf, retention_days: i64) -> Self {
         // 兜底：调用方传入空路径时归一为 "."，避免 join 出无目录前缀的路径导致写入 CWD
         let dir = if dir.as_os_str().is_empty() {
             PathBuf::from(".")
@@ -82,6 +85,7 @@ impl UsageRecorder {
                 writer: None,
             }),
             dir,
+            retention_days: std::sync::atomic::AtomicI64::new(retention_days.max(1)),
         }
     }
 
@@ -124,9 +128,20 @@ impl UsageRecorder {
         }
     }
 
+    /// 获取保留天数
+    pub fn retention_days(&self) -> i64 {
+        self.retention_days.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// 设置保留天数（>=1）
+    pub fn set_retention_days(&self, days: i64) {
+        self.retention_days
+            .store(days.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// 清理超过保留期的旧文件
     pub fn cleanup_old_logs(&self) {
-        let cutoff = Local::now().date_naive() - Duration::days(RETENTION_DAYS);
+        let cutoff = Local::now().date_naive() - Duration::days(self.retention_days());
         let entries = match std::fs::read_dir(&self.dir) {
             Ok(it) => it,
             Err(_) => return,

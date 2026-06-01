@@ -12,6 +12,8 @@ export interface CredentialStatusItem {
   priority: number
   disabled: boolean
   failureCount: number
+  /** 累计失败次数（所有失败类型，只增不减，仅手动重置归零） */
+  totalFailureCount: number
   isCurrent: boolean
   expiresAt: string | null
   authMethod: string | null
@@ -26,6 +28,8 @@ export interface CredentialStatusItem {
   proxyUrl?: string
   refreshFailureCount: number
   disabledReason?: string
+  /** 账号级风控冷却剩余秒数（>0 表示冷却中） */
+  throttledRemainingSecs?: number
   endpoint: string
   /** 后端缓存的最近一次余额（5 分钟内） */
   balance?: BalanceResponse
@@ -366,3 +370,69 @@ export interface CredentialDistribution {
   outputTokens: number
   errors: number
 }
+
+// ============ 请求链路追踪 ============
+
+/** 单次上游尝试 */
+export interface TraceAttempt {
+  attempt: number
+  credentialId: number
+  email?: string | null
+  endpoint: string
+  /** 上游 HTTP 状态码；null = 网络层失败 */
+  httpStatus: number | null
+  /** success / quota_exhausted / account_throttled / auth_failed / transient / network_error / bad_request / unknown */
+  outcome: string
+  /** 上游错误体片段（已截断） */
+  errorSnippet: string | null
+  durationMs: number
+}
+
+/** 一个外部请求的完整链路 */
+export interface TraceRecord {
+  traceId: string
+  ts: string
+  keyId: number
+  model: string
+  isStream: boolean
+  /** success / error / interrupted */
+  finalStatus: string
+  finalCredentialId: number
+  finalEmail?: string | null
+  errorType: string | null
+  errorMessage: string | null
+  totalAttempts: number
+  durationMs: number
+  /** 流式中断时已发送字节数 */
+  interruptedAfterBytes: number | null
+  attempts: TraceAttempt[]
+}
+
+/** 链路查询参数 */
+export interface TraceQuery {
+  status?: string
+  errorType?: string
+  credentialId?: number
+  /** 该凭据在某一跳失败过（即便 trace 最终成功）——用于凭据失败详情 */
+  failedAttemptCredentialId?: number
+  model?: string
+  onlyFailed?: boolean
+  limit?: number
+  offset?: number
+}
+
+/** 分页响应 */
+export interface TracePage {
+  records: TraceRecord[]
+  total: number
+}
+
+/** 单凭据失败分类计数（鉴权 / 账号风控 / 其他） */
+export interface FailureStats {
+  auth: number
+  throttle: number
+  other: number
+}
+
+/** credentialId(字符串) → 失败分类计数 */
+export type FailureStatsMap = Record<string, FailureStats>

@@ -63,6 +63,9 @@ proxy_pool.json
 usage_log.*.jsonl
 usage_stats.json
 prompt_cache.json
+traces.db
+traces.db-shm
+traces.db-wal
 data/
 
 # 在线更新产物（GitHub Releases 二进制暂存 + 备份）

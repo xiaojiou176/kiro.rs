@@ -30,6 +30,8 @@ pub struct CredentialStatusItem {
     pub disabled: bool,
     /// 连续失败次数
     pub failure_count: u32,
+    /// 累计失败次数（所有失败类型，只增不减，仅手动重置归零）
+    pub total_failure_count: u64,
     /// 是否为当前活跃凭据
     pub is_current: bool,
     /// Token 过期时间（RFC3339 格式）
@@ -287,6 +289,54 @@ pub struct LoadBalancingModeResponse {
 pub struct SetLoadBalancingModeRequest {
     /// 模式（"priority" 或 "balanced"）
     pub mode: String,
+}
+
+/// 账号级风控故障转移配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountThrottleConfigResponse {
+    /// 是否启用账号级 429 故障转移
+    pub failover: bool,
+    /// 冷却时长（秒）
+    pub cooldown_secs: u64,
+}
+
+/// 更新账号级风控故障转移配置
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAccountThrottleConfigRequest {
+    /// 是否启用故障转移；缺省表示不修改
+    #[serde(default)]
+    pub failover: Option<bool>,
+    /// 冷却时长（秒）；缺省表示不修改，1..=86400
+    #[serde(default)]
+    pub cooldown_secs: Option<u64>,
+}
+
+/// 日志治理配置响应
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogGovernanceConfigResponse {
+    /// 是否启用请求链路追踪写入
+    pub trace_enabled: bool,
+    /// trace 记录保留天数
+    pub trace_retention_days: u32,
+    /// 用量日志保留天数
+    pub usage_log_retention_days: u32,
+}
+
+/// 更新日志治理配置（字段缺省表示不修改）
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetLogGovernanceConfigRequest {
+    #[serde(default)]
+    pub trace_enabled: Option<bool>,
+    /// trace 保留天数，1..=365
+    #[serde(default)]
+    pub trace_retention_days: Option<u32>,
+    /// 用量日志保留天数，1..=365
+    #[serde(default)]
+    pub usage_log_retention_days: Option<u32>,
 }
 
 // ============ 代理池 ============

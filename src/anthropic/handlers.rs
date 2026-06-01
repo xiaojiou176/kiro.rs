@@ -5,6 +5,7 @@ use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
+use crate::admin::trace_db::{SharedTraceStore, TraceAttempt, TraceRecord, TraceSink, outcome};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -109,6 +110,90 @@ impl UsageRecordHook {
             }
         }
     }
+}
+
+/// 单次请求的链路追踪器
+///
+/// 在 handler 入口构造，作为 [`TraceSink`] 传入 provider；provider 在重试循环里
+/// 每跳调用 [`on_attempt`](TraceSink::on_attempt) 累积一条 [`TraceAttempt`]。
+/// 请求结束时调用 [`Self::finalize`] 组装 [`TraceRecord`] 并写入 SQLite。
+///
+/// `store` 为 None（未启用 Admin / trace）时所有方法都是空操作，零开销。
+pub(crate) struct RequestTracer {
+    store: Option<SharedTraceStore>,
+    trace_id: String,
+    ts: String,
+    key_id: u64,
+    model: String,
+    is_stream: bool,
+    started_at: Instant,
+    attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
+}
+
+impl RequestTracer {
+    pub fn new(state: &AppState, key_id: u64, model: String, is_stream: bool) -> Self {
+        Self {
+            store: state.trace_store.clone(),
+            trace_id: Uuid::new_v4().to_string(),
+            ts: Utc::now().to_rfc3339(),
+            key_id,
+            model,
+            is_stream,
+            started_at: Instant::now(),
+            attempts: parking_lot::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// 组装并落库一条完整链路。store 为 None 时不做任何事。
+    pub fn finalize(
+        &self,
+        final_status: &str,
+        error_type: Option<&str>,
+        error_message: Option<&str>,
+        interrupted_after_bytes: Option<u64>,
+    ) {
+        let Some(store) = &self.store else { return };
+        let attempts = std::mem::take(&mut *self.attempts.lock());
+        // 最终凭据：最后一跳的命中凭据（成功跳即命中凭据，失败跳即最后尝试的凭据）
+        let final_credential_id = attempts.last().map(|a| a.credential_id).unwrap_or(0);
+        let rec = TraceRecord {
+            trace_id: self.trace_id.clone(),
+            ts: self.ts.clone(),
+            key_id: self.key_id,
+            model: self.model.clone(),
+            is_stream: self.is_stream,
+            final_status: final_status.to_string(),
+            final_credential_id,
+            error_type: error_type.map(|s| s.to_string()),
+            error_message: error_message.map(|s| s.to_string()),
+            total_attempts: attempts.len() as u32,
+            duration_ms: self.started_at.elapsed().as_millis() as u64,
+            interrupted_after_bytes,
+            attempts,
+        };
+        store.insert(&rec);
+    }
+}
+
+impl TraceSink for RequestTracer {
+    fn on_attempt(&self, attempt: TraceAttempt) {
+        self.attempts.lock().push(attempt);
+    }
+}
+
+/// 取追踪器里最后一跳的 outcome（用于把 provider 的失败分类提升到 record.error_type）。
+/// 返回 'static str（outcome 常量），无 attempt 时返回 None。
+fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
+    let last = tracer.attempts.lock().last()?.outcome.clone();
+    Some(match last.as_str() {
+        outcome::QUOTA_EXHAUSTED => outcome::QUOTA_EXHAUSTED,
+        outcome::ACCOUNT_THROTTLED => outcome::ACCOUNT_THROTTLED,
+        outcome::AUTH_FAILED => outcome::AUTH_FAILED,
+        outcome::TRANSIENT => outcome::TRANSIENT,
+        outcome::NETWORK_ERROR => outcome::NETWORK_ERROR,
+        outcome::BAD_REQUEST => outcome::BAD_REQUEST,
+        _ => outcome::UNKNOWN,
+    })
 }
 
 /// 将 KiroProvider 错误映射为 HTTP 响应
@@ -548,6 +633,12 @@ pub async fn post_messages(
 
     if payload.stream {
         // 流式响应
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            key_ctx.key_id,
+            payload.model.clone(),
+            true,
+        ));
         handle_stream_request(
             provider,
             &request_body,
@@ -558,11 +649,18 @@ pub async fn post_messages(
             hook,
             cache_creation_tokens,
             cache_read_tokens,
+            tracer,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            key_ctx.key_id,
+            payload.model.clone(),
+            false,
+        ));
         handle_non_stream_request(
             provider,
             &request_body,
@@ -573,6 +671,7 @@ pub async fn post_messages(
             hook,
             cache_creation_tokens,
             cache_read_tokens,
+            tracer,
         )
         .await
     }
@@ -589,12 +688,15 @@ async fn handle_stream_request(
     hook: UsageRecordHook,
     cache_creation_tokens: i32,
     cache_read_tokens: i32,
+    tracer: std::sync::Arc<RequestTracer>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body).await {
+    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref())).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+            // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
+            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None);
             return map_provider_error(e);
         }
     };
@@ -610,7 +712,7 @@ async fn handle_stream_request(
     let initial_events = ctx.generate_initial_events();
 
     // 创建 SSE 流
-    let stream = create_sse_stream(response, ctx, initial_events, hook, credential_id);
+    let stream = create_sse_stream(response, ctx, initial_events, hook, credential_id, tracer);
 
     // 返回 SSE 响应
     Response::builder()
@@ -637,6 +739,7 @@ fn create_sse_stream(
     initial_events: Vec<SseEvent>,
     hook: UsageRecordHook,
     credential_id: u64,
+    tracer: std::sync::Arc<RequestTracer>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     // 先发送初始事件
     let initial_stream = stream::iter(
@@ -649,8 +752,8 @@ fn create_sse_stream(
     let body_stream = response.bytes_stream();
 
     let processing_stream = stream::unfold(
-        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id)| async move {
+        (body_stream, ctx, EventStreamDecoder::new(), false, interval(Duration::from_secs(PING_INTERVAL_SECS)), hook, credential_id, tracer, 0u64),
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
             if finished {
                 return None;
             }
@@ -661,6 +764,7 @@ fn create_sse_stream(
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
+                            sent_bytes += chunk.len() as u64;
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
                                 tracing::warn!("缓冲区溢出: {}", e);
@@ -687,28 +791,36 @@ fn create_sse_stream(
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
 
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
                         }
                         Some(Err(e)) => {
                             tracing::error!("读取响应流失败: {}", e);
                             // 发送最终事件并结束（记为 error）
                             let final_events = ctx.generate_final_events();
                             record_stream_usage(&hook, &ctx, credential_id, "error");
+                            // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
+                            tracer.finalize(
+                                "interrupted",
+                                Some(outcome::STREAM_INTERRUPTED),
+                                Some(&e.to_string()),
+                                Some(sent_bytes),
+                            );
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
                         }
                         None => {
                             // 流结束，发送最终事件
                             let final_events = ctx.generate_final_events();
                             record_stream_usage(&hook, &ctx, credential_id, "success");
+                            tracer.finalize("success", None, None, None);
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                 .collect();
-                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id)))
+                            Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)))
                         }
                     }
                 }
@@ -716,7 +828,7 @@ fn create_sse_stream(
                 _ = ping_interval.tick() => {
                     tracing::trace!("发送 ping 保活事件");
                     let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id)))
+                    Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)))
                 }
             }
         },
@@ -758,12 +870,14 @@ async fn handle_non_stream_request(
     hook: UsageRecordHook,
     initial_cache_creation: i32,
     initial_cache_read: i32,
+    tracer: std::sync::Arc<RequestTracer>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api(request_body).await {
+    let call_result = match provider.call_api(request_body, Some(tracer.as_ref())).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
+            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None);
             return map_provider_error(e);
         }
     };
@@ -776,6 +890,12 @@ async fn handle_non_stream_request(
         Err(e) => {
             tracing::error!("读取响应体失败: {}", e);
             hook.record(credential_id, input_tokens, 0, 0, 0, 0.0, "error");
+            tracer.finalize(
+                "interrupted",
+                Some(outcome::STREAM_INTERRUPTED),
+                Some(&e.to_string()),
+                None,
+            );
             return (
                 StatusCode::BAD_GATEWAY,
                 Json(ErrorResponse::new(
@@ -906,9 +1026,13 @@ async fn handle_non_stream_request(
             super::stream::extract_thinking_from_complete_text(&text_content);
 
         if let Some(thinking_text) = thinking {
+            // signature 占位字符串：上游 Kiro 不下发真实 Anthropic 签名，
+            // 但 thinking 模式下客户端要求 thinking 块带 signature 字段，
+            // 否则下一轮回传时 SDK 本地校验会拒绝（"must be passed back"）
             content.push(json!({
                 "type": "thinking",
-                "thinking": thinking_text
+                "thinking": thinking_text,
+                "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
             }));
         }
 
@@ -959,6 +1083,7 @@ async fn handle_non_stream_request(
         credits,
         "success",
     );
+    tracer.finalize("success", None, None, None);
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
@@ -1162,6 +1287,12 @@ pub async fn post_messages_cc(
 
     if payload.stream {
         // 流式响应（缓冲模式）
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            key_ctx.key_id,
+            payload.model.clone(),
+            true,
+        ));
         handle_stream_request_buffered(
             provider,
             &request_body,
@@ -1172,11 +1303,18 @@ pub async fn post_messages_cc(
             total_input_tokens,
             cache_creation_tokens,
             cache_read_tokens,
+            tracer,
         )
         .await
     } else {
         // 非流式响应：仅在配置开启时提取 thinking 块
         let extract_thinking = state.extract_thinking && thinking_enabled;
+        let tracer = std::sync::Arc::new(RequestTracer::new(
+            &state,
+            key_ctx.key_id,
+            payload.model.clone(),
+            false,
+        ));
         handle_non_stream_request(
             provider,
             &request_body,
@@ -1187,6 +1325,7 @@ pub async fn post_messages_cc(
             hook,
             cache_creation_tokens,
             cache_read_tokens,
+            tracer,
         )
         .await
     }
@@ -1206,12 +1345,14 @@ async fn handle_stream_request_buffered(
     fallback_input_tokens: i32,
     cache_creation_tokens: i32,
     cache_read_tokens: i32,
+    tracer: std::sync::Arc<RequestTracer>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body).await {
+    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref())).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
+            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None);
             return map_provider_error(e);
         }
     };
@@ -1228,7 +1369,7 @@ async fn handle_stream_request_buffered(
     ctx.set_initial_cache_tokens(cache_creation_tokens, cache_read_tokens);
 
     // 创建缓冲 SSE 流
-    let stream = create_buffered_sse_stream(response, ctx, hook, credential_id);
+    let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);
 
     // 返回 SSE 响应
     Response::builder()
@@ -1252,6 +1393,7 @@ fn create_buffered_sse_stream(
     ctx: BufferedStreamContext,
     hook: UsageRecordHook,
     credential_id: u64,
+    tracer: std::sync::Arc<RequestTracer>,
 ) -> impl Stream<Item = Result<Bytes, Infallible>> {
     let body_stream = response.bytes_stream();
 
@@ -1264,8 +1406,10 @@ fn create_buffered_sse_stream(
             interval(Duration::from_secs(PING_INTERVAL_SECS)),
             hook,
             credential_id,
+            tracer,
+            0u64,
         ),
-        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id)| async move {
+        |(mut body_stream, mut ctx, mut decoder, finished, mut ping_interval, hook, credential_id, tracer, mut sent_bytes)| async move {
             if finished {
                 return None;
             }
@@ -1280,13 +1424,14 @@ fn create_buffered_sse_stream(
                     _ = ping_interval.tick() => {
                         tracing::trace!("发送 ping 保活事件（缓冲模式）");
                         let bytes: Vec<Result<Bytes, Infallible>> = vec![Ok(create_ping_sse())];
-                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id)));
+                        return Some((stream::iter(bytes), (body_stream, ctx, decoder, false, ping_interval, hook, credential_id, tracer, sent_bytes)));
                     }
 
                     // 然后处理数据流
                     chunk_result = body_stream.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
+                                sent_bytes += chunk.len() as u64;
                                 // 解码事件
                                 if let Err(e) = decoder.feed(&chunk) {
                                     tracing::warn!("缓冲区溢出: {}", e);
@@ -1313,22 +1458,30 @@ fn create_buffered_sse_stream(
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
                                 hook.record(credential_id, i, o, cc, cr, credits, "error");
+                                // 缓冲模式 chunk 读取失败：上游中途断流
+                                tracer.finalize(
+                                    "interrupted",
+                                    Some(outcome::STREAM_INTERRUPTED),
+                                    Some(&e.to_string()),
+                                    Some(sent_bytes),
+                                );
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)));
                             }
                             None => {
                                 // 流结束，完成处理并返回所有事件（已更正 input_tokens）
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
                                 hook.record(credential_id, i, o, cc, cr, credits, "success");
+                                tracer.finalize("success", None, None, None);
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))
                                     .collect();
-                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id)));
+                                return Some((stream::iter(bytes), (body_stream, ctx, decoder, true, ping_interval, hook, credential_id, tracer, sent_bytes)));
                             }
                         }
                     }

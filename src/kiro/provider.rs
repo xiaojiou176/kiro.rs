@@ -8,9 +8,10 @@
 use reqwest::Client;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
+use crate::admin::trace_db::{TraceAttempt, TraceSink, outcome, truncate_snippet};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
@@ -117,14 +118,23 @@ impl KiroProvider {
 
     /// 发送非流式 API 请求
     ///
-    /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）
-    pub async fn call_api(&self, request_body: &str) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, false).await
+    /// 支持多凭据故障转移（见 [`Self::call_api_with_retry`]）。
+    /// `sink` 可选，用于逐跳上报链路追踪。
+    pub async fn call_api(
+        &self,
+        request_body: &str,
+        sink: Option<&dyn TraceSink>,
+    ) -> anyhow::Result<KiroCallResult> {
+        self.call_api_with_retry(request_body, false, sink).await
     }
 
     /// 发送流式 API 请求
-    pub async fn call_api_stream(&self, request_body: &str) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, true).await
+    pub async fn call_api_stream(
+        &self,
+        request_body: &str,
+        sink: Option<&dyn TraceSink>,
+    ) -> anyhow::Result<KiroCallResult> {
+        self.call_api_with_retry(request_body, true, sink).await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -318,6 +328,7 @@ impl KiroProvider {
         &self,
         request_body: &str,
         is_stream: bool,
+        sink: Option<&dyn TraceSink>,
     ) -> anyhow::Result<KiroCallResult> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
@@ -329,10 +340,15 @@ impl KiroProvider {
         let model = Self::extract_model_from_request(request_body);
 
         for attempt in 0..max_retries {
+            let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
             let ctx = match self.token_manager.acquire_context(model.as_deref()).await {
                 Ok(c) => c,
                 Err(e) => {
+                    Self::emit_attempt(
+                        sink, attempt, 0, "", None, outcome::UNKNOWN,
+                        Some(&e.to_string()), attempt_start,
+                    );
                     last_error = Some(e);
                     continue;
                 }
@@ -344,11 +360,16 @@ impl KiroProvider {
             let endpoint = match self.endpoint_for(&ctx.credentials) {
                 Ok(e) => e,
                 Err(e) => {
+                    Self::emit_attempt(
+                        sink, attempt, ctx.id, "", None, outcome::UNKNOWN,
+                        Some(&e.to_string()), attempt_start,
+                    );
                     last_error = Some(e);
                     self.token_manager.report_failure(ctx.id);
                     continue;
                 }
             };
+            let endpoint_name = endpoint.name();
 
             let rctx = RequestContext {
                 credentials: &ctx.credentials,
@@ -415,6 +436,10 @@ impl KiroProvider {
                         max_retries,
                         e
                     );
+                    Self::emit_attempt(
+                        sink, attempt, ctx.id, endpoint_name, None,
+                        outcome::NETWORK_ERROR, Some(&e.to_string()), attempt_start,
+                    );
                     // 网络错误通常是上游/链路瞬态问题，不应导致"禁用凭据"或"切换凭据"
                     // （否则一段时间网络抖动会把所有凭据都误禁用，需要重启才能恢复）
                     last_error = Some(e.into());
@@ -429,6 +454,10 @@ impl KiroProvider {
 
             // 成功响应
             if status.is_success() {
+                Self::emit_attempt(
+                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                    outcome::SUCCESS, None, attempt_start,
+                );
                 self.token_manager.report_success(ctx.id);
                 return Ok(KiroCallResult {
                     response,
@@ -447,6 +476,10 @@ impl KiroProvider {
                     max_retries,
                     status,
                     body
+                );
+                Self::emit_attempt(
+                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                    outcome::QUOTA_EXHAUSTED, Some(&body), attempt_start,
                 );
 
                 let has_available = self.token_manager.report_quota_exhausted(ctx.id);
@@ -470,6 +503,10 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                Self::emit_attempt(
+                    sink, attempt, ctx.id, endpoint_name, Some(400),
+                    outcome::BAD_REQUEST, Some(&body), attempt_start,
+                );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -481,6 +518,10 @@ impl KiroProvider {
                     max_retries,
                     status,
                     body
+                );
+                Self::emit_attempt(
+                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                    outcome::AUTH_FAILED, Some(&body), attempt_start,
                 );
 
                 // token 被上游失效：先尝试 force-refresh，每凭据仅一次机会
@@ -513,6 +554,56 @@ impl KiroProvider {
                 continue;
             }
 
+            // 429 + suspicious activity = 账号级临时风控
+            // 仅当前凭据被针对，故障转移到其它凭据可立即恢复（受配置开关控制）。
+            if status.as_u16() == 429
+                && self.token_manager.get_account_throttle_failover()
+                && endpoint.is_account_throttled(&body)
+            {
+                let cooldown_secs = self
+                    .token_manager
+                    .get_account_throttle_cooldown_secs()
+                    .max(1);
+                let cooldown = std::time::Duration::from_secs(cooldown_secs);
+                tracing::warn!(
+                    "API 请求失败（账号级风控，凭据 #{} 冷却 {}s 并切换，尝试 {}/{}）: {}",
+                    ctx.id,
+                    cooldown_secs,
+                    attempt + 1,
+                    max_retries,
+                    body
+                );
+
+                let remaining = self.token_manager.report_account_throttled(ctx.id, cooldown);
+                Self::emit_attempt(
+                    sink, attempt, ctx.id, endpoint_name, Some(429),
+                    outcome::ACCOUNT_THROTTLED, Some(&body), attempt_start,
+                );
+                last_error = Some(anyhow::anyhow!(
+                    "{} API 请求失败（账号级风控，凭据 #{} 已冷却 {} 分钟）: {} {}",
+                    api_type,
+                    ctx.id,
+                    cooldown_secs / 60,
+                    status,
+                    body
+                ));
+
+                if remaining == 0 {
+                    anyhow::bail!(
+                        "{} API 请求失败：所有凭据都处于账号风控冷却或已禁用状态。\
+                         上游对凭据 #{} 的账号触发了 \"suspicious activity\" 临时限速，\
+                         建议：(1) 增加更多不同 AWS 账号的凭据；\
+                         (2) 在管理面板降低冷却时长或手动解除冷却以重试；\
+                         (3) 提交 AWS Support 申诉解封该账号。原始响应: {} {}",
+                        api_type,
+                        ctx.id,
+                        status,
+                        body
+                    );
+                }
+                continue;
+            }
+
             // 429/408/5xx - 瞬态上游错误：重试但不禁用或切换凭据
             // （避免 429 high traffic / 502 high load 等瞬态错误把所有凭据锁死）
             if matches!(status.as_u16(), 408 | 429) || status.is_server_error() {
@@ -522,6 +613,10 @@ impl KiroProvider {
                     max_retries,
                     status,
                     body
+                );
+                Self::emit_attempt(
+                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                    outcome::TRANSIENT, Some(&body), attempt_start,
                 );
                 last_error = Some(anyhow::anyhow!(
                     "{} API 请求失败: {} {}",
@@ -537,6 +632,10 @@ impl KiroProvider {
 
             // 其他 4xx - 通常为请求/配置问题：直接返回，不计入凭据失败
             if status.is_client_error() {
+                Self::emit_attempt(
+                    sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                    outcome::BAD_REQUEST, Some(&body), attempt_start,
+                );
                 anyhow::bail!("{} API 请求失败: {} {}", api_type, status, body);
             }
 
@@ -547,6 +646,10 @@ impl KiroProvider {
                 max_retries,
                 status,
                 body
+            );
+            Self::emit_attempt(
+                sink, attempt, ctx.id, endpoint_name, Some(status.as_u16()),
+                outcome::UNKNOWN, Some(&body), attempt_start,
             );
             last_error = Some(anyhow::anyhow!(
                 "{} API 请求失败: {} {}",
@@ -567,6 +670,30 @@ impl KiroProvider {
                 max_retries
             )
         }))
+    }
+
+    /// 向 trace sink 上报一跳结果（sink 为 None 时无开销）
+    #[allow(clippy::too_many_arguments)]
+    fn emit_attempt(
+        sink: Option<&dyn TraceSink>,
+        attempt: usize,
+        credential_id: u64,
+        endpoint: &str,
+        http_status: Option<u16>,
+        outcome: &str,
+        error_body: Option<&str>,
+        started: Instant,
+    ) {
+        let Some(sink) = sink else { return };
+        sink.on_attempt(TraceAttempt {
+            attempt: attempt as u32,
+            credential_id,
+            endpoint: endpoint.to_string(),
+            http_status,
+            outcome: outcome.to_string(),
+            error_snippet: error_body.and_then(truncate_snippet),
+            duration_ms: started.elapsed().as_millis() as u64,
+        });
     }
 
     /// 从请求体中提取模型信息

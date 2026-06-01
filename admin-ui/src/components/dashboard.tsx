@@ -83,9 +83,24 @@ import {
   useLoadBalancingMode,
   useSetLoadBalancingMode,
   useResetAllSuccessCount,
+  useSetPriority,
 } from "@/hooks/use-credentials";
 import { useUpdateCheck } from "@/hooks/use-update-check";
+import { useFailureStats } from "@/hooks/use-traces";
 import { useRectSelect } from "@/hooks/use-rect-select";
+import {
+  DndContext,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  closestCenter,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  arrayMove,
+  rectSortingStrategy,
+} from "@dnd-kit/sortable";
 import {
   getCredentialBalance,
   forceRefreshToken,
@@ -95,7 +110,12 @@ import {
   enableOverageForAllCapable,
   exportKamCredentials,
 } from "@/api/credentials";
-import { extractErrorMessage, parseError, generateApiKey, formatNumber } from "@/lib/utils";
+import {
+  extractErrorMessage,
+  parseError,
+  generateApiKey,
+  formatNumber,
+} from "@/lib/utils";
 import type { BalanceResponse } from "@/types/api";
 
 interface DashboardProps {
@@ -163,17 +183,81 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } =
     useSetLoadBalancingMode();
   const resetAllSuccess = useResetAllSuccessCount();
+  const setPriority = useSetPriority();
   const { data: updateCheck } = useUpdateCheck();
+  const { data: failureStatsMap } = useFailureStats();
 
   const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage);
   const startIndex = (currentPage - 1) * itemsPerPage;
   const endIndex = startIndex + itemsPerPage;
-  const currentCredentials =
-    data?.credentials.slice(startIndex, endIndex) || [];
+  const serverPageCreds = data?.credentials.slice(startIndex, endIndex) || [];
+  // 拖拽排序的本地乐观顺序：仅当 id 集合与当前页一致时生效，否则回落到服务端顺序，
+  // 避免翻页 / 数据变更后顺序错乱。
+  const [pageOrder, setPageOrder] = useState<number[] | null>(null);
+  const currentCredentials = (() => {
+    if (!pageOrder) return serverPageCreds;
+    const serverIds = new Set(serverPageCreds.map((c) => c.id));
+    const orderIds = new Set(pageOrder);
+    if (
+      serverIds.size !== orderIds.size ||
+      ![...serverIds].every((id) => orderIds.has(id))
+    ) {
+      return serverPageCreds;
+    }
+    const byId = new Map(serverPageCreds.map((c) => [c.id, c]));
+    return pageOrder.map((id) => byId.get(id)!).filter(Boolean);
+  })();
   const currentPageIds = currentCredentials.map((c) => c.id);
   const currentPageAllSelected =
     currentPageIds.length > 0 &&
     currentPageIds.every((id) => selectedIds.has(id));
+
+  // 翻页时清掉本地排序覆盖，回到服务端顺序
+  useEffect(() => {
+    setPageOrder(null);
+  }, [currentPage]);
+
+  const dragSensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+  );
+
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    const ids = currentCredentials.map((c) => c.id);
+    const oldIndex = ids.indexOf(Number(active.id));
+    const newIndex = ids.indexOf(Number(over.id));
+    if (oldIndex < 0 || newIndex < 0) return;
+
+    const newOrder = arrayMove(ids, oldIndex, newIndex);
+    setPageOrder(newOrder);
+
+    // 按新视觉顺序赋连续递增的 priority（全局位置 = startIndex + 页内索引）。
+    // 不依赖原有 priority 值域：即使原值全为默认 0 / 相同，也能保证数字更新、排序持久化；
+    // 跨页也不冲突（第 1 页 0..11、第 2 页 12..23）。只对实际变化的卡片发请求。
+    const prevPriority = new Map(
+      currentCredentials.map((c) => [c.id, c.priority]),
+    );
+    const updates = newOrder
+      .map((id, i) => ({ id, priority: startIndex + i }))
+      .filter((u) => prevPriority.get(u.id) !== u.priority);
+    if (updates.length === 0) return;
+
+    Promise.all(
+      updates.map((u) =>
+        setPriority.mutateAsync({ id: u.id, priority: u.priority }),
+      ),
+    )
+      .then(() => {
+        toast.success("优先级顺序已更新");
+        queryClient.invalidateQueries({ queryKey: ["credentials"] });
+      })
+      .catch((err) => {
+        toast.error("更新优先级失败: " + (err as Error).message);
+        setPageOrder(null);
+      });
+  };
+
   const gridRef = useRef<HTMLElement | null>(null);
   const rectSelection = useRectSelect({
     containerRef: gridRef,
@@ -502,6 +586,31 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     else toast.warning(`查询完成：成功 ${s} 个，失败 ${f} 个`);
   };
 
+  const handleRefreshBalance = async (id: number) => {
+    setLoadingBalanceIds((prev) => {
+      const n = new Set(prev);
+      n.add(id);
+      return n;
+    });
+    try {
+      const balance = await getCredentialBalance(id);
+      setBalanceMap((prev) => {
+        const n = new Map(prev);
+        n.set(id, balance);
+        return n;
+      });
+      toast.success("余额已刷新");
+    } catch (err) {
+      toast.error("刷新余额失败: " + (err as Error).message);
+    } finally {
+      setLoadingBalanceIds((prev) => {
+        const n = new Set(prev);
+        n.delete(id);
+        return n;
+      });
+    }
+  };
+
   const handleBatchVerify = async () => {
     if (selectedIds.size === 0) {
       toast.error("请先选择要验活的凭据");
@@ -565,7 +674,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [disablingQuota, setDisablingQuota] = useState(false);
   const handleDisableQuotaExceeded = async () => {
     if (quotaExceededCount === 0) {
-      toast.info('当前没有已超额的凭据，可先点击"查询当前页信息"刷新余额');
+      toast.info('当前没有已超额的凭据，可先点击"刷新当前页余额"');
       return;
     }
     if (!confirm(`确定要把 ${quotaExceededCount} 个已超额的凭据全部禁用吗？`))
@@ -591,15 +700,16 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   // 一键开启超额：调用上游 setUserPreference 把所有"可开启且未开启"的凭据开启
   const [enablingOverage, setEnablingOverage] = useState(false);
   const handleEnableOverageAll = async () => {
-    if (overageRetryableCount === 0) {
-      toast.info("当前没有需要操作的凭据");
+    if (overageEnableableCount === 0) {
+      toast.info("当前没有明确「未开启超额」的凭据");
       return;
     }
-    const msg =
-      overageEnableableCount > 0
-        ? `确定要为 ${overageEnableableCount} 个凭据开启超额吗？开启后超出额度将按 overageRate 计费。`
-        : `当前没有明确"未开"的凭据，将对 ${overageStats.unknown} 个状态待定的凭据尝试开启超额。继续？`;
-    if (!confirm(msg)) return;
+    if (
+      !confirm(
+        `确定要为 ${overageEnableableCount} 个凭据开启超额吗？开启后超出额度将按 overageRate 计费。`,
+      )
+    )
+      return;
     setEnablingOverage(true);
     try {
       const res = await enableOverageForAllCapable();
@@ -619,6 +729,61 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     } finally {
       setEnablingOverage(false);
     }
+  };
+
+  // 重试拉取超额状态：仅针对状态待确定的凭据批量查余额（只读，安全）。
+  // 区分于「一键开启超额」——后者会调用写接口 setUserPreference，FREE 订阅会 403。
+  const [refreshingOverage, setRefreshingOverage] = useState(false);
+  const [refreshingOverageProgress, setRefreshingOverageProgress] = useState({
+    current: 0,
+    total: 0,
+  });
+  const handleRefreshOverageStatus = async () => {
+    const targets = (data?.credentials || [])
+      .filter((c) => {
+        if (c.disabled) return false;
+        const b = balanceMap.get(c.id) || c.balance;
+        if (!b) return true;
+        return b.overageCapable === undefined || b.overageCapable === null;
+      })
+      .map((c) => c.id);
+    if (targets.length === 0) {
+      toast.info("没有状态待确定的凭据");
+      return;
+    }
+    setRefreshingOverage(true);
+    setRefreshingOverageProgress({ current: 0, total: targets.length });
+    let s = 0,
+      f = 0;
+    for (let i = 0; i < targets.length; i++) {
+      const id = targets[i];
+      setLoadingBalanceIds((prev) => {
+        const n = new Set(prev);
+        n.add(id);
+        return n;
+      });
+      try {
+        const balance = await getCredentialBalance(id);
+        s++;
+        setBalanceMap((prev) => {
+          const n = new Map(prev);
+          n.set(id, balance);
+          return n;
+        });
+      } catch {
+        f++;
+      } finally {
+        setLoadingBalanceIds((prev) => {
+          const n = new Set(prev);
+          n.delete(id);
+          return n;
+        });
+      }
+      setRefreshingOverageProgress({ current: i + 1, total: targets.length });
+    }
+    setRefreshingOverage(false);
+    if (f === 0) toast.success(`刷新完成：成功 ${s}/${targets.length}`);
+    else toast.warning(`刷新完成：成功 ${s} 个，失败 ${f} 个`);
   };
 
   const [exportingKam, setExportingKam] = useState(false);
@@ -1012,6 +1177,21 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               </>
             )}
 
+            {/* 刷新当前页余额 */}
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={queryingInfo || !data?.credentials?.length}
+              onClick={handleQueryCurrentPageInfo}
+            >
+              <RefreshCw
+                className={`h-3.5 w-3.5 ${queryingInfo ? "animate-spin" : ""}`}
+              />
+              {queryingInfo
+                ? `刷新中… ${queryInfoProgress.current}/${queryInfoProgress.total}`
+                : "刷新当前页余额"}
+            </Button>
+
             {/* 主操作 */}
             <Button onClick={() => setAddDialogOpen(true)} size="sm">
               <Plus className="h-3.5 w-3.5" />
@@ -1067,18 +1247,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   IP 代理池管理
                 </DropdownMenuItem>
                 <DropdownMenuItem
-                  disabled={queryingInfo || !data?.credentials?.length}
-                  onSelect={(e) => {
-                    e.preventDefault();
-                    handleQueryCurrentPageInfo();
-                  }}
-                >
-                  <RefreshCw className={queryingInfo ? "animate-spin" : ""} />
-                  {queryingInfo
-                    ? `查询中… ${queryInfoProgress.current}/${queryInfoProgress.total}`
-                    : "查询当前页信息"}
-                </DropdownMenuItem>
-                <DropdownMenuItem
                   disabled={
                     resetAllSuccess.isPending || !data?.credentials?.length
                   }
@@ -1097,10 +1265,18 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   重置成功次数
                 </DropdownMenuItem>
                 <DropdownMenuItem
-                  disabled={enablingOverage || overageRetryableCount === 0}
+                  disabled={
+                    enablingOverage ||
+                    refreshingOverage ||
+                    overageRetryableCount === 0
+                  }
                   onSelect={(e) => {
                     e.preventDefault();
-                    handleEnableOverageAll();
+                    if (overageEnableableCount > 0) {
+                      handleEnableOverageAll();
+                    } else {
+                      handleRefreshOverageStatus();
+                    }
                   }}
                   title={
                     overageRetryableCount === 0
@@ -1110,16 +1286,18 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 >
                   <Zap
                     className={
-                      enablingOverage
+                      enablingOverage || refreshingOverage
                         ? "animate-pulse text-emerald-500"
                         : "text-emerald-500"
                     }
                   />
-                  {overageRetryableCount === 0
-                    ? `全部已开启超额（${overageStats.enabled}）`
-                    : overageEnableableCount > 0
-                      ? `一键开启超额（${overageEnableableCount}）`
-                      : `重试拉取超额状态（${overageStats.unknown}）`}
+                  {refreshingOverage
+                    ? `刷新中… ${refreshingOverageProgress.current}/${refreshingOverageProgress.total}`
+                    : overageRetryableCount === 0
+                      ? `全部已开启超额（${overageStats.enabled}）`
+                      : overageEnableableCount > 0
+                        ? `一键开启超额（${overageEnableableCount}）`
+                        : `重试拉取超额状态（${overageStats.unknown}）`}
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuItem
@@ -1163,20 +1341,37 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           </Card>
         ) : (
           <>
-            <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 select-none">
-              {currentCredentials.map((credential) => (
-                <CredentialCard
-                  key={credential.id}
-                  credential={credential}
-                  selected={selectedIds.has(credential.id)}
-                  onToggleSelect={() => toggleSelect(credential.id)}
-                  balance={
-                    balanceMap.get(credential.id) || credential.balance || null
-                  }
-                  loadingBalance={loadingBalanceIds.has(credential.id)}
-                />
-              ))}
-            </div>
+            <DndContext
+              sensors={dragSensors}
+              collisionDetection={closestCenter}
+              onDragEnd={handleDragEnd}
+            >
+              <SortableContext
+                items={currentPageIds}
+                strategy={rectSortingStrategy}
+              >
+                <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 select-none">
+                  {currentCredentials.map((credential) => (
+                    <CredentialCard
+                      key={credential.id}
+                      credential={credential}
+                      selected={selectedIds.has(credential.id)}
+                      onToggleSelect={() => toggleSelect(credential.id)}
+                      balance={
+                        balanceMap.get(credential.id) ||
+                        credential.balance ||
+                        null
+                      }
+                      loadingBalance={loadingBalanceIds.has(credential.id)}
+                      onRefreshBalance={() =>
+                        handleRefreshBalance(credential.id)
+                      }
+                      failureStats={failureStatsMap?.[String(credential.id)]}
+                    />
+                  ))}
+                </div>
+              </SortableContext>
+            </DndContext>
 
             {totalPages > 1 && (
               <div className="mt-8 flex items-center justify-center gap-2">

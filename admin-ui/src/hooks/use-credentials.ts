@@ -5,6 +5,7 @@ import {
   setCredentialPriority,
   resetCredentialFailure,
   forceRefreshToken,
+  clearThrottle,
   getCredentialBalance,
   addCredential,
   deleteCredential,
@@ -12,6 +13,10 @@ import {
   updateRefreshToken,
   getLoadBalancingMode,
   setLoadBalancingMode,
+  getAccountThrottleConfig,
+  setAccountThrottleConfig,
+  getLogGovernanceConfig,
+  setLogGovernanceConfig,
   resetSuccessCount,
   resetAllSuccessCount,
 } from '@/api/credentials'
@@ -76,6 +81,17 @@ export function useForceRefreshToken() {
   const queryClient = useQueryClient()
   return useMutation({
     mutationFn: (id: number) => forceRefreshToken(id),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['credentials'] })
+    },
+  })
+}
+
+// 解除账号级风控冷却
+export function useClearThrottle() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: (id: number) => clearThrottle(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['credentials'] })
     },
@@ -165,6 +181,44 @@ export function useSetLoadBalancingMode() {
     mutationFn: setLoadBalancingMode,
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['loadBalancingMode'] })
+    },
+  })
+}
+
+// 获取账号级风控故障转移配置
+export function useAccountThrottleConfig() {
+  return useQuery({
+    queryKey: ['accountThrottleConfig'],
+    queryFn: getAccountThrottleConfig,
+  })
+}
+
+// 更新账号级风控故障转移配置
+export function useSetAccountThrottleConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setAccountThrottleConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['accountThrottleConfig'] })
+    },
+  })
+}
+
+// 获取日志治理配置
+export function useLogGovernanceConfig() {
+  return useQuery({
+    queryKey: ['logGovernanceConfig'],
+    queryFn: getLogGovernanceConfig,
+  })
+}
+
+// 更新日志治理配置
+export function useSetLogGovernanceConfig() {
+  const queryClient = useQueryClient()
+  return useMutation({
+    mutationFn: setLogGovernanceConfig,
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['logGovernanceConfig'] })
     },
   })
 }

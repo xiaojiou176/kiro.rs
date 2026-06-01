@@ -18,6 +18,10 @@
 # 按天滚动的请求用量日志
 /usage_log.*.jsonl
 /usage_stats.json
+# 请求链路追踪 SQLite 库（运行时产物，含 WAL 边车文件）
+/traces.db
+/traces.db-shm
+/traces.db-wal
 # 在线更新产生的暂存二进制和备份
 *.staged-*
 *.backup
