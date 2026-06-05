@@ -509,4 +509,77 @@ mod tests {
         };
         assert_eq!(compute_cache_usage(&cache, &req), (0, 0));
     }
+
+    /// 构造一个普通工具，input_schema 的顶层 key 按给定顺序插入。
+    /// 用于验证：无论插入顺序如何，tool_signature 都稳定（BTreeMap 保证）。
+    fn build_tool_with_schema_order(insert_required_first: bool) -> super::super::types::Tool {
+        use super::super::types::Tool;
+        let mut schema = std::collections::BTreeMap::new();
+        // 故意用不同的插入顺序，模拟上游 JSON 解析的不确定迭代序。
+        if insert_required_first {
+            schema.insert("required".to_string(), serde_json::json!([]));
+            schema.insert("properties".to_string(), serde_json::json!({}));
+            schema.insert("type".to_string(), serde_json::json!("object"));
+        } else {
+            schema.insert("type".to_string(), serde_json::json!("object"));
+            schema.insert("properties".to_string(), serde_json::json!({}));
+            schema.insert("required".to_string(), serde_json::json!([]));
+        }
+        Tool {
+            tool_type: None,
+            name: "my_tool".to_string(),
+            description: "desc".to_string(),
+            input_schema: schema,
+            max_uses: None,
+            cache_control: None,
+        }
+    }
+
+    #[test]
+    fn tool_signature_stable_across_insert_order() {
+        let a = build_tool_with_schema_order(true);
+        let b = build_tool_with_schema_order(false);
+        // 逻辑等价、插入顺序不同的 schema 必须产生相同签名，
+        // 否则 tools 段 hash 抖动会让后续 system/messages 断点连锁 miss。
+        assert_eq!(tool_signature(&a), tool_signature(&b));
+    }
+
+    #[test]
+    fn compute_cache_usage_tools_hit_regardless_of_schema_order() {
+        use super::super::types::{CacheControl, Message, MessagesRequest};
+
+        let make_req = |insert_required_first: bool| {
+            let mut tool = build_tool_with_schema_order(insert_required_first);
+            tool.cache_control = Some(CacheControl {
+                cache_type: "ephemeral".to_string(),
+                ttl: None,
+            });
+            MessagesRequest {
+                model: "claude-sonnet-4-5-20250929".to_string(),
+                max_tokens: 32,
+                messages: vec![Message {
+                    role: "user".to_string(),
+                    content: serde_json::Value::String("Hello".to_string()),
+                }],
+                stream: false,
+                system: None,
+                tools: Some(vec![tool]),
+                tool_choice: None,
+                thinking: None,
+                output_config: None,
+                metadata: None,
+            }
+        };
+
+        let cache = PromptCache::new(None);
+        // 第一次：用一种插入顺序，应写缓存。
+        let (cc1, cr1) = compute_cache_usage(&cache, &make_req(false));
+        assert!(cc1 > 0, "first call should write cache, cc={}", cc1);
+        assert_eq!(cr1, 0);
+
+        // 第二次：换一种插入顺序但逻辑等价，应命中缓存（不再反复 miss）。
+        let (cc2, cr2) = compute_cache_usage(&cache, &make_req(true));
+        assert_eq!(cc2, 0, "second call should hit, not re-create, got cc={}", cc2);
+        assert_eq!(cr2, cc1, "second read should equal first creation");
+    }
 }

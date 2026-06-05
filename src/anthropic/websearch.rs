@@ -111,11 +111,11 @@ pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
     })
 }
 
-/// 检查请求是否为"混合工具里含 web_search"的场景
+/// Checks whether the request is a "mixed-tools set that contains web_search" case
 ///
-/// 与 [`has_web_search_tool`] 互斥：后者是纯单工具快路径，本函数判定的是
-/// web_search 与其它工具(exec 等)并存的场景——这种请求会落普通对话路径，
-/// 上游可能回 name=web_search 的 tool_use，需要走内部 agentic loop。
+/// Mutually exclusive with [`has_web_search_tool`]: that one is the pure single-tool fast path, while this one detects
+/// the case where web_search coexists with other tools (exec, etc.) - such a request falls onto the normal chat path,
+/// where the upstream may return a tool_use with name=web_search, requiring the internal agentic loop.
 pub(crate) fn has_web_search_among_tools(req: &MessagesRequest) -> bool {
     req.tools.as_ref().is_some_and(|tools| {
         tools.len() > 1 && tools.iter().any(|t| t.name == "web_search")

@@ -1,7 +1,7 @@
 //! Anthropic API 类型定义
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 // === 错误响应 ===
 
@@ -232,8 +232,12 @@ pub struct Tool {
     #[serde(default)]
     pub description: String,
     /// 输入参数 schema（普通工具必需，WebSearch 工具无此字段）
+    ///
+    /// 使用 `BTreeMap` 而非 `HashMap`：key 按字典序稳定迭代，保证序列化
+    /// 输出可复现。这对 prompt cache 至关重要——tool 签名参与缓存前缀
+    /// 指纹，若顶层 key 顺序抖动会导致后续 system/messages 断点连锁失效。
     #[serde(default)]
-    pub input_schema: HashMap<String, serde_json::Value>,
+    pub input_schema: BTreeMap<String, serde_json::Value>,
     /// 最大使用次数（仅 WebSearch 工具）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_uses: Option<i32>,

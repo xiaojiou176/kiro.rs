@@ -13,6 +13,7 @@ import {
   ZapOff,
   Clock,
   ScrollText,
+  Boxes,
 } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -56,6 +57,7 @@ import { EditCredentialDialog } from "@/components/edit-credential-dialog";
 import { UpdateTokenDialog } from "@/components/update-token-dialog";
 import { ReloginDialog } from "@/components/relogin-dialog";
 import { CredentialFailuresDialog } from "@/components/credential-failures-dialog";
+import { AvailableModelsDialog } from "@/components/available-models-dialog";
 
 interface CredentialCardProps {
   credential: CredentialStatusItem;
@@ -200,6 +202,7 @@ export function CredentialCard({
   const [showUpdateTokenDialog, setShowUpdateTokenDialog] = useState(false);
   const [showReloginDialog, setShowReloginDialog] = useState(false);
   const [showFailuresDialog, setShowFailuresDialog] = useState(false);
+  const [showModelsDialog, setShowModelsDialog] = useState(false);
 
   const setDisabled = useSetDisabled();
   const setPriority = useSetPriority();
@@ -739,6 +742,16 @@ export function CredentialCard({
                     <RotateCcw />
                     重置失败计数
                   </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => setShowModelsDialog(true)}
+                    disabled={credential.disabled}
+                    title={
+                      credential.disabled ? "已禁用凭据无法查询" : undefined
+                    }
+                  >
+                    <Boxes />
+                    查看可用模型
+                  </DropdownMenuItem>
                   {throttleRemaining > 0 && (
                     <DropdownMenuItem
                       onSelect={(e) => {
@@ -865,6 +878,11 @@ export function CredentialCard({
         onOpenChange={setShowFailuresDialog}
         credentialId={credential.id}
         email={credential.email}
+      />
+      <AvailableModelsDialog
+        open={showModelsDialog}
+        onOpenChange={setShowModelsDialog}
+        credentialId={showModelsDialog ? credential.id : null}
       />
     </>
   );

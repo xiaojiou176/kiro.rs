@@ -190,6 +190,19 @@ pub fn get_context_window_size(model: &str) -> i32 {
     }
 }
 
+/// Whether this request should use `additionalModelRequestFields.output_config`.
+///
+/// The field is currently only known to be accepted by the Opus 4.6 adaptive-thinking path.
+/// Sending it to other models causes upstream 400 responses such as
+/// `additionalModelRequestFields is not supported for this model`.
+fn should_emit_additional_model_request_fields(req: &MessagesRequest, model_id: &str) -> bool {
+    model_id == "claude-opus-4.6"
+        && req
+            .thinking
+            .as_ref()
+            .is_some_and(|t| t.thinking_type == "adaptive")
+}
+
 /// 转换结果
 #[derive(Debug)]
 pub struct ConversionResult {
@@ -197,8 +210,8 @@ pub struct ConversionResult {
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
-    /// 附加模型请求字段（含 `output_config.effort`），由客户端 Anthropic 请求
-    /// 里的 `output_config` 字段翻译而来。空时不发送。
+    /// Additional model request fields (including `output_config.effort`), translated from the
+    /// `output_config` field of the client's Anthropic request. Not sent when empty.
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
 }
 
@@ -403,29 +416,46 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         );
     }
 
-    // 14. 提取 effort 到 AdditionalModelRequestFields（Kiro CLI 真包字段）
+    // 14. Extract effort into AdditionalModelRequestFields only for models that accept it.
     //
-    // 实测 2026-05-25：AWS Q 后端真协议是 `additionalModelRequestFields.output_config.effort`，
-    // 跟 system prompt 里塞 `<thinking_effort>` XML 标签不是同一个东西。
-    // 客户端传入的 `req.output_config.effort` 在这里被翻译到真协议字段，
-    // 现有的 XML 前缀逻辑（generate_thinking_prefix）保留不动，
-    // 双发出最高效力（ladder F case 实测比单发 4x 思考深度）。
+    // Upstream capability gate (from ZyphrZero): the real wire field
+    // `additionalModelRequestFields.output_config.effort` is narrower than the system-prompt
+    // thinking prefix. Newer/non-adaptive models reject it with
+    // `additionalModelRequestFields is not supported for this model`, so keep the field opt-in
+    // by upstream model capability rather than by the mere presence of client output_config.
+    // The XML thinking prefix (generate_thinking_prefix) remains available for every thinking mode.
     //
-    // P0 patch 2026-05-25：Codex APP schema 的 ReasoningEffort.enum 锁死到 xhigh，
-    // 没有 "max" 选项；而 Kiro CLI 真包发的就是 "max"。
-    // 为了让 Codex 顶档 xhigh 真打到 Kiro 顶档 max（完美复刻 Kiro CLI Max 模式），
-    // 在这里做 xhigh -> max 的字面值映射，其它档位字面透传。
-    let additional_model_request_fields = req.output_config.as_ref().map(|oc| {
-        let mapped_effort = match oc.effort.as_str() {
-            "xhigh" => "max".to_string(),
-            other => other.to_string(),
+    // Local increment preserved (Terry, P0 2026-05-25): the Codex App schema locks
+    // ReasoningEffort.enum to "xhigh" with no "max" option, while the Kiro CLI wire value is
+    // "max". When the field is emitted, map the top tier "xhigh" -> "max" so Codex's top tier
+    // reaches Kiro's top tier (faithful Kiro CLI Max mode); other tiers pass through literally.
+    let additional_model_request_fields =
+        if should_emit_additional_model_request_fields(req, &model_id) {
+            req.output_config.as_ref().and_then(|oc| {
+                if oc.effort.trim().is_empty() {
+                    return None;
+                }
+                let mapped_effort = match oc.effort.as_str() {
+                    "xhigh" => "max".to_string(),
+                    other => other.to_string(),
+                };
+                Some(AdditionalModelRequestFields {
+                    output_config: Some(KiroOutputConfig {
+                        effort: mapped_effort,
+                    }),
+                })
+            })
+        } else {
+            if let Some(oc) = &req.output_config
+                && !oc.effort.trim().is_empty()
+            {
+                tracing::debug!(
+                    model_id = %model_id,
+                    "skipping unsupported additionalModelRequestFields for model"
+                );
+            }
+            None
         };
-        AdditionalModelRequestFields {
-            output_config: Some(KiroOutputConfig {
-                effort: mapped_effort,
-            }),
-        }
-    });
 
     Ok(ConversionResult {
         conversation_state,
@@ -447,9 +477,9 @@ fn process_message_content(
     process_message_content_dedup(content, None)
 }
 
-/// 与 `process_message_content` 相同，但当 `dedup` 为 `Some` 时对图片做 SHA256 去重：
-/// 历史消息里重复出现的同一张图（同 base64）只保留首次，后续替换成占位文本，
-/// 避免多轮对话里同一截图反复重发 base64 烧 token。
+/// Same as `process_message_content`, but when `dedup` is `Some` it deduplicates images by SHA256:
+/// the same image (identical base64) recurring across history is kept only on first sight and later replaced with placeholder text,
+/// avoiding the same screenshot being re-sent as base64 over multiple turns and burning tokens.
 fn process_message_content_dedup(
     content: &serde_json::Value,
     mut dedup: Option<&mut std::collections::HashSet<String>>,
@@ -521,18 +551,18 @@ fn get_image_format(media_type: &str) -> Option<String> {
     }
 }
 
-/// 把一个 image block 的 source 转成 `KiroImage` 推到顶层 `images`。
+/// Converts an image block's source into a `KiroImage` and pushes it onto the top-level `images`.
 ///
-/// 复用顶层 image 的同一条转换链（格式校验 + SHA256 去重 + resize + `from_base64`），
-/// 让 tool_result 里的 image 走同样的路上提到顶层 images 字段。
-/// 返回 `Some(占位文本)` 表示命中历史去重、图被省略；`None` 表示已上提或格式不支持。
+/// Reuses the same conversion chain as top-level images (format validation + SHA256 dedup + resize + `from_base64`),
+/// so an image inside a tool_result is lifted into the top-level images field the same way.
+/// Returns `Some(placeholder)` when history dedup hit and the image was omitted; `None` when it was lifted or the format is unsupported.
 fn extract_kiro_image(
     source: &ImageSource,
     dedup: &mut Option<&mut std::collections::HashSet<String>>,
     images: &mut Vec<KiroImage>,
 ) -> Option<String> {
     let format = get_image_format(&source.media_type)?;
-    // 历史去重：命中过的同图省略 base64，返回占位文本
+    // History dedup: an already-seen image omits its base64 and returns placeholder text
     if let Some(seen) = dedup.as_deref_mut() {
         let mut hasher = Sha256::new();
         hasher.update(source.data.as_bytes());
@@ -549,9 +579,9 @@ fn extract_kiro_image(
 
 /// 提取工具结果内容
 ///
-/// 文本元素留作 tool_result 占位文本；`type=="image"` 的 block 抽成 `KiroImage`
-/// 上提到顶层 `images`（Amazon Q 的 `ToolResult` 没有图字段，图只能走顶层通道）。
-/// 若 tool_result 只有图没有文本，留占位文本 "[image attached]"。
+/// Text elements remain as tool_result placeholder text; blocks with `type=="image"` are extracted into a `KiroImage`
+/// and lifted to the top-level `images` (Amazon Q's `ToolResult` has no image field, so images can only go through the top-level channel).
+/// If a tool_result has only images and no text, the placeholder text "[image attached]" is used.
 fn extract_tool_result_content(
     content: &Option<serde_json::Value>,
     dedup: &mut Option<&mut std::collections::HashSet<String>>,
@@ -869,7 +899,7 @@ fn build_history(req: &MessagesRequest, messages: &[super::types::Message], mode
     // 收集并配对消息
     let mut user_buffer: Vec<&super::types::Message> = Vec::new();
     let mut assistant_buffer: Vec<&super::types::Message> = Vec::new();
-    // 历史图片 SHA256 去重集合，贯穿整个历史；同图重复出现只保留首次
+    // SHA256 dedup set for images spanning the whole history; a repeated image is kept only on first sight
     let mut image_dedup: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for i in 0..history_end_index {
@@ -1171,6 +1201,76 @@ mod tests {
         assert_eq!(result, Some("claude-haiku-4.5".to_string()));
     }
 
+    fn minimal_request_with_output_config(model: &str) -> MessagesRequest {
+        use super::super::types::{Message as AnthropicMessage, OutputConfig};
+
+        MessagesRequest {
+            model: model.to_string(),
+            max_tokens: 1024,
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
+            stream: false,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            thinking: None,
+            output_config: Some(OutputConfig {
+                effort: "high".to_string(),
+            }),
+            metadata: None,
+        }
+    }
+
+    fn minimal_adaptive_thinking_request_with_output_config(model: &str) -> MessagesRequest {
+        use super::super::types::Thinking;
+
+        let mut req = minimal_request_with_output_config(model);
+        req.thinking = Some(Thinking {
+            thinking_type: "adaptive".to_string(),
+            budget_tokens: 20000,
+        });
+        req
+    }
+
+    #[test]
+    fn test_output_config_does_not_emit_unsupported_additional_fields() {
+        let req = minimal_request_with_output_config("claude-sonnet-4-8-thinking");
+        let result = convert_request(&req).unwrap();
+
+        assert!(
+            result.additional_model_request_fields.is_none(),
+            "sonnet 4.8 rejects additionalModelRequestFields even when the client sends output_config"
+        );
+    }
+
+    #[test]
+    fn test_output_config_does_not_emit_for_non_adaptive_opus_4_6() {
+        let req = minimal_request_with_output_config("claude-opus-4-6");
+        let result = convert_request(&req).unwrap();
+
+        assert!(
+            result.additional_model_request_fields.is_none(),
+            "opus 4.6 only uses additionalModelRequestFields for adaptive thinking"
+        );
+    }
+
+    #[test]
+    fn test_output_config_emits_additional_fields_for_opus_4_6() {
+        let req = minimal_adaptive_thinking_request_with_output_config("claude-opus-4-6-thinking");
+        let result = convert_request(&req).unwrap();
+
+        let fields = result
+            .additional_model_request_fields
+            .expect("opus 4.6 adaptive thinking should keep the real effort field");
+        assert_eq!(
+            fields.output_config.unwrap().effort,
+            "high",
+            "effort should be passed through for the supported model"
+        );
+    }
+
     #[test]
     fn test_determine_chat_trigger_type() {
         // 无工具时返回 MANUAL
@@ -1274,7 +1374,7 @@ mod tests {
         let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
         assert!(long_tool_name.len() > TOOL_NAME_MAX_LEN);
 
-        let mut schema = std::collections::HashMap::new();
+        let mut schema = std::collections::BTreeMap::new();
         schema.insert("type".to_string(), serde_json::json!("object"));
         schema.insert("properties".to_string(), serde_json::json!({}));
 
@@ -1325,7 +1425,7 @@ mod tests {
 
         let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
 
-        let mut schema = std::collections::HashMap::new();
+        let mut schema = std::collections::BTreeMap::new();
         schema.insert("type".to_string(), serde_json::json!("object"));
         schema.insert("properties".to_string(), serde_json::json!({}));
 
@@ -1988,14 +2088,14 @@ mod tests {
         assert!(found_tool_use, "合并后的 assistant 消息应包含 tool_use");
     }
 
-    // 1x1 PNG 的 base64（合法 PNG header，resize 直接 passthrough）
+    // base64 of a 1x1 PNG (valid PNG header, so resize just passes it through)
     const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
 
     #[test]
     fn test_tool_result_image_lifts_to_top_level() {
         use super::super::types::Message as AnthropicMessage;
 
-        // user 提问 -> assistant tool_use -> user tool_result（含图 + 文本）
+        // user question -> assistant tool_use -> user tool_result (with image + text)
         let req = MessagesRequest {
             model: "claude-sonnet-4.5".to_string(),
             max_tokens: 1024,
@@ -2032,18 +2132,18 @@ mod tests {
         let result = convert_request(&req).unwrap();
         let msg = &result.conversation_state.current_message.user_input_message;
 
-        // 图被上提到顶层 images
-        assert_eq!(msg.images.len(), 1, "tool_result 里的图应上提到顶层 images");
+        // image is lifted to the top-level images
+        assert_eq!(msg.images.len(), 1, "image in tool_result should be lifted to top-level images");
         assert_eq!(msg.images[0].format, "png");
         assert_eq!(msg.images[0].source.bytes, TINY_PNG_B64);
 
-        // tool_result 自身只保留文本占位（图已剥离）
+        // tool_result itself keeps only the text placeholder (image stripped out)
         let tr = &msg.user_input_message_context.tool_results;
         assert_eq!(tr.len(), 1);
         assert_eq!(
             tr[0].content[0].get("text").and_then(|v| v.as_str()),
             Some("here is the screen"),
-            "tool_result content 应保留文本，不含 base64"
+            "tool_result content should keep the text and contain no base64"
         );
     }
 
@@ -2051,7 +2151,7 @@ mod tests {
     fn test_tool_result_text_only_unchanged() {
         use super::super::types::Message as AnthropicMessage;
 
-        // 纯文本 tool_result：回归不变，不应产生顶层图
+        // text-only tool_result: regression unchanged, should produce no top-level image
         let req = MessagesRequest {
             model: "claude-sonnet-4.5".to_string(),
             max_tokens: 1024,
@@ -2085,13 +2185,13 @@ mod tests {
         let result = convert_request(&req).unwrap();
         let msg = &result.conversation_state.current_message.user_input_message;
 
-        assert!(msg.images.is_empty(), "纯文本 tool_result 不应产生顶层图");
+        assert!(msg.images.is_empty(), "text-only tool_result should produce no top-level image");
         let tr = &msg.user_input_message_context.tool_results;
         assert_eq!(tr.len(), 1);
         assert_eq!(
             tr[0].content[0].get("text").and_then(|v| v.as_str()),
             Some("file content"),
-            "纯文本 tool_result content 应原样保留"
+            "text-only tool_result content should be preserved as-is"
         );
     }
 }

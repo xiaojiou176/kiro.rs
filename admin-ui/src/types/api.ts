@@ -54,6 +54,20 @@ export interface BalanceResponse {
   overageCapabilityRaw?: string
 }
 
+// 某凭据当前可用的模型列表响应
+export interface AvailableModelsResponse {
+  id: number
+  models: AvailableModelItem[]
+}
+
+// 单个可用模型
+export interface AvailableModelItem {
+  modelId: string
+  modelName?: string
+  description?: string
+  maxInputTokens?: number
+}
+
 // 成功响应
 export interface SuccessResponse {
   success: boolean
@@ -122,6 +136,9 @@ export interface UpdateRefreshTokenRequest {
   expiresAt?: string
 }
 
+// 代理健康状态
+export type ProxyHealth = 'unknown' | 'healthy' | 'unhealthy'
+
 // 代理池条目
 export interface ProxyPoolEntry {
   id: number
@@ -129,6 +146,11 @@ export interface ProxyPoolEntry {
   label?: string
   enabled: boolean
   credentialCount: number
+  health: ProxyHealth
+  latencyMs?: number
+  lastCheckedAt?: string
+  consecutiveFailures: number
+  autoDisabled: boolean
 }
 
 // 代理池列表响应
@@ -159,6 +181,34 @@ export interface BatchAddProxyResponse {
   errors: number
   proxies: ProxyPoolEntry[]
   errorMessages: string[]
+}
+
+// 单个代理健康检查响应
+export interface ProxyCheckResponse {
+  id: number
+  health: ProxyHealth
+  latencyMs?: number
+  lastCheckedAt?: string
+  enabled: boolean
+  autoDisabled: boolean
+}
+
+// 全量健康检查响应
+export interface ProxyCheckAllResponse {
+  healthy: number
+  unhealthy: number
+  autoDisabled: number
+}
+
+// 轮询批量分配请求
+export interface AssignRoundRobinRequest {
+  credentialIds?: number[] | null
+}
+
+// 轮询批量分配响应
+export interface AssignRoundRobinResponse {
+  assigned: number
+  proxyCount: number
 }
 
 // 全局代理配置

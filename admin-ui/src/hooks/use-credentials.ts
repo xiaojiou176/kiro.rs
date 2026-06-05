@@ -7,6 +7,7 @@ import {
   forceRefreshToken,
   clearThrottle,
   getCredentialBalance,
+  getCredentialModels,
   addCredential,
   deleteCredential,
   updateCredential,
@@ -38,6 +39,16 @@ export function useCredentialBalance(id: number | null) {
     queryFn: () => getCredentialBalance(id!),
     enabled: id !== null,
     retry: false, // 余额查询失败时不重试（避免重复请求被封禁的账号）
+  })
+}
+
+// 查询凭据当前可用的模型列表（按需实时查询上游）
+export function useCredentialModels(id: number | null) {
+  return useQuery({
+    queryKey: ['credential-models', id],
+    queryFn: () => getCredentialModels(id!),
+    enabled: id !== null,
+    retry: false, // 失败不重试，避免对被封禁/异常账号反复请求
   })
 }
 

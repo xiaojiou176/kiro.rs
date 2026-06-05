@@ -18,6 +18,7 @@ use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::machine_id;
+use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::model::token_refresh::{
     IdcRefreshRequest, IdcRefreshResponse, RefreshRequest, RefreshResponse,
@@ -386,6 +387,78 @@ pub(crate) async fn get_usage_limits(
     }
 
     let data: UsageLimitsResponse = response.json().await?;
+    Ok(data)
+}
+
+/// 获取该凭据当前可用的模型列表
+///
+/// 上游接口：`GET https://q.{api_region}.amazonaws.com/ListAvailableModels?origin=AI_EDITOR`
+/// 返回值随订阅等级不同而不同（如 FREE 账号不含 Opus）。
+/// 请求头与构造方式与 [`get_usage_limits`] 完全一致。
+pub(crate) async fn get_available_models(
+    credentials: &KiroCredentials,
+    config: &Config,
+    token: &str,
+    proxy: Option<&ProxyConfig>,
+) -> anyhow::Result<ListAvailableModelsResponse> {
+    tracing::debug!("正在获取可用模型列表...");
+
+    // 优先级：凭据.api_region > config.api_region > config.region
+    let region = credentials.effective_api_region(config);
+    let host = format!("q.{}.amazonaws.com", region);
+    let machine_id = machine_id::generate_from_credentials(credentials, config);
+    let kiro_version = &config.kiro_version;
+    let os_name = &config.system_version;
+    let node_version = &config.node_version;
+
+    // 构建 URL（profileArn 可选）
+    let mut url = format!(
+        "https://{}/ListAvailableModels?origin=AI_EDITOR",
+        host
+    );
+    if let Some(profile_arn) = &credentials.profile_arn {
+        url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
+    }
+
+    // 构建 User-Agent headers（与 get_usage_limits 保持一致）
+    let user_agent = format!(
+        "aws-sdk-js/1.0.0 ua/2.1 os/{} lang/js md/nodejs#{} api/codewhispererruntime#1.0.0 m/N,E KiroIDE-{}-{}",
+        os_name, node_version, kiro_version, machine_id
+    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.0 KiroIDE-{}-{}", kiro_version, machine_id);
+
+    let client = build_client(proxy, 60, config.tls_backend)?;
+
+    let mut request = client
+        .get(&url)
+        .header("x-amz-user-agent", &amz_user_agent)
+        .header("user-agent", &user_agent)
+        .header("host", &host)
+        .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string())
+        .header("amz-sdk-request", "attempt=1; max=1")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("Connection", "close");
+
+    if credentials.is_api_key_credential() {
+        request = request.header("tokentype", "API_KEY");
+    }
+
+    let response = request.send().await?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body_text = response.text().await.unwrap_or_default();
+        let error_msg = match status.as_u16() {
+            401 => "认证失败，Token 无效或已过期",
+            403 => "权限不足，无法获取可用模型",
+            429 => "请求过于频繁，已被限流",
+            500..=599 => "服务器错误，AWS 服务暂时不可用",
+            _ => "获取可用模型失败",
+        };
+        bail!("{}: {} {}", error_msg, status, body_text);
+    }
+
+    let data: ListAvailableModelsResponse = response.json().await?;
     Ok(data)
 }
 
@@ -2033,6 +2106,97 @@ impl MultiTokenManager {
         }
 
         Ok(usage_limits)
+    }
+
+    /// 为只读型上游查询准备有效 token 与最新凭据快照
+    ///
+    /// 复用 [`Self::get_usage_limits_for`] 的 token 准备流程：API Key 凭据直接用
+    /// kiroApiKey；OAuth 凭据按需在 `refresh_lock` 内刷新并持久化。返回的凭据是
+    /// 刷新后重新读取的最新快照，调用方据此构造请求。
+    async fn prepare_request_token(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<(String, KiroCredentials)> {
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        // API Key 凭据直接使用 kiro_api_key，无需刷新
+        let token = if credentials.is_api_key_credential() {
+            credentials
+                .kiro_api_key
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("API Key 凭据缺少 kiroApiKey"))?
+        } else if is_token_expired(&credentials) || is_token_expiring_soon(&credentials) {
+            let _guard = self.refresh_lock.lock().await;
+            let current_creds = {
+                let entries = self.entries.lock();
+                entries
+                    .iter()
+                    .find(|e| e.id == id)
+                    .map(|e| e.credentials.clone())
+                    .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+            };
+
+            if is_token_expired(&current_creds) || is_token_expiring_soon(&current_creds) {
+                let global_proxy = self.proxy.lock().clone();
+                let effective_proxy = current_creds.effective_proxy(global_proxy.as_ref());
+                let new_creds =
+                    refresh_token(&current_creds, &self.config, effective_proxy.as_ref()).await?;
+                {
+                    let mut entries = self.entries.lock();
+                    if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                        entry.credentials = new_creds.clone();
+                    }
+                }
+                // 持久化失败只记录警告，不影响本次请求
+                if let Err(e) = self.persist_credentials() {
+                    tracing::warn!("Token 刷新后持久化失败（不影响本次请求）: {}", e);
+                }
+                new_creds
+                    .access_token
+                    .ok_or_else(|| anyhow::anyhow!("刷新后无 access_token"))?
+            } else {
+                current_creds
+                    .access_token
+                    .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
+            }
+        } else {
+            credentials
+                .access_token
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("凭据无 access_token"))?
+        };
+
+        // 重新读取最新凭据（刷新可能改写了 access_token 之外的字段）
+        let credentials = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.credentials.clone())
+                .ok_or_else(|| anyhow::anyhow!("凭据不存在: {}", id))?
+        };
+
+        Ok((token, credentials))
+    }
+
+    /// 获取指定凭据当前可用的模型列表（Admin API）
+    ///
+    /// 按需实时查询上游 `ListAvailableModels`，不做缓存。
+    pub async fn get_available_models_for(
+        &self,
+        id: u64,
+    ) -> anyhow::Result<ListAvailableModelsResponse> {
+        let (token, credentials) = self.prepare_request_token(id).await?;
+        let global_proxy = self.proxy.lock().clone();
+        let effective_proxy = credentials.effective_proxy(global_proxy.as_ref());
+        get_available_models(&credentials, &self.config, &token, effective_proxy.as_ref()).await
     }
 
     /// 设置用户偏好（开启/关闭超额）— Admin API

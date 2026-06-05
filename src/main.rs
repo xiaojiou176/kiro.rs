@@ -3,10 +3,10 @@ mod admin_ui;
 mod anthropic;
 mod common;
 mod http_client;
+mod image_resize;
 mod kiro;
 mod model;
 mod observability;
-mod image_resize;
 pub mod token;
 
 use std::collections::HashMap;
@@ -306,6 +306,11 @@ async fn main() {
             admin_state
                 .service
                 .start_balance_refresher(std::time::Duration::from_secs(300));
+
+            // 启动代理池健康检查调度器（每 5 分钟一次）
+            admin_state
+                .service
+                .start_proxy_health_checker(std::time::Duration::from_secs(300));
 
             // 启动自动更新调度器：每分钟检查一次本地时间，到达 update_auto_apply_time
             // 且开启 update_auto_apply 时执行一次更新；否则静默等待。

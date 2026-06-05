@@ -3,6 +3,7 @@ import { storage } from '@/lib/storage'
 import type {
   CredentialsStatusResponse,
   BalanceResponse,
+  AvailableModelsResponse,
   SuccessResponse,
   SetDisabledRequest,
   SetPriorityRequest,
@@ -16,6 +17,9 @@ import type {
   BatchAddProxyRequest,
   BatchAddProxyResponse,
   AssignProxyRequest,
+  ProxyCheckResponse,
+  ProxyCheckAllResponse,
+  AssignRoundRobinResponse,
   StartIdcLoginRequest,
   StartIdcLoginResponse,
   PollIdcLoginResponse,
@@ -146,6 +150,12 @@ export async function getCredentialBalance(id: number): Promise<BalanceResponse>
   return data
 }
 
+// 获取凭据当前可用的模型列表（按需实时查询上游）
+export async function getCredentialModels(id: number): Promise<AvailableModelsResponse> {
+  const { data } = await api.get<AvailableModelsResponse>(`/credentials/${id}/models`)
+  return data
+}
+
 // 添加新凭据
 export async function addCredential(
   req: AddCredentialRequest
@@ -256,6 +266,28 @@ export async function assignProxyToCredential(
   req: AssignProxyRequest
 ): Promise<SuccessResponse> {
   const { data } = await api.post<SuccessResponse>(`/credentials/${credentialId}/proxy`, req)
+  return data
+}
+
+// 即时探测单个代理连通性
+export async function checkProxy(id: number): Promise<ProxyCheckResponse> {
+  const { data } = await api.post<ProxyCheckResponse>(`/proxy-pool/${id}/check`)
+  return data
+}
+
+// 触发全部代理健康检查
+export async function checkAllProxies(): Promise<ProxyCheckAllResponse> {
+  const { data } = await api.post<ProxyCheckAllResponse>('/proxy-pool/check-all')
+  return data
+}
+
+// 轮询批量分配可用代理给凭据
+export async function assignProxiesRoundRobin(
+  credentialIds?: number[] | null
+): Promise<AssignRoundRobinResponse> {
+  const { data } = await api.post<AssignRoundRobinResponse>('/proxy-pool/assign-round-robin', {
+    credentialIds: credentialIds ?? null,
+  })
   return data
 }
 

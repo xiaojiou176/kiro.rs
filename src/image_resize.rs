@@ -1,23 +1,23 @@
-//! 入站图片缩放与重编码
+//! Inbound image downscaling and re-encoding
 //!
-//! 把 Anthropic 协议 ContentBlock 里 base64 编码的图片在 **CPU 本地**缩到
-//! 长边 ≤ `KIRO_RS_IMAGE_MAX_LONG_SIDE` 像素 + 字节 ≤ `KIRO_RS_IMAGE_MAX_BYTES`，
-//! 再 base64 重编码后塞回 KiroImage。这一步必须做的原因：
+//! Downscales the base64-encoded images carried in Anthropic protocol ContentBlocks **locally on CPU** to
+//! a long side <= `KIRO_RS_IMAGE_MAX_LONG_SIDE` px and a byte size <= `KIRO_RS_IMAGE_MAX_BYTES`,
+//! then re-encodes to base64 and writes it back into the KiroImage. Why this step is required:
 //!
-//! 1. AWS Q (`q.us-east-1.amazonaws.com`) 后端对单字段大小有硬限。实测 ~700 KB
-//!    的 toolResult.content[0].text 会触发 `CONTENT_LENGTH_EXCEEDS_THRESHOLD`，
-//!    iPhone 截图（1206×2622 PNG）单张 base64 ≈ 700K 字符同样会触发。
-//! 2. Anthropic 官方建议长边 ≤ 1568 px，这个数据点是 vision encoder 的 patch
-//!    grid 边界，超出会被服务端再缩一次但 token 仍按原图计费。
-//! 3. ChatGPT/OpenAI 服务端会自动缩到这个尺寸；AWS Q 不会。这就是同样一批
-//!    iPhone 截图发给 GPT-5.5 能成功而 Kiro Opus 4.7 报 400 的根因。
+//! 1. The AWS Q (`q.us-east-1.amazonaws.com`) backend enforces a hard per-field size limit. A ~700 KB
+//!    toolResult.content[0].text triggers `CONTENT_LENGTH_EXCEEDS_THRESHOLD`,
+//!    and an iPhone screenshot (1206x2622 PNG) whose single base64 string is ~700K chars triggers it too.
+//! 2. Anthropic recommends a long side <= 1568 px; this value is the vision encoder's patch
+//!    grid boundary. Beyond it the server downscales again, yet tokens are still billed against the original.
+//! 3. ChatGPT/OpenAI servers downscale to this size automatically; AWS Q does not. That is the root
+//!    cause of the same iPhone screenshots succeeding on GPT models while Kiro Opus returns 400.
 //!
-//! 设计原则：
-//! - 小图直接 pass（不解码不重编，零开销）
-//! - 大图缩到长边阈值并转 JPEG 重编（PNG/WebP/JPEG 全部输出 JPEG，
-//!   GIF 例外保留原格式因为可能是动图）
-//! - 解码失败时**保留原图**，记 warn 日志，永远不能让坏图导致整请求挂掉
-//! - 全部走 `KIRO_RS_IMAGE_*` 环境变量，跟 observability 八件套同款契约
+//! Design principles:
+//! - Small images pass through directly (no decode, no re-encode, zero overhead)
+//! - Large images are downscaled to the long-side cap and re-encoded as JPEG (PNG/WebP/JPEG all
+//!   emit JPEG; GIF is the exception and keeps its original format because it may be animated)
+//! - On decode failure **keep the original image** and log a warning; a bad image must never fail the whole request
+//! - Everything is driven by `KIRO_RS_IMAGE_*` env vars, sharing the same contract as the observability env-var family
 
 use std::io::Cursor;
 
@@ -25,14 +25,14 @@ use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use image::{ImageFormat, ImageReader, imageops::FilterType};
 use tracing::{debug, warn};
 
-/// 默认长边阈值（Anthropic 官方推荐值）
+/// Default long-side threshold (Anthropic's recommended value)
 const DEFAULT_MAX_LONG_SIDE: u32 = 1568;
-/// 默认字节阈值（留足 < AWS Q 单字段限的安全余量）
+/// Default byte threshold (leaves a safe margin below the AWS Q per-field limit)
 const DEFAULT_MAX_BYTES: usize = 400_000;
-/// 默认 JPEG 质量
+/// Default JPEG quality
 const DEFAULT_JPEG_QUALITY: u8 = 85;
 
-/// 入站图片处理器配置
+/// Inbound image processor configuration
 #[derive(Debug, Clone, Copy)]
 pub struct ResizeConfig {
     pub enabled: bool,
@@ -42,16 +42,15 @@ pub struct ResizeConfig {
 }
 
 impl ResizeConfig {
-    /// 从 `KIRO_RS_IMAGE_*` 环境变量读，缺省回退到默认值
+    /// Reads from `KIRO_RS_IMAGE_*` env vars, falling back to defaults when unset
     pub fn from_env() -> Self {
-        let enabled = match std::env::var("KIRO_RS_IMAGE_RESIZE")
-            .unwrap_or_else(|_| "1".to_string())
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "0" | "false" | "no" | "off" => false,
-            _ => true,
-        };
+        let enabled = !matches!(
+            std::env::var("KIRO_RS_IMAGE_RESIZE")
+                .unwrap_or_else(|_| "1".to_string())
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "false" | "no" | "off"
+        );
         let max_long_side = std::env::var("KIRO_RS_IMAGE_MAX_LONG_SIDE")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -73,27 +72,31 @@ impl ResizeConfig {
     }
 }
 
-/// 一张图片处理结果（明确表达"原样保留"和"重编码"两种状态）
+/// Result of processing one image (explicitly distinguishes the "kept as-is" and "re-encoded" states)
+///
+/// `was_resized` / `original_bytes` / `final_bytes` are consumed only by test assertions and structured logs;
+/// non-test runtime paths do not read them, so the whole struct is marked `allow(dead_code)` to keep the diagnostic fields.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct ProcessedImage {
-    /// 输出格式（"jpeg" / "png" / "gif" / "webp"）
+    /// Output format ("jpeg" / "png" / "gif" / "webp")
     pub format: String,
-    /// 输出 base64 字符串
+    /// Output base64 string
     pub data_base64: String,
-    /// 是否真做了重编码（用于日志/metrics）
+    /// Whether re-encoding actually happened (used for logs/metrics)
     pub was_resized: bool,
-    /// 输入字节数（解码前）
+    /// Input byte count (before decoding)
     pub original_bytes: usize,
-    /// 输出字节数
+    /// Output byte count
     pub final_bytes: usize,
 }
 
-/// 主入口：对单张入站图片做"够小直接过 / 大就缩"的处理
+/// Main entry: processes a single inbound image with the rule "small enough -> pass / large -> shrink"
 ///
-/// `format` 是来源 media-type 的最后一段（"png" / "jpeg" / "gif" / "webp"），
-/// `data_base64` 是 base64 编码的原始字节。
+/// `format` is the last segment of the source media-type ("png" / "jpeg" / "gif" / "webp"),
+/// `data_base64` is the base64-encoded raw bytes.
 ///
-/// 永远不会 panic、永远不会丢图。失败时返回输入的 owned 拷贝并 log warn。
+/// Never panics and never drops an image. On failure it returns an owned copy of the input and logs a warning.
 pub fn maybe_shrink_image(
     cfg: ResizeConfig,
     format: &str,
@@ -102,22 +105,22 @@ pub fn maybe_shrink_image(
     let format_lc = format.to_ascii_lowercase();
     let original_bytes = data_base64.len();
 
-    // 1) 关闭开关：原样返回
+    // 1) Disabled: return as-is
     if !cfg.enabled {
         return passthrough(format_lc, data_base64);
     }
-    // 2) 字节够小：原样返回（小图不必折腾，节省 CPU）
+    // 2) Bytes small enough: return as-is (small images need no work, saves CPU)
     if data_base64.len() <= cfg.max_bytes {
-        // 但即便字节小也要看一下尺寸是否超长（罕见，比如 7000×100 banner）
-        // 用一个轻量 probe（仅读 header）：image::ImageReader::with_guessed_format
+        // Even with small bytes, check whether the dimensions are oversized (rare, e.g. a 7000x100 banner)
+        // Use a lightweight probe (header only): image::ImageReader::with_guessed_format
         if let Some((w, h)) = peek_dimensions(&format_lc, data_base64)
             && w.max(h) <= cfg.max_long_side
         {
             return passthrough(format_lc, data_base64);
         }
-        // 字节小但维度超大：仍然走重编路径
+        // Small bytes but oversized dimensions: still take the re-encode path
     }
-    // 3) 动图（GIF 多帧）保留原格式不动 — JPEG 化会丢动画
+    // 3) Animated images (multi-frame GIF) keep their original format unchanged - JPEG would lose the animation
     if format_lc == "gif" {
         debug!(
             target: "kiro_rs::image_resize",
@@ -127,7 +130,7 @@ pub fn maybe_shrink_image(
         return passthrough(format_lc, data_base64);
     }
 
-    // 4) 真正缩图
+    // 4) Actually shrink the image
     match shrink_static_image(cfg, &format_lc, data_base64) {
         Ok(processed) => processed,
         Err(e) => {
@@ -145,8 +148,8 @@ pub fn maybe_shrink_image(
 
 fn passthrough(format: String, data_base64: &str) -> ProcessedImage {
     let n = data_base64.len();
-    // 用真实字节的 magic bytes 校正 format：宿主侧可能标 png 但字节实为 jpeg，
-    // 忠实透传会让 Bedrock 严格 MIME 校验报 IMAGE_MIME_MISMATCH。探测失败则保持原标签（不丢图）。
+    // Correct the format from the real magic bytes: the host may label it png while the bytes are actually jpeg,
+    // and faithful passthrough would trip Bedrock's strict MIME check with IMAGE_MIME_MISMATCH. If detection fails, keep the original label (never drop the image).
     let format = match detect_format_from_bytes(data_base64) {
         Some(real) if real != format => {
             debug!(
@@ -168,9 +171,9 @@ fn passthrough(format: String, data_base64: &str) -> ProcessedImage {
     }
 }
 
-/// 按真实字节的 magic bytes 探测格式，返回 "png"/"jpeg"/"gif"/"webp"。
-/// 只 decode 前 ~16 字节（base64 前 24 字符）足够覆盖全部 magic，省 CPU。
-/// 探测不出（解码失败/未知格式）返回 None，由调用方安全兜底保持原标签。
+/// Detects the format from the real magic bytes, returning "png"/"jpeg"/"gif"/"webp".
+/// Decoding only the first ~16 bytes (first 24 base64 chars) is enough to cover every magic number and saves CPU.
+/// On detection failure (decode error / unknown format) it returns None, and the caller safely keeps the original label.
 fn detect_format_from_bytes(data_base64: &str) -> Option<String> {
     let head: String = data_base64.chars().take(24).collect();
     let bytes = BASE64.decode(head.as_bytes()).ok()?;
@@ -183,7 +186,7 @@ fn detect_format_from_bytes(data_base64: &str) -> Option<String> {
     }
 }
 
-/// 只读 header 拿尺寸，不解整个像素，单图 < 1ms
+/// Reads only the header for dimensions without decoding all pixels; < 1ms per image
 fn peek_dimensions(format: &str, data_base64: &str) -> Option<(u32, u32)> {
     let bytes = BASE64.decode(data_base64).ok()?;
     let cursor = Cursor::new(&bytes);
@@ -230,31 +233,48 @@ fn shrink_static_image(
         .decode()
         .map_err(|e| ResizeError::Decode(e.to_string()))?;
 
-    // 比例缩放（保持长宽比）
+    // Initial proportional scaling to the configured long-side cap (preserves aspect ratio).
     let (w, h) = (img.width(), img.height());
-    let long = w.max(h);
-    let resized = if long > cfg.max_long_side {
-        let scale = cfg.max_long_side as f32 / long as f32;
-        let new_w = ((w as f32) * scale).round().max(1.0) as u32;
-        let new_h = ((h as f32) * scale).round().max(1.0) as u32;
-        // FilterType::Lanczos3 视觉质量好，CPU 单核 1206×2622 → 1024×~470
-        // 经验耗时 ~80ms；批量 30 张图大概 2.5s，可接受
-        img.resize_exact(new_w, new_h, FilterType::Lanczos3)
-    } else {
-        img
-    };
+    let long_initial = w.max(h);
+    let mut cur_long = long_initial.min(cfg.max_long_side).max(1);
 
-    // JPEG 重编码（截图场景质量 85 视觉无损 + 体积小 10-20×）
-    let mut out = Vec::with_capacity(64 * 1024);
-    {
-        // 强制 RGB8（JPEG 不支持透明通道；alpha 会被丢弃，对截图场景无影响）
+    // Two-level convergence to honor max_bytes: for each long-side cap, encode at the
+    // configured quality and progressively lower the quality; if the budget still isn't met
+    // at the minimum quality, downscale the long side further and retry. This guarantees the
+    // output actually fits max_bytes (down to a small floor) instead of returning oversized data.
+    const MIN_JPEG_QUALITY: u8 = 35;
+    const MIN_LONG_SIDE: u32 = 256;
+    let mut out;
+    let mut quality;
+    loop {
+        let resized = if w.max(h) > cur_long {
+            let scale = cur_long as f32 / w.max(h) as f32;
+            let new_w = ((w as f32) * scale).round().max(1.0) as u32;
+            let new_h = ((h as f32) * scale).round().max(1.0) as u32;
+            // FilterType::Lanczos3 gives good visual quality; ~80ms for 1206x2622 -> 1024x~470 on one core.
+            img.resize_exact(new_w, new_h, FilterType::Lanczos3)
+        } else {
+            img.clone()
+        };
+        // Force RGB8 (JPEG has no alpha; dropping alpha is harmless for screenshots).
         let rgb = resized.to_rgb8();
-        let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
-            &mut out,
-            cfg.jpeg_quality,
-        );
-        rgb.write_with_encoder(encoder)
-            .map_err(|e| ResizeError::Encode(e.to_string()))?;
+        quality = cfg.jpeg_quality;
+        loop {
+            out = Vec::with_capacity(64 * 1024);
+            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, quality);
+            rgb.write_with_encoder(encoder)
+                .map_err(|e| ResizeError::Encode(e.to_string()))?;
+            // base64 inflates by ~4/3; stop once the encoded base64 length fits the budget.
+            if out.len().saturating_mul(4) / 3 <= cfg.max_bytes || quality <= MIN_JPEG_QUALITY {
+                break;
+            }
+            quality = quality.saturating_sub(10).max(MIN_JPEG_QUALITY);
+        }
+        if out.len().saturating_mul(4) / 3 <= cfg.max_bytes || cur_long <= MIN_LONG_SIDE {
+            break;
+        }
+        // Quality floor hit but still oversized: shrink the long side and retry.
+        cur_long = ((cur_long as f32 * 0.8) as u32).max(MIN_LONG_SIDE);
     }
     let final_bytes_raw = out.len();
     let data_b64 = BASE64.encode(&out);
@@ -297,7 +317,7 @@ mod tests {
     fn make_png(w: u32, h: u32) -> String {
         use image::{Rgb, RgbImage};
         let mut img = RgbImage::new(w, h);
-        // 渐变填色，比纯色压缩率更接近真实截图
+        // Gradient fill: its compression ratio is closer to real screenshots than a solid color
         for y in 0..h {
             for x in 0..w {
                 img.put_pixel(x, y, Rgb([(x % 256) as u8, (y % 256) as u8, 128]));
@@ -332,7 +352,7 @@ mod tests {
             max_bytes: 400_000,
             jpeg_quality: 85,
         };
-        // 1206×2622 ~ iPhone Pro Max 截图比例
+        // 1206x2622 ~ iPhone Pro Max screenshot ratio
         let big = make_png(1206, 2622);
         let out = maybe_shrink_image(cfg, "png", &big);
         assert!(out.was_resized, "should have been resized");
@@ -343,15 +363,36 @@ mod tests {
             out.final_bytes,
             cfg.max_bytes
         );
-        // 渐变测试图压缩率不如真截图（块状 UI 元素），只要保证缩到阈值之下就行
-        // 真实 iPhone 截图压缩率会大得多（15-20×）— 见 README "实测数据" 章节
+        // The gradient test image compresses worse than a real screenshot (blocky UI elements); we only need it below the threshold
+        // Real iPhone screenshots compress far more (15-20x) - see the README "measured data" section
         let _ = out.original_bytes;
+    }
+
+    #[test]
+    fn within_dimensions_but_oversized_bytes_converges_under_cap() {
+        // Dimensions are under max_long_side, so the resize branch is skipped; the only way
+        // to honor max_bytes is the progressive quality reduction in the encode loop.
+        let cfg = ResizeConfig {
+            enabled: true,
+            max_long_side: 1568,
+            max_bytes: 20_000,
+            jpeg_quality: 85,
+        };
+        let img = make_png(1024, 1024);
+        let out = maybe_shrink_image(cfg, "png", &img);
+        assert!(out.was_resized, "should have been re-encoded");
+        assert!(
+            out.final_bytes <= cfg.max_bytes,
+            "final {} must be <= cap {} after quality reduction",
+            out.final_bytes,
+            cfg.max_bytes
+        );
     }
 
     #[test]
     fn gif_passes_through_to_preserve_animation() {
         let cfg = ResizeConfig::from_env();
-        // 一张 1×1 GIF 即可，关键测的是分支
+        // A 1x1 GIF is enough; what matters here is exercising the branch
         let tiny_gif = "R0lGODlhAQABAAAAACw=";
         let out = maybe_shrink_image(cfg, "gif", tiny_gif);
         assert!(!out.was_resized);
@@ -380,7 +421,7 @@ mod tests {
             max_bytes: 100,
             jpeg_quality: 85,
         };
-        // 故意给坏数据 + 字节超限触发解码路径
+        // Deliberately feed corrupt data + over-limit bytes to trigger the decode path
         let bogus = "X".repeat(1000);
         let out = maybe_shrink_image(cfg, "png", &bogus);
         assert!(!out.was_resized, "corrupt input should fall through");
@@ -410,8 +451,8 @@ mod tests {
             max_bytes: 400_000,
             jpeg_quality: 85,
         };
-        // 真实 JPEG 字节，但调用方误标 format="png"（宿主侧头体不一致，CPA 忠实透传）。
-        // 小图走 passthrough。出站 format 必须按真实字节校正成 jpeg，否则 Bedrock 报 IMAGE_MIME_MISMATCH。
+        // Real JPEG bytes, but the caller mislabels format="png" (host-side header/body mismatch, faithfully passed through).
+        // Small images take the passthrough path. The outbound format must be corrected to jpeg per the real bytes, otherwise Bedrock returns IMAGE_MIME_MISMATCH.
         let jpeg = make_jpeg(64, 64);
         let out = maybe_shrink_image(cfg, "png", &jpeg);
         assert_eq!(out.data_base64, jpeg, "must not mutate image bytes");
@@ -441,7 +482,7 @@ mod tests {
 
     #[test]
     fn undetectable_bytes_keep_declared_format() {
-        // 坏数据探测失败 -> 保持传入 format，绝不丢图。
+        // Detection fails on corrupt data -> keep the incoming format, never drop the image.
         let cfg = ResizeConfig {
             enabled: false,
             max_long_side: 1568,

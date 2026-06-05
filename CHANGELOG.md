@@ -6,6 +6,60 @@ project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.9] - 2026-06-03
+
+主题：**客户端行为纠偏 + 按凭据拉取上游真实可用模型**。此前客户端传入的畸形请求体（tool_use/tool_result 不配对等）会导致上游 Bedrock 返回 503，触发重试风暴；批量工具混入 native web_search 也缺少端到端 handler。模型列表方面，免费凭据无法用 Opus 但此前无可见性——现在可按凭据实时查看上游订阅的真实可用模型。
+
+### ✨ 新功能
+
+- **凭据级上游模型查询**（PR #12 @ZyphrZero）：新增 `GET /api/admin/credentials/{id}/models` 接口，实时查询上游 `ListAvailableModels` API 获取该凭据当前可用模型（随订阅等级变化，FREE 不含 Opus）。在凭据卡片「更多操作」弹出独立弹窗，展示模型名、ID、最大输入 token 数。后端整条链路对标现有"余额"功能，新增 `src/kiro/model/available_models.rs` 响应 DTO、`token_manager` 抽出 `prepare_request_token` helper 消除重复的 token 刷新逻辑。
+  > 仅限 admin 面板按需拉取，不影响客户端 `GET /v1/models` 静态聚合列表。
+
+### 🛠 修复
+
+- **从源头阻断 503 风暴**（@ZyphrZero）：`provider.rs` 与 endpoint 层新增 `is_bad_request` 判别，把上游 Bedrock 因客户端格式错误（tool_use/tool_result 不配对等）返回的 503 在结束即刻识别为不可重试错误——不走重试、不切换凭据，直接返回 400 给客户端。此前这类错误被当成瞬态故障反复重试，会放大成一次坏请求 → 全部凭据接连被打 → 瞬时数百次 503。
+- **Bedrock 客户端校验错误映射为 400**（PR #10 @xiaojiou176）：`src/anthropic/handlers.rs` 对 Bedrock 返回的 `ValidationException`（消息序列非法、缺少 content 等）统一返回 `400 Bad Request` 而非 `502 Bad Gateway`，避免下游客户端误判为上游故障并无效重试。
+
+### ✨ 新功能 — 来自社区贡献
+
+感谢以下 PR 贡献者 🙏
+
+- **Native WebSearch 端到端循环**（PR #9 @xiaojiou176）：批量工具中混入 `web_search` 时，进入 agentic 内部循环——先调上游获取搜索结果，把结果注入回消息作为 tool_result，再继续对话。完全在 MCP 端点 `q.{region}.amazonaws.com/mcp` 上完成，不依赖外部搜索 API。
+- **`output_config.effort` 直通上游**（PR #8 @xiaojiou176）：Anthropic 协议 `reasoning.effort` 字段（low/medium/high）映射到 Kiro/Q 协议 `outputConfiguration.agentMode` 字段，让不同推理强度的请求在 Kiro 上游获得对应的资源分配。
+- **图片 MIME 修正与智能降采样**（PR #7 @xiaojiou176）：用 `magic-bytes` 从二进制头识别真实图片格式，修正错误声明的 MIME；超尺寸图片自动降采样到 1M 像素并重编码为 JPEG；`tool_result` 中的 base64 图片上浮到 user message 级 `images: [...]`，避免被上游忽略。
+
+### 📦 升级指南
+
+1. **`docker compose pull && docker compose up -d`** 即可。无破坏性变更，无需清理状态文件。
+2. **查看凭据可用模型**：登录管理面板 → 凭据管理 → 任一凭据卡片「更多操作」→「查看可用模型」，实时查询上游。
+
+## [0.5.8] - 2026-06-01
+
+主题：IP 代理池从「仅能增删改查 + 手动分配」升级为**具备主动健康检查、失败累计自动剔除、轮询批量分配**的完整代理管理能力。此前加完代理只能等真实请求才知道是否可用，代理失效也不会被记录或自动禁用，且只能逐个手动分配给凭据。
+
+### ✨ 新功能 — 主动健康检查与连通性测试
+
+- **探测连通性与延迟**：`ProxyEntry` 新增 `health / latencyMs / lastCheckedAt / consecutiveFailures / autoDisabled` 字段（`serde(default)` 向后兼容旧 `proxy_pool.json`）。通过该代理请求轻量公网端点 `https://www.gstatic.com/generate_204`（8s 超时）验证「能否走通 + 往返延迟」，不依赖上游 Kiro。
+- **后台健康检查调度器**：照搬 `start_balance_refresher` 模式新增 `start_proxy_health_checker`，每 5 分钟对所有已启用代理用 `join_all` 并发探测一次。
+- **新接口 `POST /proxy-pool/{id}/check` 与 `/proxy-pool/check-all`**：分别供 UI「测试」按钮即时探测单个代理、以及手动触发全量健康检查。
+
+### ✨ 新功能 — 失败累计与自动剔除
+
+- **连续探测失败自动禁用**：探测失败累计 `consecutive_failures`，达阈值（3 次，与凭据 `MAX_FAILURES_PER_CREDENTIAL` 对齐）即自动 `enabled=false, auto_disabled=true`；探测成功立即清零。用户手动重新启用时清除自动禁用标记与失败计数。仅由健康检查触发，不侵入 `provider.rs` 请求热路径。
+
+### ✨ 新功能 — 轮询批量分配
+
+- **新接口 `POST /proxy-pool/assign-round-robin`**：取「已启用且非 Unhealthy」的可用代理，对目标凭据（默认全部）按取模轮询写入 `proxy_url`，复用 `token_manager.update_credential`，免去逐个手动分配。
+
+### ⚡ 优化 — HTTP Client 缓存
+
+- **缓存容量上限淘汰**：`provider.rs` 的 `client_cache` 原为无界 `HashMap`，代理数增长会令每个代理常驻一个 `reqwest::Client` 导致内存无界增长。改为带容量上限（64）的 `ClientCache`，按插入顺序淘汰最旧的非全局代理 client，全局代理 client 常驻不被淘汰。
+
+### 🎨 前端
+
+- 代理池弹窗每行新增健康状态徽章（绿：可用 + 延迟 ms / 红：异常 + 连续失败次数 / 灰：未检测）与最近检测时间，并区分「自动禁用」与用户「手动禁用」。
+- 每行新增「测试」按钮，顶部新增「全部检测」「轮询分配」按钮。
+
 ## [0.5.7] - 2026-05-30
 
 主题：凭据失败次数从单一"连续失败计数器"升级为**累计统计 + 按类型三色分类展示**。此前卡片"失败次数"绑定 `failure_count`（连续失败计数器，成功即清零、账号风控与瞬态不计入），导致鉴权失败被其他凭据救回后立即清零、账号风控压根不显示，与用户对"这个凭据到底失败了多少次、什么原因"的直觉不符。

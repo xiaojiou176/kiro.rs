@@ -35,38 +35,38 @@ pub struct KiroRequest {
     /// Profile ARN（可选）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_arn: Option<String>,
-    /// 附加模型请求字段（Kiro CLI 真包字段，载 `output_config.effort` 等控制开关）
+    /// Additional model request fields (a real Kiro CLI wire field carrying control switches such as `output_config.effort`)
     ///
-    /// 真包样本（来自 mitm 抓 Kiro CLI 真实流量 2026-05-25）：
+    /// Real wire sample (captured from real Kiro CLI traffic):
     /// ```json
     /// "additionalModelRequestFields": {
     ///     "output_config": { "effort": "max" }
     /// }
     /// ```
-    /// 5 档值: `low / medium / high / xhigh / max`
+    /// Five tiers: `low / medium / high / xhigh / max`
     #[serde(skip_serializing_if = "Option::is_none")]
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
 }
 
-/// AWS Q CodeWhisperer `additionalModelRequestFields` 顶层容器
+/// Top-level container for the AWS Q CodeWhisperer `additionalModelRequestFields`
 ///
-/// 注意：外层字段 `output_config` 在真包里是 `snake_case`，
-/// 跟外面 `additionalModelRequestFields` (camelCase) 不同，
-/// 所以这个 struct **不能**继承 `rename_all = "camelCase"`。
+/// Note: in the real wire format the inner `output_config` field is `snake_case`,
+/// unlike the outer `additionalModelRequestFields` (camelCase),
+/// so this struct **must not** inherit `rename_all = "camelCase"`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AdditionalModelRequestFields {
-    /// 输出配置（含 reasoning effort）
+    /// Output configuration (including reasoning effort)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_config: Option<KiroOutputConfig>,
 }
 
-/// AWS Q 后端识别的 effort 控制字段
+/// The effort control field recognized by the AWS Q backend
 ///
-/// 取值 5 档：`low / medium / high / xhigh / max`
+/// Accepts five tiers: `low / medium / high / xhigh / max`
 ///
-/// 经实测（ladder 实验 2026-05-25），同一 prompt 在 `low` 和 `max` 之间
-/// 响应时间和输出长度差异约 5x，**是真实生效的协议字段**，
-/// 跟 `<thinking_effort>` XML 标签塞 system prompt 的"伪协议"完全不同。
+/// Measured (via a ladder experiment), the same prompt between `low` and `max` differs
+/// by roughly 5x in response time and output length, so this **is a protocol field that genuinely takes effect**,
+/// completely unlike the "pseudo-protocol" of stuffing a `<thinking_effort>` XML tag into the system prompt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KiroOutputConfig {
     pub effort: String,
@@ -103,6 +103,24 @@ mod tests {
                 .user_input_message
                 .content,
             "Test message"
+        );
+    }
+
+    #[test]
+    fn test_additional_model_request_fields_wire_format() {
+        // The wire format requires the outer key to be camelCase
+        // (`additionalModelRequestFields`) while the inner key stays snake_case
+        // (`output_config`), matching real Kiro CLI traffic.
+        let fields = AdditionalModelRequestFields {
+            output_config: Some(KiroOutputConfig {
+                effort: "max".to_string(),
+            }),
+        };
+        let v = serde_json::to_value(&fields).unwrap();
+        assert_eq!(v["output_config"]["effort"], "max");
+        assert!(
+            v.get("outputConfig").is_none(),
+            "inner key must stay snake_case output_config, got {v}"
         );
     }
 }

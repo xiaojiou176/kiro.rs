@@ -10,11 +10,11 @@ use super::{
     client_keys::mask_client_key,
     middleware::AdminState,
     types::{
-        AddCredentialRequest, AddProxyRequest, AssignProxyRequest, BatchAddProxyRequest,
-        ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest, CreateClientKeyRequest,
-        CreateClientKeyResponse, GlobalProxyResponse, SetAccountThrottleConfigRequest,
-        SetDisabledRequest, SetGlobalProxyRequest, SetLoadBalancingModeRequest,
-        SetLogGovernanceConfigRequest, SetPriorityRequest,
+        AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
+        BatchAddProxyRequest, ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest,
+        CreateClientKeyRequest, CreateClientKeyResponse, GlobalProxyResponse,
+        SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
+        SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
         SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
@@ -133,6 +133,18 @@ pub async fn get_credential_balance(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.get_balance(id).await {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// GET /api/admin/credentials/:id/models
+/// 获取指定凭据当前可用的模型列表（按需实时查询上游）
+pub async fn get_credential_models(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.get_available_models(id).await {
         Ok(response) => Json(response).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
@@ -346,6 +358,39 @@ pub async fn assign_proxy_to_credential(
 ) -> impl IntoResponse {
     match state.service.assign_proxy_to_credential(id, payload) {
         Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 代理已更新", id))).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxy-pool/:id/check
+/// 即时探测单个代理的连通性
+pub async fn check_proxy(
+    State(state): State<AdminState>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    match state.service.check_proxy(id).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/proxy-pool/check-all
+/// 触发全部代理的健康检查
+pub async fn check_all_proxies(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.check_all_proxies().await)
+}
+
+/// POST /api/admin/proxy-pool/assign-round-robin
+/// 将可用代理轮询批量分配给凭据
+pub async fn assign_proxies_round_robin(
+    State(state): State<AdminState>,
+    Json(payload): Json<AssignRoundRobinRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .assign_proxies_round_robin(payload.credential_ids)
+    {
+        Ok(resp) => Json(resp).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }

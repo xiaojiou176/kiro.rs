@@ -196,26 +196,21 @@ fn last_attempt_outcome(tracer: &RequestTracer) -> Option<&'static str> {
     })
 }
 
-/// 将 KiroProvider 错误映射为 HTTP 响应
-///
-/// 同时把上游原始 body 落到 `logs/errors/{ts}-{request_id}-{kind}.json`,
-/// 方便事后用 `replay/` 工具复现 — 这样 Anthropic 400 / Bedrock 协议错位
-/// 一类的问题不需要靠 client 重发就能定位。
 /// Image-budget warning threshold (in raw base64 chars, not decoded bytes).
-/// 当一次请求里所有 image 内容的 base64 字符总数 > 这个阈值时，主动 warn。
-/// 这个阈值并不会拒收请求（让上游做最终决定），只是给运维更精准的诊断。
+/// Emits a warning when the total base64 char count of all image content in one request exceeds this threshold.
+/// The threshold does not reject the request (the upstream makes the final call); it only gives operators more precise diagnostics.
 const IMAGE_BUDGET_WARN_BYTES: usize = 800 * 1024;
 
-/// 一次入站请求里 image content 的预算统计。
+/// Budget statistics for the image content in one inbound request.
 struct ImageBudget {
     count: usize,
     total_b64_bytes: usize,
     largest_b64_bytes: usize,
 }
 
-/// 数一遍 payload 里 image 的总数 + base64 字节量。
-/// 只看 inline base64 (image source.type == "base64")，跳过 url-mode（那些不会
-/// 直接进 Bedrock 单消息体）。这是一个轻量 O(N) 扫描，不解码 base64。
+/// Counts the total number of images in the payload and their base64 byte size.
+/// Looks only at inline base64 (image source.type == "base64"), skipping url-mode images (which do not
+/// go directly into a Bedrock single message body). This is a lightweight O(N) scan that does not decode base64.
 fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
     let mut count = 0usize;
     let mut total = 0usize;
@@ -246,6 +241,7 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
     }
 }
 
+/// 将 KiroProvider 错误映射为 HTTP 响应
 pub(super) fn map_provider_error(err: Error) -> Response {
     let err_str = err.to_string();
 
@@ -277,23 +273,26 @@ pub(super) fn map_provider_error(err: Error) -> Response {
             .into_response();
     }
 
-    // Bedrock 客户端校验错误 (tool_use ↔ tool_result 配对错乱、消息序列违规等)
-    // 这类错误的根因在 client 发的 messages 数组本身, 不是上游故障, 不应映射成 5xx
-    // 否则会触发上游 cooldown 把 1 次 client 错放大成 30+ 次 503 风暴
-    if err_str.contains("TOOL_USE_RESULT_MISMATCH")
-        || err_str.contains("ValidationException")
-        || err_str.contains("Expected toolResult blocks")
-    {
+    // Bedrock client-side validation errors (tool_use <-> tool_result mismatch, invalid message sequence, etc.)
+    // The root cause is the client's own messages array, not an upstream failure, so it must not map to 5xx
+    // otherwise it triggers an upstream cooldown that amplifies one client error into a 30+ burst of 503s.
+    // Detection is centralized in the endpoint layer (single source of truth for the markers); the provider
+    // already bails out without retry on these, and this mapping is the client-facing safety net.
+    if crate::kiro::endpoint::default_is_client_validation_error(&err_str) {
         tracing::warn!(
             error = %err,
-            "client 发送的 messages 数组协议违规 (Bedrock validation, 映射为 400 防止误判 cooldown)"
+            "client messages array violates the protocol (Bedrock validation; mapped to 400 to avoid a false cooldown)"
         );
+        // Local: archive the raw upstream body for offline replay/diagnostics.
         crate::observability::archive_error_body("tool-use-result-mismatch", &err_str);
+        // Return a stable, client-facing message and avoid echoing the raw upstream
+        // error string (which can carry request IDs or internal validation details).
+        // The full error is already logged above for diagnostics.
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
                 "invalid_request_error",
-                format!("Invalid message sequence rejected by upstream: {}", err),
+                "Invalid message sequence: tool_use and tool_result blocks must be correctly paired and ordered.".to_string(),
             )),
         )
             .into_response();
@@ -490,7 +489,7 @@ pub async fn post_messages(
     Extension(key_ctx): Extension<KeyContext>,
     JsonExtractor(mut payload): JsonExtractor<MessagesRequest>,
 ) -> Response {
-    // 入站时统计 image 预算，给后续 context-window-full 提供精准诊断
+    // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
     let img_stats = count_image_budget(&payload);
     tracing::info!(
         model = %payload.model,
@@ -550,10 +549,10 @@ pub async fn post_messages(
     }
 
     let payload_stream = payload.stream;
-    // 混合工具(web_search + exec...)场景:web_search 与其它工具并存,会落普通对话路径,
-    // 上游可能回 name=web_search 的 tool_use。走内部 agentic loop,内部搜索并回灌。
+    // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
+    // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
-        tracing::info!("检测到混合工具含 web_search，进入 web_search agentic loop");
+        tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
         return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream)
             .await;
     }
@@ -580,9 +579,8 @@ pub async fn post_messages(
         }
     };
 
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入；
-    // additional_model_request_fields 来自客户端 output_config，是 AWS Q 后端
-    // 识别 effort 的真协议字段，跟 XML 前缀双发出最高效力）
+    // Build the Kiro request. profile_arn is injected by the provider layer from the actual
+    // credentials; additional_model_request_fields is already filtered by converter model support.
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
@@ -1204,10 +1202,10 @@ pub async fn post_messages_cc(
     }
 
     let payload_stream = payload.stream;
-    // 混合工具(web_search + exec...)场景:web_search 与其它工具并存,会落普通对话路径,
-    // 上游可能回 name=web_search 的 tool_use。走内部 agentic loop,内部搜索并回灌。
+    // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
+    // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
-        tracing::info!("检测到混合工具含 web_search，进入 web_search agentic loop");
+        tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
         return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream)
             .await;
     }
@@ -1234,9 +1232,8 @@ pub async fn post_messages_cc(
         }
     };
 
-    // 构建 Kiro 请求（profile_arn 由 provider 层根据实际凭据注入；
-    // additional_model_request_fields 来自客户端 output_config，是 AWS Q 后端
-    // 识别 effort 的真协议字段，跟 XML 前缀双发出最高效力）
+    // Build the Kiro request. profile_arn is injected by the provider layer from the actual
+    // credentials; additional_model_request_fields is already filtered by converter model support.
     let kiro_request = KiroRequest {
         conversation_state: conversion_result.conversation_state,
         profile_arn: None,
@@ -1495,6 +1492,38 @@ fn create_buffered_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bedrock_client_validation_errors_map_to_400() {
+        // 客户端校验错误必须映射为 400（而非 5xx），否则会被 provider 当作上游
+        // 瞬态错误触发冷却，放大成 503 风暴。识别逻辑集中在 endpoint 层。
+        for needle in [
+            // 精确 reason（provider 错误串里嵌着上游 body）
+            "非流式 API 请求失败: 500 {\"reason\":\"TOOL_USE_RESULT_MISMATCH\"}",
+            // message 级特异短语（纯文本报文）
+            "Expected toolResult blocks but found none",
+        ] {
+            let resp = map_provider_error(anyhow::anyhow!(needle.to_string()));
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "错误串 `{needle}` 应映射为 400"
+            );
+        }
+    }
+
+    #[test]
+    fn generic_upstream_error_still_maps_to_502() {
+        // 回归：普通上游错误不应被新分支误伤，仍应是 502 BAD_GATEWAY。
+        let resp = map_provider_error(anyhow::anyhow!("connection reset by peer"));
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        // 回归：宽泛的 ValidationException 不再被当作客户端校验错误而误判为 400，
+        // 仍按上游错误走 502（避免把可重试故障误杀）。
+        let resp = map_provider_error(anyhow::anyhow!(
+            "ValidationException: transient backend issue".to_string()
+        ));
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
 
     #[test]
     fn available_models_include_opus_4_7_variants() {
