@@ -328,6 +328,67 @@ fn build_result_block(results: &Option<WebSearchResults>) -> Vec<Value> {
     }
 }
 
+/// Splits a round's tool_uses into (web_search calls, client tool calls),
+/// preserving order within each group. This is the structural core of the
+/// invariant "web_search is always handled internally and never leaves kiro-rs
+/// as a raw tool_use": every flush path partitions first, then handles each
+/// group differently (web_search -> presentation blocks, client tools -> raw).
+fn partition_tool_uses(tool_uses: &[DecodedToolUse]) -> (Vec<&DecodedToolUse>, Vec<&DecodedToolUse>) {
+    let mut web = Vec::new();
+    let mut client = Vec::new();
+    for tu in tool_uses {
+        if tu.name == "web_search" {
+            web.push(tu);
+        } else {
+            client.push(tu);
+        }
+    }
+    (web, client)
+}
+
+/// Builds the final flush content with the web_search invariant baked in:
+/// - any web_search tool_use becomes a `server_tool_use` + `web_search_tool_result`
+///   presentation pair (NEVER a raw `tool_use`, which the Codex host rejects);
+/// - client tools (exec, get_time, ...) are returned verbatim as raw `tool_use`.
+///
+/// `searched` corresponds one-to-one (same order) to `tool_uses`; entries for
+/// web_search carry the already-completed search results, client-tool entries
+/// are ignored (typically None).
+fn build_flush_content(
+    presentation: Vec<Value>,
+    text: &str,
+    tool_uses: &[DecodedToolUse],
+    searched: &[Option<WebSearchResults>],
+) -> Vec<Value> {
+    let mut content: Vec<Value> = presentation;
+    if !text.is_empty() {
+        content.push(json!({"type": "text", "text": text}));
+    }
+    for (idx, tu) in tool_uses.iter().enumerate() {
+        if tu.name == "web_search" {
+            // INVARIANT: present as server_tool_use + web_search_tool_result,
+            // never as a raw tool_use.
+            let query = tu.query();
+            let (srv_id, _mcp) = websearch::create_mcp_request(&query);
+            content.push(json!({
+                "type": "server_tool_use", "id": srv_id, "name": "web_search",
+                "input": {"query": query}
+            }));
+            let results: &Option<WebSearchResults> = searched.get(idx).unwrap_or(&None);
+            content.push(json!({
+                "type": "web_search_tool_result",
+                "content": build_result_block(results)
+            }));
+        } else {
+            // Client tool (exec, get_time, ...): returned to the client verbatim.
+            content.push(json!({
+                "type": "tool_use", "id": tu.id, "name": tu.name, "input": tu.input
+            }));
+        }
+    }
+    content
+}
+
 /// web_search loop entry point
 ///
 /// `stream_client`: whether the client wants SSE (true) or a single JSON response (false).
@@ -385,9 +446,14 @@ pub(super) async fn run_web_search_loop(
             continue;
         }
 
-        // Terminate: this round is not "pure web_search", or the limit has been reached -> flush to the client
+        // Terminate: this round is not "pure web_search", or the limit has been reached -> flush to the client.
+        // stop_reason must reflect CLIENT tools only: web_search is handled internally
+        // (presented as server_tool_use, not a pending tool_use), so a round with only
+        // web_search must end as "end_turn", not "tool_use" (otherwise the host would
+        // wait for a client tool call that is never emitted).
+        let (_web_uses, client_uses) = partition_tool_uses(&round.tool_uses);
         let stop_reason = round.stop_reason_override.clone().unwrap_or_else(|| {
-            if round.tool_uses.is_empty() {
+            if client_uses.is_empty() {
                 "end_turn".to_string()
             } else {
                 "tool_use".to_string()
@@ -395,16 +461,45 @@ pub(super) async fn run_web_search_loop(
         });
         let final_input = last_context_input.unwrap_or(fallback_input_tokens);
 
-        // Final content: presentation blocks (per-round search) + final-round text + final-round tool_use (exec, etc., returned as-is)
-        let mut content: Vec<Value> = presentation.clone();
-        if !round.text.is_empty() {
-            content.push(json!({"type": "text", "text": round.text}));
-        }
+        // INVARIANT: web_search is ALWAYS executed internally and is NEVER flushed
+        // as a raw tool_use (the Codex host has no executor for it and rejects it
+        // with "unsupported call: web_search"). This covers the mixed-round case
+        // (web_search + exec) and the round-limit case: search every web_search call
+        // in this final round here, then build the flushed content with web_search
+        // presented as server_tool_use + web_search_tool_result while client tools
+        // (exec, etc.) are returned verbatim.
+        let mut searched: Vec<Option<WebSearchResults>> = Vec::with_capacity(round.tool_uses.len());
         for tu in &round.tool_uses {
-            content.push(json!({
-                "type": "tool_use", "id": tu.id, "name": tu.name, "input": tu.input
-            }));
+            if tu.name == "web_search" {
+                let (_id, mcp_request) = websearch::create_mcp_request(&tu.query());
+                match websearch::call_mcp_api(&provider, &mcp_request).await {
+                    Ok(resp) => searched.push(websearch::parse_search_results(&resp)),
+                    Err(e) => {
+                        // Same pass-through discipline as the continue branch: a failed
+                        // search must surface as an error, never a silent success.
+                        tracing::warn!("web_search MCP call (final round) failed: {}", e);
+                        hook.record(
+                            last_credential_id,
+                            fallback_input_tokens,
+                            0,
+                            0,
+                            0,
+                            total_credits,
+                            "error",
+                        );
+                        return map_provider_error(e);
+                    }
+                }
+            } else {
+                searched.push(None);
+            }
         }
+        let content = build_flush_content(
+            presentation.clone(),
+            &round.text,
+            &round.tool_uses,
+            &searched,
+        );
 
         let output_tokens = token::estimate_output_tokens(&content);
         hook.record(
@@ -713,5 +808,105 @@ mod tests {
                 && e.data["content_block"]["name"] == "exec"
         });
         assert!(has_exec, "the exec tool_use must be returned to the client as-is and not swallowed");
+    }
+    // ---- INVARIANT: web_search must NEVER leave kiro-rs as a raw tool_use ----
+    // Regression for the "mixed-round leak": when the final round mixes web_search
+    // with a client tool (exec/get_time), the flush content must present web_search
+    // as server_tool_use + web_search_tool_result (never raw tool_use), while the
+    // client tool is returned verbatim. Previously the flush loop emitted
+    // {"type":"tool_use","name":"web_search"} which the Codex host rejected with
+    // "unsupported call: web_search".
+
+    fn fake_results(q: &str) -> Option<WebSearchResults> {
+        Some(WebSearchResults {
+            results: vec![WebSearchResult {
+                title: "T".to_string(),
+                url: "https://example.com".to_string(),
+                snippet: Some("snip".to_string()),
+                published_date: None,
+                id: None,
+                domain: None,
+                max_verbatim_word_limit: None,
+                public_domain: None,
+            }],
+            total_results: Some(1),
+            query: Some(q.to_string()),
+            error: None,
+        })
+    }
+
+    #[test]
+    fn flush_content_mixed_round_never_emits_raw_web_search() {
+        let tool_uses = vec![tu("web_search"), tu("exec")];
+        let searched = vec![fake_results("rust 2026"), None];
+        let content = build_flush_content(Vec::new(), "answer", &tool_uses, &searched);
+
+        let raw_web_search = content
+            .iter()
+            .any(|c| c["type"] == "tool_use" && c["name"] == "web_search");
+        assert!(
+            !raw_web_search,
+            "web_search must never be flushed as a raw tool_use (host rejects it). content={:?}",
+            content
+        );
+
+        assert!(
+            content
+                .iter()
+                .any(|c| c["type"] == "server_tool_use" && c["name"] == "web_search"),
+            "web_search must be presented as server_tool_use"
+        );
+        assert!(
+            content.iter().any(|c| c["type"] == "web_search_tool_result"),
+            "web_search must carry a web_search_tool_result block"
+        );
+        assert!(
+            content
+                .iter()
+                .any(|c| c["type"] == "tool_use" && c["name"] == "exec"),
+            "the exec client tool must be returned to the client as-is"
+        );
+        assert!(
+            content
+                .iter()
+                .any(|c| c["type"] == "text" && c["text"] == "answer"),
+            "assistant text must be preserved"
+        );
+    }
+
+    #[test]
+    fn flush_content_client_tools_only_passthrough() {
+        let tool_uses = vec![tu("exec")];
+        let searched: Vec<Option<WebSearchResults>> = vec![None];
+        let content = build_flush_content(Vec::new(), "", &tool_uses, &searched);
+        assert!(content
+            .iter()
+            .any(|c| c["type"] == "tool_use" && c["name"] == "exec"));
+        assert!(!content.iter().any(|c| c["type"] == "server_tool_use"));
+    }
+
+    #[test]
+    fn partition_separates_web_search_from_client_tools() {
+        let tool_uses = vec![tu("web_search"), tu("exec"), tu("web_search")];
+        let (web, client) = partition_tool_uses(&tool_uses);
+        assert_eq!(web.len(), 2, "two web_search calls");
+        assert_eq!(client.len(), 1, "one client tool");
+        assert_eq!(client[0].name, "exec");
+    }
+
+    #[test]
+    fn flush_content_only_web_search_has_no_client_tool() {
+        // A final round that is only web_search (e.g. round limit hit) must present
+        // the search and emit NO raw tool_use at all -> the caller derives end_turn.
+        let tool_uses = vec![tu("web_search")];
+        let searched = vec![fake_results("q")];
+        let content = build_flush_content(Vec::new(), "", &tool_uses, &searched);
+        assert!(!content.iter().any(|c| c["type"] == "tool_use"));
+        assert!(content
+            .iter()
+            .any(|c| c["type"] == "server_tool_use" && c["name"] == "web_search"));
+        // client-tool partition is empty -> caller will choose end_turn
+        let (_web, client) = partition_tool_uses(&tool_uses);
+        assert!(client.is_empty());
     }
 }
