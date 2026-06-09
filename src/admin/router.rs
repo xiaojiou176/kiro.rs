@@ -55,6 +55,9 @@ pub fn create_admin_router(state: AdminState) -> Router {
             "/credentials",
             get(get_all_credentials).post(add_credential),
         )
+        // Two credential-export routes with DIFFERENT response schemas — do not merge:
+        //   /credentials/export      -> upstream nested format (export_credentials), general-purpose export
+        //   /credentials/export/kam  -> local KAM flat format (export_kam_credentials), for KAM batch-login workflow
         .route("/credentials/export", get(export_credentials))
         .route("/credentials/export/kam", get(export_kam_credentials))
         .route(
