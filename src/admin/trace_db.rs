@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use chrono::Utc;
 use parking_lot::Mutex;
-use rusqlite::Connection;
+use rusqlite::{Connection, types::Type};
 use serde::{Deserialize, Serialize};
 
 /// trace 记录默认保留天数
@@ -43,6 +43,40 @@ pub struct TraceAttempt {
     pub duration_ms: u64,
 }
 
+/// 调用方使用的入口 Key 类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TraceKeySource {
+    /// 管理员API密钥。
+    MasterApiKey,
+    /// Admin UI 中创建并分发的客户端 Key。
+    ClientKey,
+}
+
+impl TraceKeySource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MasterApiKey => "masterApiKey",
+            Self::ClientKey => "clientKey",
+        }
+    }
+
+    fn from_db(value: &str, column: usize) -> rusqlite::Result<Self> {
+        match value {
+            "masterApiKey" => Ok(Self::MasterApiKey),
+            "clientKey" => Ok(Self::ClientKey),
+            other => Err(rusqlite::Error::FromSqlConversionFailure(
+                column,
+                Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("未知 trace key_source: {other}"),
+                )),
+            )),
+        }
+    }
+}
+
 /// 一个外部请求的完整链路
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -53,6 +87,8 @@ pub struct TraceRecord {
     pub ts: String,
     /// 客户端 Key id；0 表示 master apiKey
     pub key_id: u64,
+    /// 入口 Key 类型，区分管理员API密钥与创建的客户端 Key。
+    pub key_source: TraceKeySource,
     /// 模型名
     pub model: String,
     /// 是否流式
@@ -71,6 +107,18 @@ pub struct TraceRecord {
     pub duration_ms: u64,
     /// 流式中断时已发送的字节数（区分完整失败 vs 半截中断）
     pub interrupted_after_bytes: Option<u64>,
+    /// 输入 token（互斥口径：未被缓存覆盖的部分）。无 usage 时为 0。
+    #[serde(default)]
+    pub input_tokens: u64,
+    /// 输出 token（估算）。
+    #[serde(default)]
+    pub output_tokens: u64,
+    /// 缓存创建 token（互斥口径）。
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
+    /// 缓存读取 token（互斥口径）。
+    #[serde(default)]
+    pub cache_read_tokens: u64,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
 }
@@ -161,6 +209,7 @@ impl TraceStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
+        migrate_add_token_columns(&conn);
         Ok(Self {
             conn: Mutex::new(conn),
             enabled: AtomicBool::new(enabled),
@@ -172,6 +221,7 @@ impl TraceStore {
     pub fn open_in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
+        migrate_add_token_columns(&conn);
         Ok(Self {
             conn: Mutex::new(conn),
             enabled: AtomicBool::new(true),
@@ -219,15 +269,17 @@ impl TraceStore {
             .unwrap_or_else(|_| Utc::now().timestamp());
         let res = (|| -> rusqlite::Result<()> {
             tx.execute(
-                "INSERT OR REPLACE INTO traces (trace_id, ts, ts_epoch, key_id, model, \
+                "INSERT OR REPLACE INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, \
                  is_stream, final_status, final_credential_id, error_type, error_message, \
-                 total_attempts, duration_ms, interrupted_after_bytes) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                 total_attempts, duration_ms, interrupted_after_bytes, \
+                 input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
                     ts_epoch,
                     rec.key_id as i64,
+                    rec.key_source.as_str(),
                     rec.model,
                     rec.is_stream as i64,
                     rec.final_status,
@@ -237,6 +289,10 @@ impl TraceStore {
                     rec.total_attempts as i64,
                     rec.duration_ms as i64,
                     rec.interrupted_after_bytes.map(|v| v as i64),
+                    rec.input_tokens as i64,
+                    rec.output_tokens as i64,
+                    rec.cache_creation_tokens as i64,
+                    rec.cache_read_tokens as i64,
                 ],
             )?;
             for a in &rec.attempts {
@@ -345,8 +401,9 @@ impl TraceStore {
             q.limit
         };
         let sql = format!(
-            "SELECT trace_id, ts, key_id, model, is_stream, final_status, final_credential_id, \
-             error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes \
+            "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
+             error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
+             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -357,15 +414,20 @@ impl TraceStore {
                 trace_id: row.get(0)?,
                 ts: row.get(1)?,
                 key_id: row.get::<_, i64>(2)? as u64,
-                model: row.get(3)?,
-                is_stream: row.get::<_, i64>(4)? != 0,
-                final_status: row.get(5)?,
-                final_credential_id: row.get::<_, i64>(6)? as u64,
-                error_type: row.get(7)?,
-                error_message: row.get(8)?,
-                total_attempts: row.get::<_, i64>(9)? as u32,
-                duration_ms: row.get::<_, i64>(10)? as u64,
-                interrupted_after_bytes: row.get::<_, Option<i64>>(11)?.map(|v| v as u64),
+                key_source: TraceKeySource::from_db(row.get::<_, String>(3)?.as_str(), 3)?,
+                model: row.get(4)?,
+                is_stream: row.get::<_, i64>(5)? != 0,
+                final_status: row.get(6)?,
+                final_credential_id: row.get::<_, i64>(7)? as u64,
+                error_type: row.get(8)?,
+                error_message: row.get(9)?,
+                total_attempts: row.get::<_, i64>(10)? as u32,
+                duration_ms: row.get::<_, i64>(11)? as u64,
+                interrupted_after_bytes: row.get::<_, Option<i64>>(12)?.map(|v| v as u64),
+                input_tokens: row.get::<_, i64>(13)? as u64,
+                output_tokens: row.get::<_, i64>(14)? as u64,
+                cache_creation_tokens: row.get::<_, i64>(15)? as u64,
+                cache_read_tokens: row.get::<_, i64>(16)? as u64,
                 attempts: Vec::new(),
             })
         })?;
@@ -483,12 +545,32 @@ pub struct FailureStats {
 /// 共享存储句柄
 pub type SharedTraceStore = Arc<TraceStore>;
 
+/// 给已存在的老 `traces` 表补 token 列（幂等）。
+///
+/// SCHEMA 用 `CREATE TABLE IF NOT EXISTS` 不会给已建表加列，所以升级到带 token 的
+/// 版本时，旧库里没有这些列。这里对每列做一次 `ADD COLUMN`，已存在时 SQLite 报
+/// "duplicate column name"，直接忽略即可——纯幂等，不依赖版本号。
+fn migrate_add_token_columns(conn: &Connection) {
+    const COLS: [&str; 4] = [
+        "input_tokens",
+        "output_tokens",
+        "cache_creation_tokens",
+        "cache_read_tokens",
+    ];
+    for col in COLS {
+        let sql = format!("ALTER TABLE traces ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0");
+        // 列已存在会返回 Err（duplicate column），是预期内的幂等结果，忽略。
+        let _ = conn.execute(&sql, []);
+    }
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS traces (
     trace_id          TEXT PRIMARY KEY,
     ts                TEXT NOT NULL,
     ts_epoch          INTEGER NOT NULL,
     key_id            INTEGER NOT NULL,
+    key_source        TEXT NOT NULL,
     model             TEXT NOT NULL,
     is_stream         INTEGER NOT NULL,
     final_status      TEXT NOT NULL,
@@ -497,7 +579,11 @@ CREATE TABLE IF NOT EXISTS traces (
     error_message     TEXT,
     total_attempts    INTEGER NOT NULL,
     duration_ms       INTEGER NOT NULL,
-    interrupted_after_bytes INTEGER
+    interrupted_after_bytes INTEGER,
+    input_tokens      INTEGER NOT NULL DEFAULT 0,
+    output_tokens     INTEGER NOT NULL DEFAULT 0,
+    cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
@@ -521,21 +607,29 @@ CREATE INDEX IF NOT EXISTS idx_attempts_trace ON trace_attempts(trace_id);
 mod tests {
     use super::*;
 
-    fn sample(trace_id: &str, status: &str, cred: u64, model: &str) -> TraceRecord {
+    struct TraceSample<'a> {
+        trace_id: &'a str,
+        status: &'a str,
+        credential_id: u64,
+        model: &'a str,
+    }
+
+    fn sample(input: TraceSample<'_>) -> TraceRecord {
         TraceRecord {
-            trace_id: trace_id.to_string(),
+            trace_id: input.trace_id.to_string(),
             ts: Utc::now().to_rfc3339(),
             key_id: 1,
-            model: model.to_string(),
+            key_source: TraceKeySource::ClientKey,
+            model: input.model.to_string(),
             is_stream: true,
-            final_status: status.to_string(),
-            final_credential_id: cred,
-            error_type: if status == "success" {
+            final_status: input.status.to_string(),
+            final_credential_id: input.credential_id,
+            error_type: if input.status == "success" {
                 None
             } else {
                 Some(outcome::ACCOUNT_THROTTLED.to_string())
             },
-            error_message: if status == "success" {
+            error_message: if input.status == "success" {
                 None
             } else {
                 Some("blocked".to_string())
@@ -543,6 +637,10 @@ mod tests {
             total_attempts: 2,
             duration_ms: 1200,
             interrupted_after_bytes: None,
+            input_tokens: 1093,
+            output_tokens: 779,
+            cache_creation_tokens: 0,
+            cache_read_tokens: 101760,
             attempts: vec![
                 TraceAttempt {
                     attempt: 0,
@@ -555,10 +653,14 @@ mod tests {
                 },
                 TraceAttempt {
                     attempt: 1,
-                    credential_id: cred,
+                    credential_id: input.credential_id,
                     endpoint: "ide".to_string(),
-                    http_status: if status == "success" { Some(200) } else { None },
-                    outcome: status.to_string(),
+                    http_status: if input.status == "success" {
+                        Some(200)
+                    } else {
+                        None
+                    },
+                    outcome: input.status.to_string(),
                     error_snippet: None,
                     duration_ms: 800,
                 },
@@ -579,7 +681,12 @@ mod tests {
     #[test]
     fn insert_and_query_roundtrip() {
         let store = mem_store();
-        store.insert(&sample("t1", "success", 5, "claude-opus-4-7"));
+        store.insert(&sample(TraceSample {
+            trace_id: "t1",
+            status: "success",
+            credential_id: 5,
+            model: "claude-opus-4-7",
+        }));
         let out = store.query(&TraceQuery {
             limit: 50,
             ..Default::default()
@@ -588,13 +695,24 @@ mod tests {
         assert_eq!(out[0].trace_id, "t1");
         assert_eq!(out[0].attempts.len(), 2);
         assert_eq!(out[0].attempts[0].outcome, outcome::ACCOUNT_THROTTLED);
+        assert_eq!(out[0].key_source, TraceKeySource::ClientKey);
+        // token 分项往返
+        assert_eq!(out[0].input_tokens, 1093);
+        assert_eq!(out[0].output_tokens, 779);
+        assert_eq!(out[0].cache_read_tokens, 101760);
+        assert_eq!(out[0].cache_creation_tokens, 0);
     }
 
     #[test]
     fn disabled_skips_insert() {
         let store = mem_store();
         store.set_enabled(false);
-        store.insert(&sample("t1", "success", 5, "m1"));
+        store.insert(&sample(TraceSample {
+            trace_id: "t1",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        }));
         let out = store.query(&TraceQuery {
             limit: 50,
             ..Default::default()
@@ -602,7 +720,12 @@ mod tests {
         assert_eq!(out.len(), 0, "trace 关闭时不应写入");
         // 重新开启后写入恢复
         store.set_enabled(true);
-        store.insert(&sample("t2", "success", 5, "m1"));
+        store.insert(&sample(TraceSample {
+            trace_id: "t2",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        }));
         assert_eq!(
             store
                 .query(&TraceQuery {
@@ -617,9 +740,24 @@ mod tests {
     #[test]
     fn filter_only_failed_and_status() {
         let store = mem_store();
-        store.insert(&sample("ok", "success", 5, "m1"));
-        store.insert(&sample("bad", "error", 6, "m1"));
-        store.insert(&sample("cut", "interrupted", 7, "m2"));
+        store.insert(&sample(TraceSample {
+            trace_id: "ok",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        }));
+        store.insert(&sample(TraceSample {
+            trace_id: "bad",
+            status: "error",
+            credential_id: 6,
+            model: "m1",
+        }));
+        store.insert(&sample(TraceSample {
+            trace_id: "cut",
+            status: "interrupted",
+            credential_id: 7,
+            model: "m2",
+        }));
 
         let failed = store.query(&TraceQuery {
             only_failed: true,
@@ -649,15 +787,20 @@ mod tests {
     #[test]
     fn cleanup_removes_old() {
         let store = mem_store();
-        store.insert(&sample("recent", "success", 5, "m1"));
+        store.insert(&sample(TraceSample {
+            trace_id: "recent",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        }));
         // 手动塞一条 8 天前的记录
         {
             let conn = store.conn.lock();
             let old = (Utc::now() - chrono::Duration::days(8)).timestamp();
             conn.execute(
-                "INSERT INTO traces (trace_id, ts, ts_epoch, key_id, model, is_stream, \
+                "INSERT INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, is_stream, \
                  final_status, final_credential_id, total_attempts, duration_ms) \
-                 VALUES ('old','2020',?1,1,'m',1,'success',1,1,1)",
+                 VALUES ('old','2020',?1,1,'clientKey','m',1,'success',1,1,1)",
                 [old],
             )
             .unwrap();
@@ -669,6 +812,29 @@ mod tests {
         });
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].trace_id, "recent");
+    }
+
+    #[test]
+    fn query_inner_rejects_unknown_key_source() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute(
+            "INSERT INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, is_stream, \
+             final_status, final_credential_id, total_attempts, duration_ms) \
+             VALUES ('bad-source','2020',1,1,'unknown','m',1,'success',1,1,1)",
+            [],
+        )
+        .unwrap();
+
+        let result = TraceStore::query_inner(
+            &conn,
+            &TraceQuery {
+                limit: 50,
+                ..Default::default()
+            },
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]

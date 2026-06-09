@@ -16,6 +16,7 @@ import {
 } from '@/hooks/use-client-keys'
 import type { ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
+import { useConfirm } from '@/components/ui/confirm-dialog'
 
 function formatTokens(n: number): string {
   if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
@@ -40,6 +41,7 @@ export function ClientKeysPage() {
   const setDisabled = useSetClientKeyDisabled()
   const resetStats = useResetClientKeyStats()
   const updateKey = useUpdateClientKey()
+  const confirm = useConfirm()
 
   const [createOpen, setCreateOpen] = useState(false)
   const [createName, setCreateName] = useState('')
@@ -72,7 +74,15 @@ export function ClientKeysPage() {
   }
 
   const handleDelete = async (item: ClientKeyItem) => {
-    if (!confirm(`确认删除 Key "${item.name}"？此操作无法撤销。`)) return
+    if (
+      !(await confirm({
+        title: '确认删除 Key',
+        description: `确认删除 Key "${item.name}"？此操作无法撤销。`,
+        confirmText: '确认删除',
+        destructive: true,
+      }))
+    )
+      return
     try {
       await deleteKey.mutateAsync(item.id)
       toast.success(`已删除 Key #${item.id}`)
@@ -91,7 +101,14 @@ export function ClientKeysPage() {
   }
 
   const handleReset = async (item: ClientKeyItem) => {
-    if (!confirm(`重置 Key "${item.name}" 的累计统计？`)) return
+    if (
+      !(await confirm({
+        title: '重置统计',
+        description: `重置 Key "${item.name}" 的累计统计？`,
+        confirmText: '重置',
+      }))
+    )
+      return
     try {
       await resetStats.mutateAsync(item.id)
       toast.success('统计已重置')
@@ -162,10 +179,10 @@ export function ClientKeysPage() {
         </Card>
       ) : (
         <Card>
-          <CardContent className="p-0 overflow-x-auto">
-            <table className="w-full text-sm">
+          <CardContent className="overflow-x-auto p-0">
+            <table className="w-full min-w-[920px] text-sm">
               <thead className="text-[12px] text-muted-foreground border-b border-border/60">
-                <tr>
+                <tr className="whitespace-nowrap">
                   <th className="text-left font-medium px-4 py-3">名称</th>
                   <th className="text-left font-medium px-4 py-3">Key</th>
                   <th className="text-left font-medium px-4 py-3">状态</th>
@@ -178,11 +195,11 @@ export function ClientKeysPage() {
               </thead>
               <tbody>
                 {data.keys.map((k) => (
-                  <tr key={k.id} className="border-t border-border/40">
+                  <tr key={k.id} className="border-t border-border/40 whitespace-nowrap">
                     <td className="px-4 py-3">
-                      <div className="font-medium">{k.name}</div>
+                      <div className="max-w-[220px] truncate font-medium">{k.name}</div>
                       {k.description && (
-                        <div className="text-[11px] text-muted-foreground truncate max-w-[180px]">
+                        <div className="max-w-[220px] truncate text-[11px] text-muted-foreground">
                           {k.description}
                         </div>
                       )}

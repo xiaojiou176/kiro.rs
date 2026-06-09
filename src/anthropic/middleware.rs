@@ -14,13 +14,13 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::admin::client_keys::SharedClientKeyManager;
-use crate::admin::trace_db::SharedTraceStore;
+use crate::admin::trace_db::{SharedTraceStore, TraceKeySource};
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 use crate::observability;
 
-use super::prompt_cache::SharedPromptCache;
+use super::cache_metering::SharedCacheMeter;
 use super::types::ErrorResponse;
 
 /// 命中的鉴权上下文（注入到请求扩展，供 handler 记录用量）
@@ -28,6 +28,8 @@ use super::types::ErrorResponse;
 pub struct KeyContext {
     /// 命中的客户端 Key id；0 表示用 master apiKey 调用
     pub key_id: u64,
+    /// 命中的入口 Key 类型。
+    pub key_source: TraceKeySource,
 }
 
 /// 应用共享状态
@@ -47,7 +49,7 @@ pub struct AppState {
     /// 用量聚合器
     pub usage_aggregator: Option<SharedAggregator>,
     /// 中转层 prompt cache（基于 cache_control 断点的内存缓存）
-    pub prompt_cache: Option<SharedPromptCache>,
+    pub cache_meter: Option<SharedCacheMeter>,
     /// 请求链路追踪存储（SQLite，可选）
     pub trace_store: Option<SharedTraceStore>,
 }
@@ -66,7 +68,7 @@ impl AppState {
             client_keys: None,
             usage_recorder: None,
             usage_aggregator: None,
-            prompt_cache: None,
+            cache_meter: None,
             trace_store: None,
         }
     }
@@ -80,7 +82,7 @@ impl AppState {
             client_keys: None,
             usage_recorder: None,
             usage_aggregator: None,
-            prompt_cache: None,
+            cache_meter: None,
             trace_store: None,
         }
     }
@@ -104,9 +106,9 @@ impl AppState {
         self
     }
 
-    /// 注入 PromptCache
-    pub fn with_prompt_cache(mut self, cache: Option<SharedPromptCache>) -> Self {
-        self.prompt_cache = cache;
+    /// 注入 CacheMeter
+    pub fn with_cache_meter(mut self, cache: Option<SharedCacheMeter>) -> Self {
+        self.cache_meter = cache;
         self
     }
 
@@ -137,14 +139,20 @@ pub async fn auth_middleware(
     // 1) master apiKey
     let master = state.api_key.read().clone();
     if auth::constant_time_eq(&presented, &master) {
-        request.extensions_mut().insert(KeyContext { key_id: 0 });
+        request.extensions_mut().insert(KeyContext {
+            key_id: 0,
+            key_source: TraceKeySource::MasterApiKey,
+        });
         return next.run(request).await;
     }
 
     // 2) 客户端 Key
     if let Some(mgr) = &state.client_keys {
         if let Some(id) = mgr.verify_and_touch(&presented) {
-            request.extensions_mut().insert(KeyContext { key_id: id });
+            request.extensions_mut().insert(KeyContext {
+                key_id: id,
+                key_source: TraceKeySource::ClientKey,
+            });
             return next.run(request).await;
         }
     }

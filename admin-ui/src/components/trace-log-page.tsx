@@ -22,6 +22,19 @@ import {
   DropdownMenuContent,
   DropdownMenuLabel,
 } from '@/components/ui/dropdown-menu'
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
+import {
+  Select as UiSelect,
+  SelectTrigger as UiSelectTrigger,
+  SelectValue as UiSelectValue,
+  SelectContent as UiSelectContent,
+  SelectItem as UiSelectItem,
+} from '@/components/ui/select'
 import { useTraces } from '@/hooks/use-traces'
 import {
   useLogGovernanceConfig,
@@ -92,9 +105,25 @@ function formatDuration(ms: number): string {
   return `${(ms / 1000).toFixed(2)}s`
 }
 
+/** 千位分隔的完整数值（用于明细悬浮框） */
+function formatTokenFull(n: number): string {
+  return n.toLocaleString('en-US')
+}
+
+/** 紧凑数值：>=1000 显示为 K（用于表格列） */
+function formatTokenCompact(n: number): string {
+  if (n < 1000) return String(n)
+  return `${(n / 1000).toFixed(1)}K`
+}
+
 function credLabel(id: number, email?: string | null): string {
   if (id === 0) return '—'
   return email ? email : `#${id}`
+}
+
+function keySourceLabel(rec: TraceRecord): string {
+  if (rec.keySource === 'clientKey') return rec.keyName ?? `#${rec.keyId}`
+  return '管理员API密钥'
 }
 
 const STATUS_OPTIONS = [
@@ -115,6 +144,58 @@ const ERROR_TYPE_OPTIONS = [
   { value: 'stream_interrupted', label: '流中断' },
   { value: 'unknown', label: '未知' },
 ]
+
+/** Token 用量单元格：紧凑展示总量，hover 显示分项明细 */
+function TokenCell({ rec }: { rec: TraceRecord }) {
+  const total =
+    rec.totalTokens ??
+    rec.inputTokens + rec.outputTokens + rec.cacheCreationTokens + rec.cacheReadTokens
+  // 全 0（早期失败、未走到上游）时不显示明细，仅占位
+  if (total === 0) {
+    return <span className="text-muted-foreground">—</span>
+  }
+  const rows: Array<[string, number]> = [
+    ['输入 Token', rec.inputTokens],
+    ['输出 Token', rec.outputTokens],
+  ]
+  if (rec.cacheCreationTokens > 0) rows.push(['缓存创建 Token', rec.cacheCreationTokens])
+  if (rec.cacheReadTokens > 0) rows.push(['缓存读取 Token', rec.cacheReadTokens])
+  return (
+    <TooltipProvider delayDuration={150}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="inline-flex items-center gap-1 font-mono tabular-nums cursor-default border-b border-dotted border-muted-foreground/40">
+            <span className="text-emerald-600 dark:text-emerald-400">
+              ↓{formatTokenCompact(rec.inputTokens + rec.cacheCreationTokens + rec.cacheReadTokens)}
+            </span>
+            <span className="text-violet-600 dark:text-violet-400">
+              ↑{formatTokenCompact(rec.outputTokens)}
+            </span>
+          </span>
+        </TooltipTrigger>
+        <TooltipContent className="p-0">
+          <div className="min-w-[180px] px-3 py-2">
+            <div className="mb-1.5 text-[13px] font-semibold">Token 明细</div>
+            <div className="space-y-1 text-[12px]">
+              {rows.map(([label, val]) => (
+                <div key={label} className="flex items-center justify-between gap-6">
+                  <span className="text-muted-foreground">{label}</span>
+                  <span className="font-mono tabular-nums">{formatTokenFull(val)}</span>
+                </div>
+              ))}
+              <div className="mt-1 flex items-center justify-between gap-6 border-t border-border/50 pt-1">
+                <span className="font-medium">总 Token</span>
+                <span className="font-mono font-semibold tabular-nums">
+                  {formatTokenFull(total)}
+                </span>
+              </div>
+            </div>
+          </div>
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  )
+}
 
 /** 单跳明细行 */
 function AttemptRow({ a }: { a: TraceAttempt }) {
@@ -149,7 +230,7 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
   return (
     <>
       <tr
-        className="cursor-pointer border-b border-border/40 hover:bg-accent/40"
+        className="cursor-pointer whitespace-nowrap border-b border-border/40 hover:bg-accent/40"
         onClick={() => setOpen((v) => !v)}
       >
         <td className="py-2.5 pl-3 pr-2">
@@ -163,33 +244,51 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
           {formatTime(rec.ts)}
         </td>
         <td className="py-2.5 pr-3 text-[13px]">
-          <span className="truncate">{rec.model}</span>
+          <span className="inline-block max-w-[220px] truncate align-middle">{rec.model}</span>
           {rec.isStream && <Badge variant="outline" className="ml-1.5">流式</Badge>}
         </td>
         <td className="py-2.5 pr-3">
           <StatusBadge status={rec.finalStatus} />
         </td>
-        <td className="py-2.5 pr-3 text-[13px]">
-          {credLabel(rec.finalCredentialId, rec.finalEmail)}
+        <td className="py-2.5 pr-3 text-[13px] whitespace-nowrap">
+          {keySourceLabel(rec)}
         </td>
+        <TraceCredentialCell rec={rec} />
         <td className="py-2.5 pr-3">
           {errStyle ? <Badge variant={errStyle.variant}>{errStyle.label}</Badge> : '—'}
         </td>
         <td className="py-2.5 pr-3 text-[13px] tabular-nums">
           {Math.max(0, rec.totalAttempts - 1)}
         </td>
+        <td className="py-2.5 pr-3 text-[13px]">
+          <TokenCell rec={rec} />
+        </td>
         <td className="py-2.5 pr-3 text-[13px] tabular-nums text-muted-foreground">
           {formatDuration(rec.durationMs)}
         </td>
       </tr>
-      {open && (
-        <tr className="border-b border-border/40 bg-secondary/20">
-          <td colSpan={8} className="px-3 py-3">
-            <ExpandedDetail rec={rec} />
-          </td>
-        </tr>
-      )}
+      {open && <ExpandedTraceRow rec={rec} />}
     </>
+  )
+}
+
+function TraceCredentialCell({ rec }: { rec: TraceRecord }) {
+  return (
+    <td className="py-2.5 pr-3 text-[13px]">
+      <span className="inline-block max-w-[220px] truncate align-middle">
+        {credLabel(rec.finalCredentialId, rec.finalEmail)}
+      </span>
+    </td>
+  )
+}
+
+function ExpandedTraceRow({ rec }: { rec: TraceRecord }) {
+  return (
+    <tr className="border-b border-border/40 bg-secondary/20">
+      <td colSpan={10} className="px-3 py-3">
+        <ExpandedDetail rec={rec} />
+      </td>
+    </tr>
   )
 }
 
@@ -232,18 +331,24 @@ function Select({
   onChange: (v: string) => void
   options: { value: string; label: string }[]
 }) {
+  // radix Select 不允许空字符串 value，用哨兵 "__all__" 代表「空/全部」，对外透明。
+  const SENTINEL = '__all__'
   return (
-    <select
-      value={value}
-      onChange={(e) => onChange(e.target.value)}
-      className="h-8 rounded-md border border-border/70 bg-background px-2 text-[13px] focus:outline-none focus:ring-2 focus:ring-ring"
+    <UiSelect
+      value={value === '' ? SENTINEL : value}
+      onValueChange={(v) => onChange(v === SENTINEL ? '' : v)}
     >
-      {options.map((o) => (
-        <option key={o.value} value={o.value}>
-          {o.label}
-        </option>
-      ))}
-    </select>
+      <UiSelectTrigger className="h-8 w-auto min-w-[120px]">
+        <UiSelectValue />
+      </UiSelectTrigger>
+      <UiSelectContent>
+        {options.map((o) => (
+          <UiSelectItem key={o.value} value={o.value === '' ? SENTINEL : o.value}>
+            {o.label}
+          </UiSelectItem>
+        ))}
+      </UiSelectContent>
+    </UiSelect>
   )
 }
 
@@ -429,16 +534,18 @@ export function TraceLogPage() {
             </div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full text-left">
+              <table className="w-full min-w-[1080px] text-left">
                 <thead>
-                  <tr className="border-b border-border/60 text-[12px] uppercase tracking-wider text-muted-foreground">
+                  <tr className="whitespace-nowrap border-b border-border/60 text-[12px] uppercase tracking-wider text-muted-foreground">
                     <th className="py-2 pl-3 pr-2 font-medium"></th>
                     <th className="py-2 pr-3 font-medium">时间</th>
                     <th className="py-2 pr-3 font-medium">模型</th>
                     <th className="py-2 pr-3 font-medium">状态</th>
+                    <th className="py-2 pr-3 font-medium">入口 Key</th>
                     <th className="py-2 pr-3 font-medium">最终凭据</th>
                     <th className="py-2 pr-3 font-medium">错误类型</th>
                     <th className="py-2 pr-3 font-medium">重试</th>
+                    <th className="py-2 pr-3 font-medium">Token</th>
                     <th className="py-2 pr-3 font-medium">耗时</th>
                   </tr>
                 </thead>

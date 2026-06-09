@@ -1,10 +1,14 @@
 //! Admin API HTTP 处理器
 
+use std::collections::HashMap;
+
 use axum::{
     Json,
     extract::{Path, Query, State},
+    http::StatusCode,
     response::IntoResponse,
 };
+use chrono::{Datelike, Duration, Local, NaiveDate, TimeZone};
 
 use super::{
     client_keys::mask_client_key,
@@ -20,7 +24,7 @@ use super::{
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
     },
-    usage_stats::Range,
+    usage_stats::{Range, StatsGranularity, StatsQueryWindow},
 };
 
 // Path 元组提取：(credential_id, session_id)
@@ -34,10 +38,10 @@ pub async fn get_all_credentials(State(state): State<AdminState>) -> impl IntoRe
 }
 
 /// GET /api/admin/credentials/export
-/// 导出凭据为 KAM 兼容 JSON（含 refreshToken 等敏感字段）
+/// 导出凭据为兼容 JSON（含 refreshToken 等敏感字段）
 ///
 /// 可选 query 参数 `ids`（逗号分隔）限定导出哪些凭据；省略则导出全部。
-pub async fn export_kam_credentials(
+pub async fn export_credentials(
     State(state): State<AdminState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
@@ -57,7 +61,7 @@ pub async fn export_kam_credentials(
         })
         .filter(|s| !s.is_empty());
 
-    let response = state.service.export_kam_credentials(id_filter.as_ref());
+    let response = state.service.export_credentials(id_filter.as_ref());
     Json(response)
 }
 
@@ -680,7 +684,7 @@ pub async fn poll_idc_relogin(
 }
 
 /// PUT /api/admin/config/admin-key
-/// 修改 Admin API Key 并持久化到配置文件
+/// 修改登录API密钥并持久化到配置文件
 pub async fn update_admin_key(
     State(state): State<AdminState>,
     Json(payload): Json<UpdateAdminKeyRequest>,
@@ -691,7 +695,7 @@ pub async fn update_admin_key(
         return (
             StatusCode::BAD_REQUEST,
             Json(super::types::AdminErrorResponse::invalid_request(
-                "新 Admin Key 不能为空",
+                "新登录API密钥不能为空",
             )),
         )
             .into_response();
@@ -703,11 +707,11 @@ pub async fn update_admin_key(
     // 通过 service 持久化到 config.json（从磁盘加载最新后再写，避免覆盖其他字段）
     state.service.persist_admin_key(&new_key);
 
-    Json(SuccessResponse::new("Admin API Key 已更新")).into_response()
+    Json(SuccessResponse::new("登录API密钥已更新")).into_response()
 }
 
 /// PUT /api/admin/config/api-key
-/// 修改业务 API Key 并持久化到配置文件
+/// 修改管理员API密钥并持久化到配置文件
 ///
 /// 内存中的认证 key 与 anthropic 路由共享，调用后 `/v1/*` 立刻使用新 key。
 pub async fn update_api_key(
@@ -720,14 +724,14 @@ pub async fn update_api_key(
         return (
             StatusCode::BAD_REQUEST,
             Json(super::types::AdminErrorResponse::invalid_request(
-                "新 API Key 不能为空",
+                "新管理员API密钥不能为空",
             )),
         )
             .into_response();
     }
     *state.api_key.write() = new_key.clone();
     state.service.persist_api_key(&new_key);
-    Json(SuccessResponse::new("API Key 已更新")).into_response()
+    Json(SuccessResponse::new("管理员API密钥已更新")).into_response()
 }
 
 // ============ 客户端 API Key 分发 ============
@@ -879,11 +883,85 @@ pub async fn reset_client_key_stats(
 
 // ============ 用量统计 ============
 
-fn parse_range(params: &std::collections::HashMap<String, String>) -> Range {
-    params
-        .get("range")
-        .map(|s| Range::parse(s.as_str()))
-        .unwrap_or(Range::Last24h)
+fn parse_range(params: &std::collections::HashMap<String, String>) -> Result<Range, String> {
+    let Some(range) = params.get("range") else {
+        return Err("range 必须是 24h、7d 或 30d".to_string());
+    };
+    Range::parse(range.as_str()).ok_or_else(|| "range 必须是 24h、7d 或 30d".to_string())
+}
+
+fn parse_key_id(params: &HashMap<String, String>) -> Result<Option<u64>, String> {
+    match params.get("keyId") {
+        Some(s) => s
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| "keyId 必须是数字".to_string()),
+        None => Ok(None),
+    }
+}
+
+fn parse_granularity(params: &HashMap<String, String>) -> Result<StatsGranularity, String> {
+    match params.get("granularity") {
+        Some(s) => {
+            StatsGranularity::parse(s).ok_or_else(|| "granularity 必须是 hour 或 day".to_string())
+        }
+        None => Err("granularity 必须是 hour 或 day".to_string()),
+    }
+}
+
+fn parse_stats_window(params: &HashMap<String, String>) -> Result<StatsQueryWindow, String> {
+    let granularity = parse_granularity(params)?;
+    match (params.get("startDate"), params.get("endDate")) {
+        (Some(start), Some(end)) => custom_stats_window(start, end, granularity),
+        (None, None) => Ok(StatsQueryWindow::preset(parse_range(params)?, granularity)),
+        _ => Err("startDate 和 endDate 必须同时提供".to_string()),
+    }
+}
+
+fn custom_stats_window(
+    start: &str,
+    end: &str,
+    granularity: StatsGranularity,
+) -> Result<StatsQueryWindow, String> {
+    let start_date = parse_stats_date(start, "startDate")?;
+    let end_date = parse_stats_date(end, "endDate")?;
+    if end_date < start_date {
+        return Err("endDate 不能早于 startDate".to_string());
+    }
+    let start_ts = local_midnight_ts(start_date)?;
+    let end_ts = local_midnight_ts(end_date + Duration::days(1))?;
+    Ok(StatsQueryWindow {
+        start_ts,
+        end_ts,
+        granularity,
+    })
+}
+
+fn parse_stats_date(value: &str, name: &str) -> Result<NaiveDate, String> {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map_err(|_| format!("{} 必须使用 YYYY-MM-DD 格式", name))
+}
+
+fn local_midnight_ts(date: NaiveDate) -> Result<i64, String> {
+    Local
+        .with_ymd_and_hms(date.year(), date.month(), date.day(), 0, 0, 0)
+        .single()
+        .map(|d| d.timestamp())
+        .ok_or_else(|| format!("日期 {} 无法转换为本地时间", date))
+}
+
+fn stats_query_parts(
+    params: &HashMap<String, String>,
+) -> Result<(StatsQueryWindow, Option<u64>), String> {
+    Ok((parse_stats_window(params)?, parse_key_id(params)?))
+}
+
+fn stats_bad_request(message: String) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(super::types::AdminErrorResponse::invalid_request(message)),
+    )
+        .into_response()
 }
 
 /// GET /api/admin/stats/overview
@@ -909,32 +987,41 @@ pub async fn stats_overview(State(state): State<AdminState>) -> impl IntoRespons
     Json(response)
 }
 
-/// GET /api/admin/stats/timeseries?range=24h|7d|30d
+/// GET /api/admin/stats/timeseries?range=24h|7d|30d&granularity=hour|day
 pub async fn stats_timeseries(
     State(state): State<AdminState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
-    let range = parse_range(&params);
-    let points = state.usage_aggregator.query_timeseries(range);
-    Json(points)
+) -> axum::response::Response {
+    let (window, key_id) = match stats_query_parts(&params) {
+        Ok(parts) => parts,
+        Err(message) => return stats_bad_request(message),
+    };
+    let points = state.usage_aggregator.query_timeseries(window, key_id);
+    Json(points).into_response()
 }
 
 /// GET /api/admin/stats/by-model?range=24h|7d|30d
 pub async fn stats_by_model(
     State(state): State<AdminState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
-    let range = parse_range(&params);
-    let data = state.usage_aggregator.query_by_model(range);
-    Json(data)
+) -> axum::response::Response {
+    let (window, key_id) = match stats_query_parts(&params) {
+        Ok(parts) => parts,
+        Err(message) => return stats_bad_request(message),
+    };
+    let data = state.usage_aggregator.query_by_model(window, key_id);
+    Json(data).into_response()
 }
 
 /// GET /api/admin/stats/by-credential?range=24h|7d|30d
 pub async fn stats_by_credential(
     State(state): State<AdminState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
-    let range = parse_range(&params);
+) -> axum::response::Response {
+    let (window, key_id) = match stats_query_parts(&params) {
+        Ok(parts) => parts,
+        Err(message) => return stats_bad_request(message),
+    };
     // 拉一份凭据快照，把 email 附加到响应里方便前端展示
     let snapshot = state.service.get_all_credentials();
     let email_map: std::collections::HashMap<u64, Option<String>> = snapshot
@@ -942,7 +1029,7 @@ pub async fn stats_by_credential(
         .iter()
         .map(|c| (c.id, c.email.clone()))
         .collect();
-    let data = state.usage_aggregator.query_by_credential(range);
+    let data = state.usage_aggregator.query_by_credential(window, key_id);
     let enriched: Vec<serde_json::Value> = data
         .into_iter()
         .map(|d| {
@@ -957,7 +1044,7 @@ pub async fn stats_by_credential(
             })
         })
         .collect();
-    Json(enriched)
+    Json(enriched).into_response()
 }
 
 /// GET /api/admin/traces
@@ -996,16 +1083,23 @@ pub async fn list_traces(
 
     // 附加 credential email 方便前端展示（与 stats_by_credential 一致）
     let snapshot = state.service.get_all_credentials();
-    let email_map: std::collections::HashMap<u64, Option<String>> = snapshot
+    let email_map: HashMap<u64, Option<String>> = snapshot
         .credentials
         .iter()
         .map(|c| (c.id, c.email.clone()))
+        .collect();
+    let client_key_name_map: HashMap<u64, String> = state
+        .client_keys
+        .list()
+        .into_iter()
+        .map(|k| (k.id, k.name))
         .collect();
 
     let enriched: Vec<serde_json::Value> = records
         .into_iter()
         .map(|r| {
             let final_email = email_map.get(&r.final_credential_id).cloned().flatten();
+            let key_name = client_key_name_map.get(&r.key_id).cloned();
             // attempts 里每跳也附 email
             let attempts: Vec<serde_json::Value> = r
                 .attempts
@@ -1028,6 +1122,8 @@ pub async fn list_traces(
                 "traceId": r.trace_id,
                 "ts": r.ts,
                 "keyId": r.key_id,
+                "keySource": r.key_source,
+                "keyName": key_name,
                 "model": r.model,
                 "isStream": r.is_stream,
                 "finalStatus": r.final_status,
@@ -1038,6 +1134,12 @@ pub async fn list_traces(
                 "totalAttempts": r.total_attempts,
                 "durationMs": r.duration_ms,
                 "interruptedAfterBytes": r.interrupted_after_bytes,
+                "inputTokens": r.input_tokens,
+                "outputTokens": r.output_tokens,
+                "cacheCreationTokens": r.cache_creation_tokens,
+                "cacheReadTokens": r.cache_read_tokens,
+                "totalTokens": r.input_tokens + r.output_tokens
+                    + r.cache_creation_tokens + r.cache_read_tokens,
                 "attempts": attempts,
             })
         })

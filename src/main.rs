@@ -137,6 +137,14 @@ async fn main() {
         tracing::info!("已配置 HTTP 代理: {}", config.proxy_url.as_ref().unwrap());
     }
 
+    // 启动 Kiro IDE 版本自动获取：从官方元数据端点拉取 currentRelease，
+    // 用于流式端点 User-Agent（替代写死的版本号）；失败时回退 config.kiroVersion。
+    kiro::kiro_version::spawn_refresher(
+        proxy_config.clone(),
+        config.tls_backend,
+        std::time::Duration::from_secs(12 * 3600),
+    );
+
     // 构建端点注册表
     let mut endpoints: HashMap<String, Arc<dyn KiroEndpoint>> = HashMap::new();
     {
@@ -253,12 +261,12 @@ async fn main() {
     // 把 api_key 包成 Arc<RwLock<...>>，以便 Admin 模块运行时改 key 后立刻生效
     let shared_api_key = std::sync::Arc::new(parking_lot::RwLock::new(api_key.clone()));
 
-    // PromptCache：基于 cache_control 断点的进程内提示词缓存
-    // 持久化到 cache_dir/prompt_cache.json，启动时自动加载有效条目
-    let prompt_cache = std::sync::Arc::new(anthropic::prompt_cache::PromptCache::new(Some(
-        cache_dir.join("prompt_cache.json"),
+    // CacheMeter：模拟 Anthropic 缓存、计量 cache_read/creation token 的进程内组件。
+    // 持久化到 cache_dir/cache_metering.json，启动时自动加载未过期条目。
+    let cache_meter = std::sync::Arc::new(anthropic::cache_metering::CacheMeter::new(Some(
+        cache_dir.join("cache_metering.json"),
     )));
-    prompt_cache.clone().spawn_background();
+    cache_meter.clone().spawn_background();
 
     let anthropic_app = anthropic::create_router_with_shared_key(
         shared_api_key.clone(),
@@ -267,7 +275,7 @@ async fn main() {
         Some(client_key_manager.clone()),
         Some(usage_recorder.clone()),
         Some(usage_aggregator.clone()),
-        Some(prompt_cache.clone()),
+        Some(cache_meter.clone()),
         trace_store.clone(),
     );
 

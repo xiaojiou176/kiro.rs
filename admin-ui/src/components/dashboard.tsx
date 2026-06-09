@@ -15,6 +15,7 @@ import {
   Globe,
   LogIn,
   Key,
+  Building2,
   Settings,
   UploadCloud,
   MoreHorizontal,
@@ -76,6 +77,7 @@ import {
 } from "@/components/batch-verify-dialog";
 import { ProxyPoolDialog } from "@/components/proxy-pool-dialog";
 import { ImageUpdateDialog } from "@/components/image-update-dialog";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import {
   useCredentials,
   useDeleteCredential,
@@ -115,6 +117,7 @@ import {
   parseError,
   generateApiKey,
   formatNumber,
+  overageFailureMessage,
 } from "@/lib/utils";
 import type { BalanceResponse } from "@/types/api";
 
@@ -125,9 +128,11 @@ interface DashboardProps {
 }
 
 export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
+  const confirm = useConfirm();
   const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false);
   const [idcLoginDialogOpen, setIdcLoginDialogOpen] = useState(false);
+  const [enterpriseLoginDialogOpen, setEnterpriseLoginDialogOpen] = useState(false);
   const [socialLoginDialogOpen, setSocialLoginDialogOpen] = useState(false);
   const [kamImportDialogOpen, setKamImportDialogOpen] = useState(false);
   const [proxyPoolDialogOpen, setProxyPoolDialogOpen] = useState(false);
@@ -275,10 +280,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   });
   const disabledCredentialCount =
     data?.credentials.filter((c) => c.disabled).length || 0;
-  const selectedDisabledCount = Array.from(selectedIds).filter((id) => {
-    const c = data?.credentials.find((x) => x.id === id);
-    return Boolean(c?.disabled);
-  }).length;
 
   // 已超额且尚未禁用的数量（用于一键超额按钮）
   const quotaExceededCount = (data?.credentials || []).filter((c) => {
@@ -393,25 +394,19 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       toast.error("请先选择要删除的凭据");
       return;
     }
-    const disabledIds = Array.from(selectedIds).filter((id) => {
-      const c = data?.credentials.find((x) => x.id === id);
-      return Boolean(c?.disabled);
-    });
-    if (disabledIds.length === 0) {
-      toast.error("选中的凭据中没有已禁用项");
-      return;
-    }
-    const skipped = selectedIds.size - disabledIds.length;
-    const skippedText = skipped > 0 ? `（将跳过 ${skipped} 个未禁用凭据）` : "";
+    const ids = Array.from(selectedIds);
     if (
-      !confirm(
-        `确定要删除 ${disabledIds.length} 个已禁用凭据吗？此操作无法撤销。${skippedText}`,
-      )
+      !(await confirm({
+        title: "批量删除凭据",
+        description: `确定要删除 ${ids.length} 个凭据吗？此操作无法撤销。`,
+        confirmText: "删除",
+        destructive: true,
+      }))
     )
       return;
     let s = 0,
       f = 0;
-    for (const id of disabledIds) {
+    for (const id of ids) {
       try {
         await new Promise<void>((resolve, reject) => {
           deleteCredential(id, {
@@ -427,9 +422,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         });
       } catch {}
     }
-    const sk = skipped > 0 ? `，已跳过 ${skipped} 个未禁用凭据` : "";
-    if (f === 0) toast.success(`成功删除 ${s} 个已禁用凭据${sk}`);
-    else toast.warning(`删除已禁用凭据：成功 ${s} 个，失败 ${f} 个${sk}`);
+    if (f === 0) toast.success(`成功删除 ${s} 个凭据`);
+    else toast.warning(`删除凭据：成功 ${s} 个，失败 ${f} 个`);
     deselectAll();
   };
 
@@ -513,9 +507,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       return;
     }
     if (
-      !confirm(
-        `确定要清除所有 ${disabled.length} 个已禁用凭据吗？此操作无法撤销。`,
-      )
+      !(await confirm({
+        title: "清除已禁用凭据",
+        description: `确定要清除所有 ${disabled.length} 个已禁用凭据吗？此操作无法撤销。`,
+        confirmText: "清除",
+        destructive: true,
+      }))
     )
       return;
     let s = 0,
@@ -677,7 +674,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       toast.info('当前没有已超额的凭据，可先点击"刷新当前页余额"');
       return;
     }
-    if (!confirm(`确定要把 ${quotaExceededCount} 个已超额的凭据全部禁用吗？`))
+    if (
+      !(await confirm({
+        title: "禁用已超额凭据",
+        description: `确定要把 ${quotaExceededCount} 个已超额的凭据全部禁用吗？`,
+        confirmText: "禁用",
+        destructive: true,
+      }))
+    )
       return;
     setDisablingQuota(true);
     try {
@@ -705,9 +709,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       return;
     }
     if (
-      !confirm(
-        `确定要为 ${overageEnableableCount} 个凭据开启超额吗？开启后超出额度将按 overageRate 计费。`,
-      )
+      !(await confirm({
+        title: "开启超额",
+        description: `确定要为 ${overageEnableableCount} 个凭据开启超额吗？开启后超出额度将按 overageRate 计费。`,
+        confirmText: "开启",
+      }))
     )
       return;
     setEnablingOverage(true);
@@ -718,10 +724,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       if (ok > 0 && fail === 0) toast.success(`已为 ${ok} 个凭据开启超额`);
       else if (ok > 0 && fail > 0)
         toast.warning(
-          `成功 ${ok} 个，失败 ${fail} 个：${res.failureMessages?.[0] || ""}`,
+          `成功 ${ok} 个，失败 ${fail} 个：${overageFailureMessage(res.failureMessages?.[0])}`,
         );
       else if (fail > 0)
-        toast.error(`全部失败：${res.failureMessages?.[0] || ""}`);
+        toast.error(`全部失败：${overageFailureMessage(res.failureMessages?.[0])}`);
       else toast.info("没有需要操作的凭据");
       queryClient.invalidateQueries({ queryKey: ["credentials"] });
     } catch (err) {
@@ -835,8 +841,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     if (!key) {
       toast.error(
         keyEditMode === "admin"
-          ? "新 Admin Key 不能为空"
-          : "新 API Key 不能为空",
+          ? "新登录API密钥不能为空"
+          : "新管理员API密钥不能为空",
       );
       return;
     }
@@ -845,11 +851,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
       if (keyEditMode === "admin") {
         await updateAdminKey({ newKey: key });
         storage.setApiKey(key);
-        toast.success("Admin API Key 已更新，已自动切换到新 Key");
+        toast.success("登录API密钥已更新，已自动切换到新 Key");
       } else {
         await updateApiKey({ newKey: key });
         toast.success(
-          "业务 API Key 已更新，所有使用 /v1 接口的客户端都需要切换",
+          "管理员API密钥已更新，所有使用 /v1 接口的客户端都需要切换",
         );
       }
       setAdminKeyDialogOpen(false);
@@ -1001,7 +1007,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     }}
                   >
                     <Key />
-                    修改 Admin API Key（管理面板登录）
+                    修改登录API密钥（管理面板登录）
                   </DropdownMenuItem>
                   <DropdownMenuItem
                     onSelect={() => {
@@ -1012,7 +1018,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                     }}
                   >
                     <Key />
-                    修改业务 API Key（客户端 /v1 调用）
+                    修改管理员API密钥（客户端 /v1 调用）
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
@@ -1035,9 +1041,9 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         className={embedded ? "" : "mx-auto max-w-[1400px] px-4 md:px-8 py-8"}
       >
         {/* 大标题 */}
-        <div className="mb-6 flex items-end justify-between gap-4">
+        <div className="mb-5 flex items-end justify-between gap-4 sm:mb-6">
           <div>
-            <h1 className="text-[28px] font-semibold tracking-tight leading-tight">
+            <h1 className="text-2xl font-semibold tracking-tight leading-tight sm:text-[28px]">
               凭据管理
             </h1>
             <p className="mt-1 text-sm text-muted-foreground">
@@ -1047,34 +1053,34 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         </div>
 
         {/* 统计卡片 */}
-        <div className="grid gap-4 md:grid-cols-3 mb-6">
+        <div className="mb-5 grid grid-cols-3 gap-2 sm:mb-6 sm:gap-4">
           <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-            <CardContent className="p-5">
-              <div className="text-[13px] font-medium text-muted-foreground">
+            <CardContent className="p-3 sm:p-5">
+              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
                 凭据总数
               </div>
-              <div className="mt-2 text-3xl font-semibold tracking-tight tabular-nums">
+              <div className="mt-1.5 text-2xl font-semibold tracking-tight tabular-nums sm:mt-2 sm:text-3xl">
                 {formatNumber(data?.total)}
               </div>
             </CardContent>
           </Card>
           <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-            <CardContent className="p-5">
-              <div className="text-[13px] font-medium text-muted-foreground">
+            <CardContent className="p-3 sm:p-5">
+              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
                 可用凭据
               </div>
-              <div className="mt-2 text-3xl font-semibold tracking-tight tabular-nums text-emerald-600 dark:text-emerald-400">
+              <div className="mt-1.5 text-2xl font-semibold tracking-tight tabular-nums text-emerald-600 dark:text-emerald-400 sm:mt-2 sm:text-3xl">
                 {formatNumber(data?.available)}
               </div>
             </CardContent>
           </Card>
           <Card className="hover:shadow-apple-lg hover:-translate-y-0.5">
-            <CardContent className="p-5">
-              <div className="text-[13px] font-medium text-muted-foreground">
+            <CardContent className="p-3 sm:p-5">
+              <div className="text-[11px] font-medium text-muted-foreground sm:text-[13px]">
                 当前活跃
               </div>
-              <div className="mt-2 flex items-center gap-2">
-                <span className="text-3xl font-semibold tracking-tight tabular-nums">
+              <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1.5 sm:mt-2 sm:gap-2">
+                <span className="truncate text-2xl font-semibold tracking-tight tabular-nums sm:text-3xl">
                   #{data?.currentId || "-"}
                 </span>
                 {data?.currentId && <Badge variant="success">活跃</Badge>}
@@ -1084,8 +1090,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         </div>
 
         {/* 工具栏 */}
-        <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
-          <div className="flex items-center gap-2">
+        <div className="mb-5 flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
             <h2 className="text-lg font-semibold tracking-tight">凭据列表</h2>
             {data?.credentials && data.credentials.length > 0 && (
               <Badge variant="secondary">{data.credentials.length}</Badge>
@@ -1094,6 +1100,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
               <Button
                 size="sm"
                 variant="ghost"
+                className="px-2 sm:px-3"
                 onClick={toggleSelectCurrentPage}
                 title={currentPageAllSelected ? "取消选择当前页" : "全选当前页"}
               >
@@ -1103,7 +1110,12 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             {selectedIds.size > 0 && (
               <>
                 <Badge variant="default">已选 {selectedIds.size}</Badge>
-                <Button onClick={deselectAll} size="sm" variant="ghost">
+                <Button
+                  onClick={deselectAll}
+                  size="sm"
+                  variant="ghost"
+                  className="px-2 sm:px-3"
+                >
                   取消选择
                 </Button>
               </>
@@ -1120,11 +1132,16 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             )}
           </div>
 
-          <div className="flex flex-wrap items-center gap-2">
+          <div className="grid w-full grid-cols-2 gap-2 sm:flex sm:w-auto sm:flex-wrap sm:items-center sm:justify-end">
             {/* 选中态批量操作 */}
             {selectedIds.size > 0 && (
               <>
-                <Button onClick={handleBatchVerify} size="sm" variant="outline">
+                <Button
+                  onClick={handleBatchVerify}
+                  size="sm"
+                  variant="outline"
+                  className="w-full sm:w-auto"
+                >
                   <CheckCircle2 className="h-3.5 w-3.5" />
                   批量验活
                 </Button>
@@ -1132,6 +1149,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   onClick={handleBatchForceRefresh}
                   size="sm"
                   variant="outline"
+                  className="w-full sm:w-auto"
                   disabled={batchRefreshing}
                 >
                   <RefreshCw
@@ -1145,6 +1163,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   onClick={handleBatchResetFailure}
                   size="sm"
                   variant="outline"
+                  className="w-full sm:w-auto"
                 >
                   <RotateCcw className="h-3.5 w-3.5" />
                   恢复异常
@@ -1153,6 +1172,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   onClick={handleExportKam}
                   size="sm"
                   variant="outline"
+                  className="w-full sm:w-auto"
                   disabled={exportingKam}
                   title="导出勾选的凭据为 KAM JSON"
                 >
@@ -1163,17 +1183,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   onClick={handleBatchDelete}
                   size="sm"
                   variant="destructive"
-                  disabled={selectedDisabledCount === 0}
-                  title={
-                    selectedDisabledCount === 0
-                      ? "只能删除已禁用凭据"
-                      : undefined
-                  }
+                  className="w-full sm:w-auto"
+                  disabled={selectedIds.size === 0}
                 >
                   <Trash2 className="h-3.5 w-3.5" />
                   删除
                 </Button>
-                <span className="mx-1 h-5 w-px bg-border/70" />
+                <span className="mx-1 hidden h-5 w-px bg-border/70 sm:inline-block" />
               </>
             )}
 
@@ -1181,6 +1197,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             <Button
               size="sm"
               variant="outline"
+              className="w-full sm:w-auto"
               disabled={queryingInfo || !data?.credentials?.length}
               onClick={handleQueryCurrentPageInfo}
             >
@@ -1193,7 +1210,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             </Button>
 
             {/* 主操作 */}
-            <Button onClick={() => setAddDialogOpen(true)} size="sm">
+            <Button
+              onClick={() => setAddDialogOpen(true)}
+              size="sm"
+              className="w-full sm:w-auto"
+            >
               <Plus className="h-3.5 w-3.5" />
               添加凭据
             </Button>
@@ -1201,7 +1222,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             {/* 导入 / 登录折叠菜单 */}
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button size="sm" variant="outline">
+                <Button size="sm" variant="outline" className="w-full sm:w-auto">
                   <Upload className="h-3.5 w-3.5" />
                   导入 / 登录
                 </Button>
@@ -1217,6 +1238,10 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 <DropdownMenuItem onSelect={() => setIdcLoginDialogOpen(true)}>
                   <Key />
                   AWS SSO (IdC) 登录
+                </DropdownMenuItem>
+                <DropdownMenuItem onSelect={() => setEnterpriseLoginDialogOpen(true)}>
+                  <Building2 />
+                  Enterprise (IAM Identity Center) 登录
                 </DropdownMenuItem>
                 <DropdownMenuSeparator />
                 <DropdownMenuLabel>导入</DropdownMenuLabel>
@@ -1236,8 +1261,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             {/* 维护 / 危险操作折叠菜单 */}
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
-                <Button size="sm" variant="outline" title="更多操作">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  title="更多操作"
+                  className="w-full sm:w-auto"
+                >
                   <MoreHorizontal className="h-3.5 w-3.5" />
+                  <span className="sm:hidden">更多</span>
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end">
@@ -1350,7 +1381,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 items={currentPageIds}
                 strategy={rectSortingStrategy}
               >
-                <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 select-none">
+                <div className="grid select-none gap-3 sm:gap-4 md:grid-cols-2 lg:grid-cols-3">
                   {currentCredentials.map((credential) => (
                     <CredentialCard
                       key={credential.id}
@@ -1374,7 +1405,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             </DndContext>
 
             {totalPages > 1 && (
-              <div className="mt-8 flex items-center justify-center gap-2">
+              <div className="mt-6 flex flex-wrap items-center justify-center gap-2 sm:mt-8">
                 <Button
                   variant="outline"
                   size="sm"
@@ -1384,7 +1415,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   <ChevronLeft className="h-3.5 w-3.5" />
                   上一页
                 </Button>
-                <div className="px-3 text-sm tabular-nums text-muted-foreground">
+                <div className="order-first w-full px-3 text-center text-sm tabular-nums text-muted-foreground sm:order-none sm:w-auto">
                   第{" "}
                   <span className="font-medium text-foreground">
                     {currentPage}
@@ -1433,6 +1464,14 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           queryClient.invalidateQueries({ queryKey: ["credentials"] })
         }
       />
+      <IdcLoginDialog
+        mode="enterprise"
+        open={enterpriseLoginDialogOpen}
+        onOpenChange={setEnterpriseLoginDialogOpen}
+        onSuccess={() =>
+          queryClient.invalidateQueries({ queryKey: ["credentials"] })
+        }
+      />
       <KamImportDialog
         open={kamImportDialogOpen}
         onOpenChange={setKamImportDialogOpen}
@@ -1466,7 +1505,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         onCancel={handleCancelVerify}
       />
 
-      {/* 修改 Admin API Key 对话框 */}
+      {/* 修改登录API密钥对话框 */}
       <Dialog
         open={adminKeyDialogOpen}
         onOpenChange={(open) => {
@@ -1478,8 +1517,8 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             <DialogTitle className="flex items-center gap-2">
               <Key className="h-4 w-4" />
               {keyEditMode === "admin"
-                ? "修改 Admin API Key"
-                : "修改业务 API Key"}
+                ? "修改登录API密钥"
+                : "修改管理员API密钥"}
             </DialogTitle>
             <DialogDescription>
               {keyEditMode === "admin"
@@ -1491,7 +1530,11 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
             <div className="relative">
               <Input
                 type={showAdminKeyPlain ? "text" : "password"}
-                placeholder="输入或生成新的 Admin API Key"
+                placeholder={
+                  keyEditMode === "admin"
+                    ? "输入或生成新的登录API密钥"
+                    : "输入或生成新的管理员API密钥"
+                }
                 value={newAdminKey}
                 onChange={(e) => setNewAdminKey(e.target.value)}
                 disabled={updatingAdminKey}

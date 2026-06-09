@@ -4,7 +4,9 @@ use std::convert::Infallible;
 use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
-use crate::admin::trace_db::{SharedTraceStore, TraceAttempt, TraceRecord, TraceSink, outcome};
+use crate::admin::trace_db::{
+    SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
+};
 use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
@@ -124,24 +126,42 @@ pub(crate) struct RequestTracer {
     trace_id: String,
     ts: String,
     key_id: u64,
+    key_source: TraceKeySource,
     model: String,
     is_stream: bool,
     started_at: Instant,
     attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
+    /// 最终 token 用量 (input, output, cache_creation, cache_read)，互斥口径。
+    /// 由各上报路径在 token 算出后调 [`Self::set_usage`] 填入，finalize 时落库。
+    usage: parking_lot::Mutex<Option<(i32, i32, i32, i32)>>,
+}
+
+struct RequestTraceOptions {
+    key_ctx: KeyContext,
+    model: String,
+    is_stream: bool,
 }
 
 impl RequestTracer {
-    pub fn new(state: &AppState, key_id: u64, model: String, is_stream: bool) -> Self {
+    fn new(state: &AppState, options: RequestTraceOptions) -> Self {
         Self {
             store: state.trace_store.clone(),
             trace_id: Uuid::new_v4().to_string(),
             ts: Utc::now().to_rfc3339(),
-            key_id,
-            model,
-            is_stream,
+            key_id: options.key_ctx.key_id,
+            key_source: options.key_ctx.key_source,
+            model: options.model,
+            is_stream: options.is_stream,
             started_at: Instant::now(),
             attempts: parking_lot::Mutex::new(Vec::new()),
+            usage: parking_lot::Mutex::new(None),
         }
+    }
+
+    /// 记录本次请求的最终 token 用量（互斥口径，与 usage 日志 / SSE 上报同源）。
+    /// 在 finalize 之前调用；多次调用以最后一次为准。
+    pub fn set_usage(&self, input: i32, output: i32, cache_creation: i32, cache_read: i32) {
+        *self.usage.lock() = Some((input, output, cache_creation, cache_read));
     }
 
     /// 组装并落库一条完整链路。store 为 None 时不做任何事。
@@ -156,10 +176,14 @@ impl RequestTracer {
         let attempts = std::mem::take(&mut *self.attempts.lock());
         // 最终凭据：最后一跳的命中凭据（成功跳即命中凭据，失败跳即最后尝试的凭据）
         let final_credential_id = attempts.last().map(|a| a.credential_id).unwrap_or(0);
+        // 最终 token 用量（互斥口径）；未上报时记 0。
+        let (input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens) =
+            self.usage.lock().unwrap_or((0, 0, 0, 0));
         let rec = TraceRecord {
             trace_id: self.trace_id.clone(),
             ts: self.ts.clone(),
             key_id: self.key_id,
+            key_source: self.key_source,
             model: self.model.clone(),
             is_stream: self.is_stream,
             final_status: final_status.to_string(),
@@ -169,6 +193,10 @@ impl RequestTracer {
             total_attempts: attempts.len() as u32,
             duration_ms: self.started_at.elapsed().as_millis() as u64,
             interrupted_after_bytes,
+            input_tokens: input_tokens.max(0) as u64,
+            output_tokens: output_tokens.max(0) as u64,
+            cache_creation_tokens: cache_creation_tokens.max(0) as u64,
+            cache_read_tokens: cache_read_tokens.max(0) as u64,
             attempts,
         };
         store.insert(&rec);
@@ -635,20 +663,23 @@ pub async fn post_messages(
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
 
-    // PromptCache：根据 cache_control 断点查 / 写中转层提示词缓存
-    let (cache_creation_tokens, cache_read_tokens) = state
-        .prompt_cache
+    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
+    // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
+    let cache_usage = state
+        .cache_meter
         .as_ref()
-        .map(|cache| super::prompt_cache::compute_cache_usage(cache, &payload))
-        .unwrap_or((0, 0));
+        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
+        .unwrap_or_default();
 
     if payload.stream {
         // 流式响应
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
-            key_ctx.key_id,
-            payload.model.clone(),
-            true,
+            RequestTraceOptions {
+                key_ctx,
+                model: payload.model.clone(),
+                is_stream: true,
+            },
         ));
         handle_stream_request(
             provider,
@@ -659,8 +690,7 @@ pub async fn post_messages(
             tool_name_map,
             known_tool_names,
             hook,
-            cache_creation_tokens,
-            cache_read_tokens,
+            cache_usage,
             tracer,
         )
         .await
@@ -669,9 +699,11 @@ pub async fn post_messages(
         let extract_thinking = state.extract_thinking && thinking_enabled;
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
-            key_ctx.key_id,
-            payload.model.clone(),
-            false,
+            RequestTraceOptions {
+                key_ctx,
+                model: payload.model.clone(),
+                is_stream: false,
+            },
         ));
         handle_non_stream_request(
             provider,
@@ -682,8 +714,7 @@ pub async fn post_messages(
             tool_name_map,
             known_tool_names,
             hook,
-            cache_creation_tokens,
-            cache_read_tokens,
+            cache_usage,
             tracer,
         )
         .await
@@ -700,8 +731,7 @@ async fn handle_stream_request(
     tool_name_map: std::collections::HashMap<String, String>,
     known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
-    cache_creation_tokens: i32,
-    cache_read_tokens: i32,
+    cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -726,10 +756,14 @@ async fn handle_stream_request(
     let credential_id = call_result.credential_id;
 
     // 创建流处理上下文
-    let mut ctx =
-        StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map, known_tool_names);
-    ctx.cache_creation_input_tokens = cache_creation_tokens;
-    ctx.cache_read_input_tokens = cache_read_tokens;
+    let mut ctx = StreamContext::new_with_thinking(
+        model,
+        input_tokens,
+        thinking_enabled,
+        tool_name_map,
+        known_tool_names,
+    );
+    ctx.cache_usage = cache_usage;
 
     // 生成初始事件
     let initial_events = ctx.generate_initial_events();
@@ -820,7 +854,7 @@ fn create_sse_stream(
                             tracing::error!("读取响应流失败: {}", e);
                             // 发送最终事件并结束（记为 error）
                             let final_events = ctx.generate_final_events();
-                            record_stream_usage(&hook, &ctx, credential_id, "error");
+                            record_stream_usage(&hook, &ctx, credential_id, "error", &tracer);
                             // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
                             tracer.finalize(
                                 "interrupted",
@@ -837,7 +871,7 @@ fn create_sse_stream(
                         None => {
                             // 流结束，发送最终事件
                             let final_events = ctx.generate_final_events();
-                            record_stream_usage(&hook, &ctx, credential_id, "success");
+                            record_stream_usage(&hook, &ctx, credential_id, "success", &tracer);
                             tracer.finalize("success", None, None, None);
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
@@ -861,23 +895,26 @@ fn create_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
-/// 从 StreamContext 提取最终用量并写入 hook
+/// 从 StreamContext 提取最终用量，写入 hook，并同步给 tracer（trace 与 usage 同源）。
 fn record_stream_usage(
     hook: &UsageRecordHook,
     ctx: &StreamContext,
     credential_id: u64,
     status: &str,
+    tracer: &RequestTracer,
 ) {
-    let input = ctx.context_input_tokens.unwrap_or(ctx.input_tokens);
+    // 互斥分摊后的 (input, cache_creation, cache_read)，与 SSE 上报口径一致。
+    let (input, cache_creation, cache_read) = ctx.resolved_usage();
     hook.record(
         credential_id,
         input,
         ctx.output_tokens,
-        ctx.cache_creation_input_tokens,
-        ctx.cache_read_input_tokens,
+        cache_creation,
+        cache_read,
         ctx.credits,
         status,
     );
+    tracer.set_usage(input, ctx.output_tokens, cache_creation, cache_read);
 }
 
 use super::converter::get_context_window_size;
@@ -894,8 +931,7 @@ async fn handle_non_stream_request(
     // 因此这里不需要工具表校验；保留参数以对齐调用方签名。
     _known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
-    initial_cache_creation: i32,
-    initial_cache_read: i32,
+    cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -945,16 +981,17 @@ async fn handle_non_stream_request(
     }
 
     let mut text_content = String::new();
+    let mut native_thinking = String::new();
+    let mut native_thinking_signature: Option<String> = None;
+    let mut native_redacted_thinking: Vec<String> = Vec::new();
     let mut tool_uses: Vec<serde_json::Value> = Vec::new();
     let mut has_tool_use = false;
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
     // meteringEvent 上报的 token 与缓存数据
-    // 上游 metering 只给 credit；input 来自 contextUsage，output 来自估算
-    // cache_creation / cache_read 由调用方（PromptCache）传入初值
-    let cache_creation_tokens: i32 = initial_cache_creation;
-    let cache_read_tokens: i32 = initial_cache_read;
+    // 上游 metering 只给 credit；input 来自 contextUsage，output 来自估算。
+    // 缓存 input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
     let mut credits: f64 = 0.0;
 
     // 收集工具调用的增量 JSON
@@ -968,6 +1005,23 @@ async fn handle_non_stream_request(
                     match event {
                         Event::AssistantResponse(resp) => {
                             text_content.push_str(&resp.content);
+                        }
+                        Event::ReasoningContent(reasoning) => {
+                            if let Some(text) = reasoning.text
+                                && !text.is_empty()
+                            {
+                                native_thinking.push_str(&text);
+                            }
+                            if let Some(signature) = reasoning.signature
+                                && !signature.is_empty()
+                            {
+                                native_thinking_signature = Some(signature);
+                            }
+                            if let Some(redacted) = reasoning.redacted_content
+                                && !redacted.is_empty()
+                            {
+                                native_redacted_thinking.push(redacted);
+                            }
                         }
                         Event::ToolUse(tool_use) => {
                             has_tool_use = true;
@@ -1049,44 +1103,23 @@ async fn handle_non_stream_request(
     }
 
     // 构建响应内容
-    let mut content: Vec<serde_json::Value> = Vec::new();
-
-    if thinking_enabled {
-        // 从完整文本中提取 thinking 块
-        let (thinking, remaining_text) =
-            super::stream::extract_thinking_from_complete_text(&text_content);
-
-        if let Some(thinking_text) = thinking {
-            // signature 占位字符串：上游 Kiro 不下发真实 Anthropic 签名，
-            // 但 thinking 模式下客户端要求 thinking 块带 signature 字段，
-            // 否则下一轮回传时 SDK 本地校验会拒绝（"must be passed back"）
-            content.push(json!({
-                "type": "thinking",
-                "thinking": thinking_text,
-                "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
-            }));
-        }
-
-        if !remaining_text.is_empty() {
-            content.push(json!({
-                "type": "text",
-                "text": remaining_text
-            }));
-        }
-    } else if !text_content.is_empty() {
-        content.push(json!({
-            "type": "text",
-            "text": text_content
-        }));
-    }
-
+    let mut content = build_non_stream_content(
+        thinking_enabled,
+        text_content,
+        native_thinking,
+        native_thinking_signature,
+        native_redacted_thinking,
+    );
     content.extend(tool_uses);
 
     // 估算输出 tokens（上游不下发 token，全部走估算）
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // 输入 tokens：contextUsage 真实值优先，否则用客户端估算
-    let final_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
+    // 全量 prompt token：contextUsage 真实值优先，否则用客户端估算。
+    let total_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
+    // 互斥分摊：total − 缓存覆盖 = 未缓存 input；三者相加恒等于 total。
+    let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
+        cache_usage.split_against_total(total_input_tokens);
 
     // 构建 Anthropic 响应
     let response_body = json!({
@@ -1114,8 +1147,80 @@ async fn handle_non_stream_request(
         credits,
         "success",
     );
+    tracer.set_usage(
+        final_input_tokens,
+        output_tokens,
+        cache_creation_tokens,
+        cache_read_tokens,
+    );
     tracer.finalize("success", None, None, None);
     (StatusCode::OK, Json(response_body)).into_response()
+}
+
+fn build_non_stream_content(
+    thinking_enabled: bool,
+    text_content: String,
+    native_thinking: String,
+    native_thinking_signature: Option<String>,
+    native_redacted_thinking: Vec<String>,
+) -> Vec<serde_json::Value> {
+    let mut content = Vec::new();
+    let has_native_thinking = !native_thinking.is_empty();
+
+    if thinking_enabled {
+        if has_native_thinking {
+            content.push(json!({
+                "type": "thinking",
+                "thinking": native_thinking.clone(),
+                "signature": native_thinking_signature
+                    .unwrap_or_else(|| super::stream::THINKING_SIGNATURE_PLACEHOLDER.to_string()),
+            }));
+        } else {
+            // 从完整文本中提取 thinking 块，兼容旧的 <thinking> 文本路径。
+            let (thinking, remaining_text) =
+                super::stream::extract_thinking_from_complete_text(&text_content);
+
+            if let Some(thinking_text) = thinking {
+                content.push(json!({
+                    "type": "thinking",
+                    "thinking": thinking_text,
+                    "signature": super::stream::THINKING_SIGNATURE_PLACEHOLDER,
+                }));
+            }
+
+            if !remaining_text.is_empty() {
+                content.push(json!({
+                    "type": "text",
+                    "text": remaining_text
+                }));
+            }
+        }
+
+        for redacted in native_redacted_thinking {
+            content.push(json!({
+                "type": "redacted_thinking",
+                "data": redacted
+            }));
+        }
+
+        if has_native_thinking && !text_content.is_empty() {
+            content.push(json!({
+                "type": "text",
+                "text": text_content
+            }));
+        }
+    } else if !text_content.is_empty() {
+        content.push(json!({
+            "type": "text",
+            "text": text_content
+        }));
+    } else if has_native_thinking {
+        content.push(json!({
+            "type": "text",
+            "text": native_thinking
+        }));
+    }
+    content
 }
 
 /// 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
@@ -1315,20 +1420,23 @@ pub async fn post_messages_cc(
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
 
-    // PromptCache：根据 cache_control 断点查 / 写中转层提示词缓存
-    let (cache_creation_tokens, cache_read_tokens) = state
-        .prompt_cache
+    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
+    // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
+    let cache_usage = state
+        .cache_meter
         .as_ref()
-        .map(|cache| super::prompt_cache::compute_cache_usage(cache, &payload))
-        .unwrap_or((0, 0));
+        .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
+        .unwrap_or_default();
 
     if payload.stream {
         // 流式响应（缓冲模式）
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
-            key_ctx.key_id,
-            payload.model.clone(),
-            true,
+            RequestTraceOptions {
+                key_ctx,
+                model: payload.model.clone(),
+                is_stream: true,
+            },
         ));
         handle_stream_request_buffered(
             provider,
@@ -1339,8 +1447,7 @@ pub async fn post_messages_cc(
             known_tool_names,
             hook,
             total_input_tokens,
-            cache_creation_tokens,
-            cache_read_tokens,
+            cache_usage,
             tracer,
         )
         .await
@@ -1349,9 +1456,11 @@ pub async fn post_messages_cc(
         let extract_thinking = state.extract_thinking && thinking_enabled;
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
-            key_ctx.key_id,
-            payload.model.clone(),
-            false,
+            RequestTraceOptions {
+                key_ctx,
+                model: payload.model.clone(),
+                is_stream: false,
+            },
         ));
         handle_non_stream_request(
             provider,
@@ -1362,8 +1471,7 @@ pub async fn post_messages_cc(
             tool_name_map,
             known_tool_names,
             hook,
-            cache_creation_tokens,
-            cache_read_tokens,
+            cache_usage,
             tracer,
         )
         .await
@@ -1383,8 +1491,7 @@ async fn handle_stream_request_buffered(
     known_tool_names: std::collections::HashSet<String>,
     hook: UsageRecordHook,
     fallback_input_tokens: i32,
-    cache_creation_tokens: i32,
-    cache_read_tokens: i32,
+    cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
@@ -1415,7 +1522,7 @@ async fn handle_stream_request_buffered(
         tool_name_map,
         known_tool_names,
     );
-    ctx.set_initial_cache_tokens(cache_creation_tokens, cache_read_tokens);
+    ctx.set_cache_usage(cache_usage);
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);
@@ -1507,6 +1614,7 @@ fn create_buffered_sse_stream(
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
                                 hook.record(credential_id, i, o, cc, cr, credits, "error");
+                                tracer.set_usage(i, o, cc, cr);
                                 // 缓冲模式 chunk 读取失败：上游中途断流
                                 tracer.finalize(
                                     "interrupted",
@@ -1525,6 +1633,7 @@ fn create_buffered_sse_stream(
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
                                 hook.record(credential_id, i, o, cc, cr, credits, "success");
+                                tracer.set_usage(i, o, cc, cr);
                                 tracer.finalize("success", None, None, None);
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
@@ -1575,6 +1684,62 @@ mod tests {
             "ValidationException: transient backend issue".to_string()
         ));
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn non_stream_native_thinking_precedes_redacted_and_text() {
+        let content = build_non_stream_content(
+            true,
+            "final answer".to_string(),
+            "native thinking".to_string(),
+            Some("real-signature".to_string()),
+            vec!["encrypted-thinking".to_string()],
+        );
+
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "native thinking");
+        assert_eq!(content[0]["signature"], "real-signature");
+        assert_eq!(content[1]["type"], "redacted_thinking");
+        assert_eq!(content[1]["data"], "encrypted-thinking");
+        assert_eq!(content[2]["type"], "text");
+        assert_eq!(content[2]["text"], "final answer");
+    }
+
+    #[test]
+    fn non_stream_legacy_thinking_extraction_still_works_without_native_reasoning() {
+        let content = build_non_stream_content(
+            true,
+            "<thinking>legacy thinking</thinking>\n\nfinal answer".to_string(),
+            String::new(),
+            None,
+            Vec::new(),
+        );
+
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "legacy thinking");
+        assert_eq!(
+            content[0]["signature"],
+            crate::anthropic::stream::THINKING_SIGNATURE_PLACEHOLDER
+        );
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "final answer");
+    }
+
+    #[test]
+    fn non_stream_native_thinking_downgrades_to_text_when_thinking_disabled() {
+        let content = build_non_stream_content(
+            false,
+            String::new(),
+            "native thinking fallback".to_string(),
+            Some("ignored-signature".to_string()),
+            vec!["ignored-redacted".to_string()],
+        );
+
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "native thinking fallback");
     }
 
     #[test]

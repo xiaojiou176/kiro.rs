@@ -9,6 +9,13 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import {
+  Select,
+  SelectTrigger,
+  SelectValue,
+  SelectContent,
+  SelectItem,
+} from '@/components/ui/select'
 import { useAddCredential } from '@/hooks/use-credentials'
 import { extractErrorMessage } from '@/lib/utils'
 
@@ -27,7 +34,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
   const [apiRegion, setApiRegion] = useState('')
   const [clientId, setClientId] = useState('')
   const [clientSecret, setClientSecret] = useState('')
-  const [priority, setPriority] = useState('0')
   const [machineId, setMachineId] = useState('')
   const [proxyUrl, setProxyUrl] = useState('')
   const [proxyUsername, setProxyUsername] = useState('')
@@ -44,7 +50,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
     setApiRegion('')
     setClientId('')
     setClientSecret('')
-    setPriority('0')
     setMachineId('')
     setProxyUrl('')
     setProxyUsername('')
@@ -84,7 +89,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
         apiRegion: apiRegion.trim() || undefined,
         clientId: isApiKey ? undefined : clientId.trim() || undefined,
         clientSecret: isApiKey ? undefined : clientSecret.trim() || undefined,
-        priority: parseInt(priority) || 0,
         machineId: machineId.trim() || undefined,
         proxyUrl: proxyUrl.trim() || undefined,
         proxyUsername: proxyUsername.trim() || undefined,
@@ -118,17 +122,20 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
               <label htmlFor="authMethod" className="text-sm font-medium">
                 认证方式
               </label>
-              <select
-                id="authMethod"
+              <Select
                 value={authMethod}
-                onChange={(e) => setAuthMethod(e.target.value as AuthMethod)}
+                onValueChange={(v) => setAuthMethod(v as AuthMethod)}
                 disabled={isPending}
-                className="flex h-10 w-full rounded-xl border border-input bg-background/60 px-3.5 py-2 text-sm transition-all duration-150 ease-apple placeholder:text-muted-foreground/70 hover:border-border focus-visible:outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/30 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                <option value="social">Social</option>
-                <option value="idc">IdC/Builder-ID/IAM</option>
-                <option value="api_key">API Key</option>
-              </select>
+                <SelectTrigger id="authMethod" className="h-10 rounded-xl px-3.5">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="social">Social</SelectItem>
+                  <SelectItem value="idc">IdC/Builder-ID/IAM</SelectItem>
+                  <SelectItem value="api_key">API Key</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
 
             {/* Kiro API Key (API Key 模式) */}
@@ -223,25 +230,6 @@ export function AddCredentialDialog({ open, onOpenChange }: AddCredentialDialogP
                 </div>
               </>
             )}
-
-            {/* 优先级 */}
-            <div className="space-y-2">
-              <label htmlFor="priority" className="text-sm font-medium">
-                优先级
-              </label>
-              <Input
-                id="priority"
-                type="number"
-                min="0"
-                placeholder="数字越小优先级越高"
-                value={priority}
-                onChange={(e) => setPriority(e.target.value)}
-                disabled={isPending}
-              />
-              <p className="text-xs text-muted-foreground">
-                数字越小优先级越高，默认为 0
-              </p>
-            </div>
 
             {/* Machine ID */}
             <div className="space-y-2">
