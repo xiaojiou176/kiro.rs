@@ -94,7 +94,7 @@ export async function exportKamCredentials(
   ids?: number[]
 ): Promise<KamExportResponse> {
   const params = ids && ids.length > 0 ? { ids: ids.join(',') } : undefined
-  const { data } = await api.get<KamExportResponse>('/credentials/export', { params })
+  const { data } = await api.get<KamExportResponse>('/credentials/export/kam', { params })
   return data
 }
 

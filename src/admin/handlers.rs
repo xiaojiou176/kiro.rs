@@ -65,6 +65,34 @@ pub async fn export_credentials(
     Json(response)
 }
 
+/// GET /api/admin/credentials/export/kam
+///
+/// 本地 KAM 平铺格式导出（与上游 `export_credentials` 的嵌套格式并存）。
+/// 供本地 admin-ui 的批量账号导出（KAM batch-login 工作流）使用。
+pub async fn export_kam_credentials(
+    State(state): State<AdminState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let id_filter: Option<std::collections::HashSet<u64>> = params
+        .get("ids")
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|s| {
+                    let t = s.trim();
+                    if t.is_empty() {
+                        None
+                    } else {
+                        t.parse::<u64>().ok()
+                    }
+                })
+                .collect::<std::collections::HashSet<u64>>()
+        })
+        .filter(|s| !s.is_empty());
+
+    let response = state.service.export_kam_credentials(id_filter.as_ref());
+    Json(response)
+}
+
 /// POST /api/admin/credentials/:id/disabled
 /// 设置凭据禁用状态
 pub async fn set_credential_disabled(
