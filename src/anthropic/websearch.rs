@@ -117,9 +117,9 @@ pub fn has_web_search_tool(req: &MessagesRequest) -> bool {
 /// the case where web_search coexists with other tools (exec, etc.) - such a request falls onto the normal chat path,
 /// where the upstream may return a tool_use with name=web_search, requiring the internal agentic loop.
 pub(crate) fn has_web_search_among_tools(req: &MessagesRequest) -> bool {
-    req.tools.as_ref().is_some_and(|tools| {
-        tools.len() > 1 && tools.iter().any(|t| t.name == "web_search")
-    })
+    req.tools
+        .as_ref()
+        .is_some_and(|tools| tools.len() > 1 && tools.iter().any(|t| t.name == "web_search"))
 }
 
 /// 从消息中提取搜索查询

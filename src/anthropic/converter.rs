@@ -40,8 +40,15 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     obj.remove("$schema");
 
     // type（必须是字符串）
-    if !obj.get("type").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
-        obj.insert("type".to_string(), serde_json::Value::String("object".to_string()));
+    if !obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .is_some_and(|s| !s.is_empty())
+    {
+        obj.insert(
+            "type".to_string(),
+            serde_json::Value::String("object".to_string()),
+        );
     }
 
     // properties（必须是 object）；递归规范化每个 property 的子 schema
@@ -51,9 +58,17 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
                 .into_iter()
                 .map(|(k, v)| (k, normalize_property_schema(v)))
                 .collect();
-            obj.insert("properties".to_string(), serde_json::Value::Object(normalized));
+            obj.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(normalized),
+            );
         }
-        _ => { obj.insert("properties".to_string(), serde_json::Value::Object(serde_json::Map::new())); }
+        _ => {
+            obj.insert(
+                "properties".to_string(),
+                serde_json::Value::Object(serde_json::Map::new()),
+            );
+        }
     }
 
     // required（必须是 string 数组）
@@ -70,7 +85,12 @@ fn normalize_json_schema(schema: serde_json::Value) -> serde_json::Value {
     // additionalProperties（允许 bool 或 object，其他按 true 处理）
     match obj.get("additionalProperties") {
         Some(serde_json::Value::Bool(_)) | Some(serde_json::Value::Object(_)) => {}
-        _ => { obj.insert("additionalProperties".to_string(), serde_json::Value::Bool(true)); }
+        _ => {
+            obj.insert(
+                "additionalProperties".to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
     }
 
     serde_json::Value::Object(obj)
@@ -90,10 +110,18 @@ fn normalize_property_schema(schema: serde_json::Value) -> serde_json::Value {
     obj.remove("$schema");
 
     // exclusiveMinimum/exclusiveMaximum：Draft 2019-09+ 为数字，Draft 07 为 bool；移除数字形式
-    if obj.get("exclusiveMinimum").and_then(|v| v.as_f64()).is_some() {
+    if obj
+        .get("exclusiveMinimum")
+        .and_then(|v| v.as_f64())
+        .is_some()
+    {
         obj.remove("exclusiveMinimum");
     }
-    if obj.get("exclusiveMaximum").and_then(|v| v.as_f64()).is_some() {
+    if obj
+        .get("exclusiveMaximum")
+        .and_then(|v| v.as_f64())
+        .is_some()
+    {
         obj.remove("exclusiveMaximum");
     }
 
@@ -112,7 +140,10 @@ fn normalize_property_schema(schema: serde_json::Value) -> serde_json::Value {
             .into_iter()
             .map(|(k, v)| (k, normalize_property_schema(v)))
             .collect();
-        obj.insert("properties".to_string(), serde_json::Value::Object(normalized));
+        obj.insert(
+            "properties".to_string(),
+            serde_json::Value::Object(normalized),
+        );
     }
 
     // 递归处理 items（数组元素 schema）
@@ -210,6 +241,10 @@ pub struct ConversionResult {
     pub conversation_state: ConversationState,
     /// 工具名称映射（短名称 → 原始名称），仅当存在超长工具名时非空
     pub tool_name_map: HashMap<String, String>,
+    /// 本次请求声明的所有工具名（原始 client 名）。用于 `<invoke>` 文本容错的灾难兜底：
+    /// 只有合成出的工具名在此集合里，才允许把字面 `<invoke>` 捞回成结构化 tool_use；
+    /// 否则当普通文本吐出，避免把「正文展示的工具调用」误执行成真命令。
+    pub known_tool_names: std::collections::HashSet<String>,
     /// Additional model request fields (including `output_config.effort`), translated from the
     /// `output_config` field of the client's Anthropic request. Not sent when empty.
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
@@ -351,6 +386,18 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     let mut tool_name_map = HashMap::new();
     let mut tools = convert_tools(&req.tools, &mut tool_name_map);
 
+    // 收集本次请求声明的所有工具名（原始 client 名），供 `<invoke>` 容错的工具表校验。
+    let mut known_tool_names: std::collections::HashSet<String> = req
+        .tools
+        .as_ref()
+        .map(|ts| ts.iter().map(|t| t.name.clone()).collect())
+        .unwrap_or_default();
+    // 建议3 修复：超长工具名（>63）会被 shorten 成短名发给上游，模型回吐的也是短名。
+    // tool_name_map 的 key 正是这些短名，一并加入，避免「超长名工具的合法 invoke 被漏捞」。
+    for short in tool_name_map.keys() {
+        known_tool_names.insert(short.clone());
+    }
+
     // 7. 构建历史消息（需要先构建，以便收集历史中使用的工具）
     let mut history = build_history(req, messages, &model_id, &mut tool_name_map)?;
 
@@ -410,10 +457,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         .with_history(history);
 
     if !tool_name_map.is_empty() {
-        tracing::info!(
-            "工具名称映射: {} 个超长名称已缩短",
-            tool_name_map.len()
-        );
+        tracing::info!("工具名称映射: {} 个超长名称已缩短", tool_name_map.len());
     }
 
     // 14. Extract effort into AdditionalModelRequestFields only for models that accept it.
@@ -460,6 +504,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     Ok(ConversionResult {
         conversation_state,
         tool_name_map,
+        known_tool_names,
         additional_model_request_fields,
     })
 }
@@ -511,8 +556,11 @@ fn process_message_content_dedup(
                         }
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
-                                let result_content =
-                                    extract_tool_result_content(&block.content, &mut dedup, &mut images);
+                                let result_content = extract_tool_result_content(
+                                    &block.content,
+                                    &mut dedup,
+                                    &mut images,
+                                );
                                 let is_error = block.is_error.unwrap_or(false);
 
                                 let mut result = if is_error {
@@ -573,7 +621,10 @@ fn extract_kiro_image(
     }
     let cfg = ResizeConfig::from_env();
     let processed = maybe_shrink_image(cfg, &format, &source.data);
-    images.push(KiroImage::from_base64(processed.format, processed.data_base64));
+    images.push(KiroImage::from_base64(
+        processed.format,
+        processed.data_base64,
+    ));
     None
 }
 
@@ -765,7 +816,10 @@ fn map_tool_name(name: &str, tool_name_map: &mut HashMap<String, String>) -> Str
 }
 
 /// 转换工具定义
-fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut HashMap<String, String>) -> Vec<Tool> {
+fn convert_tools(
+    tools: &Option<Vec<super::types::Tool>>,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Vec<Tool> {
     let Some(tools) = tools else {
         return Vec::new();
     };
@@ -803,7 +857,9 @@ fn convert_tools(tools: &Option<Vec<super::types::Tool>>, tool_name_map: &mut Ha
                 tool_specification: ToolSpecification {
                     name: map_tool_name(&t.name, tool_name_map),
                     description,
-                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(t.input_schema))),
+                    input_schema: InputSchema::from_json(normalize_json_schema(serde_json::json!(
+                        t.input_schema
+                    ))),
                 },
             }
         })
@@ -846,7 +902,12 @@ fn has_thinking_tags(content: &str) -> bool {
 ///   注意：该切片与 `req.messages` 可能不同（prefill 时会截断末尾的 assistant 消息），
 ///   调用方应始终使用此参数而非 `req.messages`。
 /// * `model_id` - 已映射的 Kiro 模型 ID
-fn build_history(req: &MessagesRequest, messages: &[super::types::Message], model_id: &str, tool_name_map: &mut HashMap<String, String>) -> Result<Vec<Message>, ConversionError> {
+fn build_history(
+    req: &MessagesRequest,
+    messages: &[super::types::Message],
+    model_id: &str,
+    tool_name_map: &mut HashMap<String, String>,
+) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
     // 生成thinking前缀（如果需要）
@@ -1014,7 +1075,8 @@ fn convert_assistant_message(
                             if let (Some(id), Some(name)) = (block.id, block.name) {
                                 let input = block.input.unwrap_or(serde_json::json!({}));
                                 let mapped_name = map_tool_name(&name, tool_name_map);
-                                tool_uses.push(ToolUseEntry::new(id, mapped_name).with_input(input));
+                                tool_uses
+                                    .push(ToolUseEntry::new(id, mapped_name).with_input(input));
                             }
                         }
                         _ => {}
@@ -1104,11 +1166,7 @@ mod tests {
                 .unwrap()
                 .contains("sonnet")
         );
-        assert!(
-            map_model("claude-sonnet-4-6")
-                .unwrap()
-                .contains("sonnet")
-        );
+        assert!(map_model("claude-sonnet-4-6").unwrap().contains("sonnet"));
     }
 
     #[test]
@@ -1332,13 +1390,18 @@ mod tests {
 
     #[test]
     fn test_shorten_tool_name_deterministic() {
-        let long_name = "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
+        let long_name =
+            "mcp__some_very_long_server_name__some_very_long_tool_name_that_exceeds_limit";
         assert!(long_name.len() > TOOL_NAME_MAX_LEN);
 
         let short1 = shorten_tool_name(long_name);
         let short2 = shorten_tool_name(long_name);
         assert_eq!(short1, short2, "相同输入应产生相同的短名称");
-        assert!(short1.len() <= TOOL_NAME_MAX_LEN, "短名称长度应 <= 63，实际 {}", short1.len());
+        assert!(
+            short1.len() <= TOOL_NAME_MAX_LEN,
+            "短名称长度应 <= 63，实际 {}",
+            short1.len()
+        );
     }
 
     #[test]
@@ -1371,7 +1434,8 @@ mod tests {
     fn test_tool_name_mapping_in_convert_request() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
         assert!(long_tool_name.len() > TOOL_NAME_MAX_LEN);
 
         let mut schema = std::collections::BTreeMap::new();
@@ -1381,12 +1445,10 @@ mod tests {
         let req = MessagesRequest {
             model: "claude-sonnet-4.5".to_string(),
             max_tokens: 1024,
-            messages: vec![
-                AnthropicMessage {
-                    role: "user".to_string(),
-                    content: serde_json::json!("test"),
-                },
-            ],
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("test"),
+            }],
             system: None,
             stream: false,
             tools: Some(vec![AnthropicTool {
@@ -1414,8 +1476,12 @@ mod tests {
         assert!(short.len() <= TOOL_NAME_MAX_LEN);
 
         // Kiro 请求中的工具名应该是短名称
-        let tools = &result.conversation_state.current_message.user_input_message
-            .user_input_message_context.tools;
+        let tools = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .tools;
         assert_eq!(tools[0].tool_specification.name, *short);
     }
 
@@ -1423,7 +1489,8 @@ mod tests {
     fn test_tool_name_mapping_in_history() {
         use super::super::types::{Message as AnthropicMessage, Tool as AnthropicTool};
 
-        let long_tool_name = "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
+        let long_tool_name =
+            "mcp__plugin_very_long_server_name__extremely_long_tool_name_exceeds_63";
 
         let mut schema = std::collections::BTreeMap::new();
         schema.insert("type".to_string(), serde_json::json!("object"));
@@ -2019,9 +2086,15 @@ mod tests {
 
         let content = &result.assistant_response_message.content;
         assert!(content.contains("<thinking>"), "应包含 thinking 标签");
-        assert!(content.contains("Let me read that file"), "应包含第二条消息的 text 内容");
+        assert!(
+            content.contains("Let me read that file"),
+            "应包含第二条消息的 text 内容"
+        );
 
-        let tool_uses = result.assistant_response_message.tool_uses.expect("应有 tool_uses");
+        let tool_uses = result
+            .assistant_response_message
+            .tool_uses
+            .expect("应有 tool_uses");
         assert_eq!(tool_uses.len(), 1);
         assert_eq!(tool_uses[0].tool_use_id, "toolu_01ABC");
     }
@@ -2071,7 +2144,11 @@ mod tests {
         };
 
         let result = convert_request(&req);
-        assert!(result.is_ok(), "连续 assistant 消息场景不应报错: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "连续 assistant 消息场景不应报错: {:?}",
+            result.err()
+        );
 
         let state = result.unwrap().conversation_state;
         let mut found_tool_use = false;
@@ -2133,7 +2210,11 @@ mod tests {
         let msg = &result.conversation_state.current_message.user_input_message;
 
         // image is lifted to the top-level images
-        assert_eq!(msg.images.len(), 1, "image in tool_result should be lifted to top-level images");
+        assert_eq!(
+            msg.images.len(),
+            1,
+            "image in tool_result should be lifted to top-level images"
+        );
         assert_eq!(msg.images[0].format, "png");
         assert_eq!(msg.images[0].source.bytes, TINY_PNG_B64);
 
@@ -2185,7 +2266,10 @@ mod tests {
         let result = convert_request(&req).unwrap();
         let msg = &result.conversation_state.current_message.user_input_message;
 
-        assert!(msg.images.is_empty(), "text-only tool_result should produce no top-level image");
+        assert!(
+            msg.images.is_empty(),
+            "text-only tool_result should produce no top-level image"
+        );
         let tr = &msg.user_input_message_context.tool_results;
         assert_eq!(tr.len(), 1);
         assert_eq!(

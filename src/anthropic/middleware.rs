@@ -14,8 +14,8 @@ use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::admin::client_keys::SharedClientKeyManager;
-use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::admin::trace_db::SharedTraceStore;
+use crate::admin::usage_stats::{SharedAggregator, SharedRecorder};
 use crate::common::auth;
 use crate::kiro::provider::KiroProvider;
 use crate::observability;
@@ -188,8 +188,7 @@ pub async fn request_id_middleware(mut request: Request<Body>, next: Next) -> Re
     let inherited_trace_id = incoming_traceparent
         .as_deref()
         .and_then(observability::extract_trace_id);
-    let traceparent =
-        observability::generate_traceparent(inherited_trace_id.as_deref());
+    let traceparent = observability::generate_traceparent(inherited_trace_id.as_deref());
     let trace_id = observability::extract_trace_id(&traceparent).unwrap_or_default();
 
     // Inject the upstream-facing traceparent into the request so downstream

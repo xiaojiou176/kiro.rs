@@ -90,7 +90,8 @@ impl UsageRecorder {
     }
 
     fn log_path(&self, date: NaiveDate) -> PathBuf {
-        self.dir.join(format!("usage_log.{}.jsonl", date.format("%Y-%m-%d")))
+        self.dir
+            .join(format!("usage_log.{}.jsonl", date.format("%Y-%m-%d")))
     }
 
     /// 同步写入一条记录。失败仅 warn，不阻塞请求。
@@ -130,7 +131,8 @@ impl UsageRecorder {
 
     /// 获取保留天数
     pub fn retention_days(&self) -> i64 {
-        self.retention_days.load(std::sync::atomic::Ordering::Relaxed)
+        self.retention_days
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// 设置保留天数（>=1）
@@ -538,7 +540,10 @@ fn upsert_bucket(buckets: &mut Vec<BucketEntry>, ts: i64, rec: &UsageRecord, max
         b.overall.add(rec);
         b.by_model.entry(rec.model.clone()).or_default().add(rec);
         if rec.credential_id != 0 {
-            b.by_credential.entry(rec.credential_id).or_default().add(rec);
+            b.by_credential
+                .entry(rec.credential_id)
+                .or_default()
+                .add(rec);
         }
         return;
     }

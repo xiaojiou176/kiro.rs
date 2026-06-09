@@ -297,7 +297,12 @@ impl ClientKeyManager {
 
     /// 获取统计后的 active Key 数（未禁用）
     pub fn active_count(&self) -> usize {
-        self.inner.read().entries.values().filter(|e| !e.disabled).count()
+        self.inner
+            .read()
+            .entries
+            .values()
+            .filter(|e| !e.disabled)
+            .count()
     }
 }
 
@@ -309,8 +314,7 @@ impl Default for ClientKeyManager {
 
 /// 生成 `csk_` 前缀 + 32 位 base62 随机字符串
 pub fn generate_client_key() -> String {
-    const CHARSET: &[u8] =
-        b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let body: String = (0..32)
         .map(|_| {
             let idx = fastrand::usize(..CHARSET.len());

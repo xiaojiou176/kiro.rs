@@ -301,10 +301,7 @@ fn extract_segments(req: &MessagesRequest) -> Vec<Segment> {
         *cum = cum.saturating_add(estimate_tokens(text).max(0) as u32);
     };
 
-    let commit = |hasher: &Sha256,
-                  cum: u32,
-                  segments: &mut Vec<Segment>,
-                  cc: &CacheControl| {
+    let commit = |hasher: &Sha256, cum: u32, segments: &mut Vec<Segment>, cc: &CacheControl| {
         let digest = hasher.clone().finalize();
         let mut buf = [0u8; 8];
         buf.copy_from_slice(&digest[..8]);
@@ -482,7 +479,11 @@ mod tests {
 
         // 第二次：相同请求 → cache_read > 0, cache_creation == 0
         let (cc2, cr2) = compute_cache_usage(&cache, &req);
-        assert_eq!(cc2, 0, "second call should not record creation, got {}", cc2);
+        assert_eq!(
+            cc2, 0,
+            "second call should not record creation, got {}",
+            cc2
+        );
         assert!(cr2 > 0, "second call should hit, cr={}", cr2);
         // 两次的 read 应等于第一次的 creation（同一个最深段累计 tokens）
         assert_eq!(cc1, cr2);
@@ -579,7 +580,11 @@ mod tests {
 
         // 第二次：换一种插入顺序但逻辑等价，应命中缓存（不再反复 miss）。
         let (cc2, cr2) = compute_cache_usage(&cache, &make_req(true));
-        assert_eq!(cc2, 0, "second call should hit, not re-create, got cc={}", cc2);
+        assert_eq!(
+            cc2, 0,
+            "second call should hit, not re-create, got cc={}",
+            cc2
+        );
         assert_eq!(cr2, cc1, "second read should equal first creation");
     }
 }

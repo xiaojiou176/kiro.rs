@@ -204,7 +204,11 @@ async fn main() {
     let client_keys_path = admin::client_keys::default_path_in(&cache_dir);
     let client_key_manager = std::sync::Arc::new(
         admin::ClientKeyManager::load(&client_keys_path).unwrap_or_else(|e| {
-            tracing::warn!("加载客户端 Key 失败 ({}): {}", client_keys_path.display(), e);
+            tracing::warn!(
+                "加载客户端 Key 失败 ({}): {}",
+                client_keys_path.display(),
+                e
+            );
             admin::ClientKeyManager::new()
         }),
     );
@@ -283,8 +287,7 @@ async fn main() {
             // Admin 查询需要一个确定的 store；traces.db 打开失败时用内存兜底（仅本进程有效）
             let admin_trace_store = trace_store.clone().unwrap_or_else(|| {
                 std::sync::Arc::new(
-                    admin::TraceStore::open_in_memory()
-                        .expect("内存 trace store 初始化失败"),
+                    admin::TraceStore::open_in_memory().expect("内存 trace store 初始化失败"),
                 )
             });
             let admin_service =
@@ -409,7 +412,10 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
         if let Err(e) = std::fs::write(cred_p, "[]\n") {
             tracing::warn!("写入空凭证文件失败 {}: {}", cred_p.display(), e);
         } else {
-            tracing::info!("已生成空凭证文件: {}（可通过 Admin UI 添加凭据）", cred_p.display());
+            tracing::info!(
+                "已生成空凭证文件: {}（可通过 Admin UI 添加凭据）",
+                cred_p.display()
+            );
         }
     }
 }

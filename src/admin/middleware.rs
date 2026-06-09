@@ -14,9 +14,9 @@ use axum::{
 
 use super::client_keys::SharedClientKeyManager;
 use super::service::AdminService;
+use super::trace_db::SharedTraceStore;
 use super::types::AdminErrorResponse;
 use super::usage_stats::SharedAggregator;
-use super::trace_db::SharedTraceStore;
 use crate::common::auth;
 
 /// Admin API 共享状态

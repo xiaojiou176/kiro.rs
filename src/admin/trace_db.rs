@@ -337,8 +337,7 @@ impl TraceStore {
 
         // 总数（用于前端分页）
         let count_sql = format!("SELECT COUNT(*) FROM traces {}", where_sql);
-        let total: i64 =
-            conn.query_row(&count_sql, param_refs.as_slice(), |row| row.get(0))?;
+        let total: i64 = conn.query_row(&count_sql, param_refs.as_slice(), |row| row.get(0))?;
 
         let limit = if q.limit == 0 {
             DEFAULT_QUERY_LIMIT
@@ -366,9 +365,7 @@ impl TraceStore {
                 error_message: row.get(8)?,
                 total_attempts: row.get::<_, i64>(9)? as u32,
                 duration_ms: row.get::<_, i64>(10)? as u64,
-                interrupted_after_bytes: row
-                    .get::<_, Option<i64>>(11)?
-                    .map(|v| v as u64),
+                interrupted_after_bytes: row.get::<_, Option<i64>>(11)?.map(|v| v as u64),
                 attempts: Vec::new(),
             })
         })?;

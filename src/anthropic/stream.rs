@@ -184,6 +184,417 @@ fn find_real_thinking_start_tag(buffer: &str) -> Option<usize> {
     None
 }
 
+/// 检查 `name_pos`（指向标签名首字母）的前面是否构成合法的开标签起始，
+/// 兼容裸写法 `<tag` 和带命名空间前缀的写法 `<prefix:tag`。
+///
+/// 返回 `Some(lt_pos)`（指向 `<` 的字节位置）表示合法；`None` 表示不是标签。
+fn open_tag_lt_pos(buffer: &str, name_pos: usize) -> Option<usize> {
+    let bytes = buffer.as_bytes();
+    if name_pos == 0 {
+        return None;
+    }
+    let prev = bytes[name_pos - 1];
+    if prev == b'<' {
+        return Some(name_pos - 1);
+    }
+    // 形如 `<prefix:tag`：name 前面是 ':'，再往前是一段标识符，再往前是 '<'
+    if prev == b':' {
+        let i = name_pos - 1; // 指向 ':'
+        let mut j = i; // 标识符左边界扫描
+        while j > 0 && {
+            let c = bytes[j - 1];
+            c.is_ascii_alphanumeric() || c == b'_'
+        } {
+            j -= 1;
+        }
+        // 标识符非空，且其左边是 '<'
+        if j < i && j > 0 && bytes[j - 1] == b'<' {
+            return Some(j - 1);
+        }
+    }
+    None
+}
+
+/// 查找未被引用字符包裹的 invoke 开标签，返回指向 `<` 的字节位置
+///
+/// 兼容裸 `<invoke ...>` 与带命名空间前缀 `<prefix:invoke ...>` 两种写法。
+/// 复用 `is_quote_char`：若 `<` 前紧贴反引号/引号等包裹字符，视为引用，跳过。
+fn find_invoke_start(buffer: &str) -> Option<usize> {
+    let mut search = 0;
+    while let Some(rel) = buffer[search..].find("invoke") {
+        let name_pos = search + rel;
+        if let Some(lt) = open_tag_lt_pos(buffer, name_pos) {
+            // 标签名后必须是边界字符（空白或 '>'），避免误匹配 invoked 之类
+            let after = name_pos + "invoke".len();
+            let next_ok = buffer.as_bytes().get(after).map_or(true, |c| {
+                c.is_ascii_whitespace() || *c == b'>' || *c == b'/'
+            });
+            let has_quote_before = lt > 0 && is_quote_char(buffer, lt - 1);
+            if next_ok && !has_quote_before {
+                return Some(lt);
+            }
+        }
+        search = name_pos + "invoke".len();
+    }
+    None
+}
+
+/// 从 `start` 之后查找第一个 invoke 闭标签，返回结束位置（exclusive，含闭标签）
+///
+/// 兼容裸 `</invoke>` 与带前缀 `</prefix:invoke>`。找不到返回 `None`（块还没到齐）。
+fn find_invoke_block_end(buffer: &str, start: usize) -> Option<usize> {
+    // 块 A 的边界 = 下一个 `<invoke` 开标签（即下一个块 B 的起点），没有则到 buffer 结尾。
+    // 这样连发 burst（A 紧跟 B）时，A 的搜索区间被 B 的开标签卡住，绝不会吃进 B。
+    let boundary = match find_next_invoke_open(buffer, start) {
+        Some(p) => p,
+        None => buffer.len(),
+    };
+    // 在 [start, boundary) 区间里取【最后一个】 `</invoke>` 作为真闭合。
+    // 贪婪取最后一个 → patch 正文里出现的字面 `</invoke>` 不会导致提前截断；
+    // 区间被下一个块开标签卡住 → 不会跨块误合并。
+    find_last_invoke_close(buffer, start, boundary)
+}
+
+/// 从 `start` 之后查找下一个真正的 `<invoke`（或 `<prefix:invoke`）开标签的字节位置。
+/// 跳过 `start` 处当前块自身的开标签。
+fn find_next_invoke_open(buffer: &str, start: usize) -> Option<usize> {
+    // 先跳过当前块的开标签：从 start 之后第一个 '>' 之后开始找。
+    let after_open = match buffer[start..].find('>') {
+        Some(rel) => start + rel + 1,
+        None => return None,
+    };
+    // 注意：不能复用 find_invoke_start——它对 `<` 前是 `>`（引用字符）的情况会拒绝，
+    // 而连发 burst 里 B 的 `<invoke` 恰好紧跟在 A 的 `</invoke>` 的 `>` 后面。
+    // 这里只认结构：`<invoke` 或 `<prefix:invoke`，开标签名后须是空白/`>`/`/` 边界。
+    let region = &buffer[after_open..];
+    let mut search = 0usize;
+    while let Some(rel) = region[search..].find("invoke") {
+        let name_pos = search + rel;
+        if let Some(lt) = open_tag_lt_pos(region, name_pos) {
+            let after = name_pos + "invoke".len();
+            let next_ok = region.as_bytes().get(after).map_or(true, |c| {
+                c.is_ascii_whitespace() || *c == b'>' || *c == b'/'
+            });
+            if next_ok {
+                return Some(after_open + lt);
+            }
+        }
+        search = name_pos + "invoke".len();
+    }
+    None
+}
+
+/// 在 `[from, boundary)` 区间内查找最后一个 `</invoke>` / `</prefix:invoke>` 的结束位置
+/// （exclusive，含闭标签）。找不到返回 `None`（块还没到齐）。
+fn find_last_invoke_close(buffer: &str, from: usize, boundary: usize) -> Option<usize> {
+    let region_end = boundary.min(buffer.len());
+    if from >= region_end {
+        return None;
+    }
+    let region = &buffer[from..region_end];
+    let bytes = region.as_bytes();
+    let mut search = 0usize;
+    let mut last: Option<usize> = None;
+    while let Some(rel) = region[search..].find("invoke>") {
+        let name_pos = search + rel;
+        // '</invoke>' 形式
+        if name_pos >= 2 && &region[name_pos - 2..name_pos] == "</" {
+            last = Some(from + name_pos + "invoke>".len());
+        } else if name_pos >= 1 && bytes[name_pos - 1] == b':' {
+            // '</prefix:invoke>' 形式
+            let mut j = name_pos - 1; // ':'
+            while j > 0 && {
+                let c = bytes[j - 1];
+                c.is_ascii_alphanumeric() || c == b'_'
+            } {
+                j -= 1;
+            }
+            if j >= 2 && &region[j - 2..j] == "</" {
+                last = Some(from + name_pos + "invoke>".len());
+            }
+        }
+        search = name_pos + "invoke>".len();
+    }
+    last
+}
+
+/// 从标签字符串中抠出 `name="..."` 的值（取第一个匹配）
+fn extract_name_attr(tag: &str) -> Option<String> {
+    let needle = "name=\"";
+    let rel = tag.find(needle)?;
+    let start = rel + needle.len();
+    let end_rel = tag[start..].find('"')?;
+    Some(tag[start..start + end_rel].to_string())
+}
+
+/// 解析一个完整 invoke 块，抠出 (tool_name, input_json_string)
+///
+/// - tool name 来自 invoke 开标签的 `name="..."`（兼容 antml: 前缀）
+/// - 参数为零个或多个 `<parameter name="K">V</parameter>`（兼容前缀）
+/// - 参数值取到下一个参数开标签前的**最后一个** `</parameter>` 为界（贪婪），
+///   允许多行 / 含 `<` / 中文 / 含字面 `</parameter>`（P0-1 修复）
+/// - 用 serde_json 拼成 object（值都是字符串，自动转义）
+/// - 无合法 name 或拼不出合法 JSON 返回 `None`
+fn parse_invoke_block(block: &str) -> Option<(String, String)> {
+    // invoke 开标签 = 块开头到第一个 '>'
+    let open_end = block.find('>')?;
+    let open_tag = &block[..=open_end];
+    let tool_name = extract_name_attr(open_tag)?;
+    if tool_name.is_empty() {
+        return None;
+    }
+
+    let mut map = serde_json::Map::new();
+    let body = &block[open_end + 1..];
+    let mut cursor = 0usize;
+    while let Some(rel) = body[cursor..].find("parameter name=\"") {
+        let name_kw = cursor + rel;
+        // 确认是真正的 '<parameter' 或 '<prefix:parameter' 开标签
+        // name_kw 指向 'parameter'，往前应是 '<' 或 '<prefix:'
+        let lt = match open_tag_lt_pos(body, name_kw) {
+            Some(p) => p,
+            None => {
+                cursor = name_kw + "parameter".len();
+                continue;
+            }
+        };
+        let _ = lt;
+        // 找该参数开标签的 '>'
+        let tag_gt = match body[name_kw..].find('>') {
+            Some(r) => name_kw + r,
+            None => break, // 开标签未闭合，停止
+        };
+        let param_open_tag = &body[name_kw..tag_gt + 1];
+        // 从 'parameter name="..."' 抠 key（剥掉前缀干扰：直接找 name="）
+        let key = match extract_name_attr(param_open_tag) {
+            Some(k) => k,
+            None => {
+                cursor = tag_gt + 1;
+                continue;
+            }
+        };
+        // 参数值取到第一个 </parameter>（兼容前缀）为界
+        let val_start = tag_gt + 1;
+        let close_rel = match find_param_close(body, val_start) {
+            Some((s, _)) => s,
+            None => break, // 值未闭合，停止
+        };
+        let value = &body[val_start..close_rel];
+        map.insert(key, serde_json::Value::String(value.to_string()));
+        // 推进到闭标签之后
+        cursor = match find_param_close(body, val_start) {
+            Some((_, e)) => e,
+            None => break,
+        };
+    }
+
+    let obj = serde_json::Value::Object(map);
+    let s = serde_json::to_string(&obj).ok()?;
+    Some((tool_name, s))
+}
+
+/// 从 `from` 开始查找第一个 parameter 闭标签，返回 (起始位置, 结束位置 exclusive)
+///
+/// 兼容裸 `</parameter>` 与带前缀 `</prefix:parameter>`。
+fn find_param_close(body: &str, from: usize) -> Option<(usize, usize)> {
+    // P0-1：参数值（尤其 apply_patch 的 patch 正文）可能含字面 `</parameter>`。
+    // 朴素「取第一个 </parameter>」会把值截断。改成「贪婪取边界内最后一个 </parameter>」：
+    // 边界 = 下一个 `<parameter name="` 开标签（多参数场景），没有则到 body 结尾。
+    // 这样：① 单参数（含 apply_patch）取到真正的最后一个闭合，内容里的字面闭合不误伤；
+    //      ② 多参数仍按下一个参数开标签正确切分。
+    // 局限（已诚实标注）：若参数值里同时含字面 `<parameter name="`，边界判定会偏早；
+    // 实测 apply_patch 正文极少出现该字面串，可接受。
+    let boundary = match find_next_param_open(body, from) {
+        Some(p) => p,
+        None => body.len(),
+    };
+    let region = &body[from..boundary];
+    let kw = "parameter>";
+    let mut last: Option<(usize, usize)> = None;
+    let mut search = 0usize;
+    let bytes = region.as_bytes();
+    while let Some(rel) = region[search..].find(kw) {
+        let name_pos = search + rel;
+        // '</parameter>' 形式
+        if name_pos >= 2 && &region[name_pos - 2..name_pos] == "</" {
+            last = Some((from + name_pos - 2, from + name_pos + kw.len()));
+        } else if name_pos >= 1 && bytes[name_pos - 1] == b':' {
+            // '</prefix:parameter>' 形式
+            let mut j = name_pos - 1; // ':'
+            while j > 0 && {
+                let c = bytes[j - 1];
+                c.is_ascii_alphanumeric() || c == b'_'
+            } {
+                j -= 1;
+            }
+            if j >= 2 && &region[j - 2..j] == "</" {
+                last = Some((from + j - 2, from + name_pos + kw.len()));
+            }
+        }
+        search = name_pos + kw.len();
+    }
+    last
+}
+
+/// 从 `from` 开始查找下一个 `<parameter name="`（或 `<prefix:parameter name="`）开标签的字节位置。
+/// 用于 `find_param_close` 的贪婪边界：当前参数值最多吃到下一个参数开标签之前。
+fn find_next_param_open(body: &str, from: usize) -> Option<usize> {
+    let mut search = from;
+    while let Some(rel) = body[search..].find("parameter name=\"") {
+        let kw_pos = search + rel;
+        // 必须是真正的开标签：'parameter' 前面是 '<' 或 '<prefix:'
+        if let Some(lt) = open_tag_lt_pos(body, kw_pos) {
+            return Some(lt);
+        }
+        search = kw_pos + "parameter".len();
+    }
+    None
+}
+
+/// 剥掉块前文本尾部的独立 stray token 行（单独一行的 `call` 或 `count`）
+///
+/// 实测里 `<invoke>` 前常出现一行裸 `call`/`count`，需要从块前叙述文本里剥掉，
+/// 避免泄漏给客户端。只剥“尾部、且独占一行”的 stray token，前面的正常叙述保留。
+/// 已实测到的 stray token 集合：Opus 长上下文退化时，泄漏的 `<invoke>` 前常有一行裸的
+/// `call` / `count` / `card`。集合形式便于以后扩充。
+const STRAY_INVOKE_TOKENS: &[&str] = &["call", "count", "card"];
+
+/// 复读熔断阈值：同一个 stray token（call/count/card）连续作为独占一行重复出现
+/// 超过这么多次，判定为「Opus 长上下文退化复读死循环」，立即熔断本轮文本输出。
+///
+/// 取值权衡：正常工具调用前最多出现 1 个引导词行（偶有 2~3），绝不会连续几十次。
+/// 设为 32 远高于正常上限、又远低于退化时的数万次，既不误伤正常引导词，又能尽早止血。
+const REPEAT_GUARD_TRIP_THRESHOLD: u32 = 32;
+
+/// 块级复读折叠：对「已完整的整段文本」做一次性复读熔断。
+///
+/// 用于非流式 / web_search loop 路径（`extract_invoke_content_blocks` 入口）——
+/// 那条路不经过流式 `emit_text_delta_raw` 的逐 chunk 熔断，所以在这里独立兜一次。
+///
+/// 规则与流式版一致：同一个 `STRAY_INVOKE_TOKENS`（call/count/card）连续作为独占一行
+/// 重复超过 `REPEAT_GUARD_TRIP_THRESHOLD` 次，判定为 Opus 退化复读，**从超阈值处截断**，
+/// 丢弃其后的全部复读垃圾（断雪球、不灌历史）。阈值内的少量引导词重复原样保留。
+fn collapse_stray_token_floods(text: &str) -> std::borrow::Cow<'_, str> {
+    let mut last_line = "";
+    let mut run: u32 = 0;
+    let mut cut_at: Option<usize> = None;
+    let mut offset = 0usize;
+    for segment in text.split_inclusive('\n') {
+        let line = segment.trim();
+        if STRAY_INVOKE_TOKENS.contains(&line) {
+            if line == last_line {
+                run += 1;
+            } else {
+                last_line = line;
+                run = 1;
+            }
+            if run >= REPEAT_GUARD_TRIP_THRESHOLD {
+                // 从「本段（这一行）开头」截断：保留阈值内已累计的内容。
+                cut_at = Some(offset);
+                break;
+            }
+        } else if !line.is_empty() {
+            last_line = line;
+            run = 0;
+        }
+        offset += segment.len();
+    }
+    match cut_at {
+        Some(pos) => std::borrow::Cow::Owned(text[..pos].to_string()),
+        None => std::borrow::Cow::Borrowed(text),
+    }
+}
+
+fn strip_trailing_stray_tokens(before: &str) -> &str {
+    let mut end = before.len();
+    loop {
+        let bytes = before.as_bytes();
+        // 先跳过尾部的换行符，定位“最后一行”的真实结束位置
+        let mut e = end;
+        while e > 0 && (bytes[e - 1] == b'\n' || bytes[e - 1] == b'\r') {
+            e -= 1;
+        }
+        let line_start = before[..e].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let last_line = before[line_start..e].trim();
+        // Opus 长上下文退化时，泄漏的 <invoke> 前常有一个孤立的 stray token 行。
+        // 实测样本里出现过 call / count / card 三种；用集合便于以后扩充。
+        if STRAY_INVOKE_TOKENS.contains(&last_line) {
+            // 连同其前面的换行一起剥掉
+            end = if line_start == 0 { 0 } else { line_start - 1 };
+            if end == 0 {
+                return "";
+            }
+        } else {
+            break;
+        }
+    }
+    &before[..end]
+}
+
+/// 判定一个 `<invoke>` 块到底像“真泄漏的工具调用”还是“正文里讨论的文本”
+///
+/// 实测真泄漏的 `<invoke>` 都出现在**行首**（前面是流的开头、或上一行已经换行结束），
+/// 而正文讨论里的 `<invoke>` 一般**嵌在一句话中间**——前面同一行还有普通文字。
+///
+/// 判定规则（输入 `before` 是 `<invoke>` 之前、已剥过 stray token 的文本）：
+/// - `before` 为空（`<invoke>` 在流开头）→ 像真泄漏，抓。
+/// - `before` 去掉尾部空格/制表符后以换行结尾（`<invoke>` 独占新行）→ 抓。
+/// - 否则（同一行前面还有非空白正文）→ 像讨论文本，不抓。
+///
+/// 注意：这里的“尾部空白”只剥行内空白（空格 / 制表符），不剥换行；
+/// 换行结尾才是“另起一行”的信号。
+fn invoke_looks_like_real_leak(before: &str) -> bool {
+    // 剥掉尾部的行内空白（空格 / 制表符），但保留换行
+    let trimmed = before.trim_end_matches([' ', '\t']);
+    // 行首：要么前面什么都没有，要么上一行已经以换行结束
+    trimmed.is_empty() || trimmed.ends_with('\n') || trimmed.ends_with('\r')
+}
+
+/// 推进「代码围栏」奇偶状态，对切分到多个 chunk 的 ``` 分隔符鲁棒。
+///
+/// 只在遇到换行符时才对「已重组的完整行」判定是否为围栏行（行首去空白后以 ``` 开头）。
+/// 未遇换行的尾部留在 `partial` 里，等后续 chunk 拼齐——所以即使 ``` 被切成
+/// `` `` `` + `` ` `` 两个 chunk，重组成完整行后仍能正确翻转 `open`。
+///
+/// 返回值仅在内部使用；主要副作用是更新 `open` 与 `partial`。
+fn advance_code_fence_state(open: &mut bool, partial: &mut String, text: &str) {
+    for ch in text.chars() {
+        if ch == '\n' {
+            if partial.trim_start().starts_with("```") {
+                *open = !*open;
+            }
+            partial.clear();
+        } else {
+            partial.push(ch);
+        }
+    }
+}
+
+/// 纯函数：在不改动真实状态的前提下，试算「把 `text` 走完之后围栏是否打开」。
+/// 用于 drain 决策处判断某个 `<invoke>` 是否落在围栏内。
+fn fence_open_after(open: bool, partial: &str, text: &str) -> bool {
+    let mut o = open;
+    let mut p = partial.to_string();
+    advance_code_fence_state(&mut o, &mut p, text);
+    // 还要考虑：partial 里残留的「未换行行」如果本身已经是 ``` 开头，
+    // 它在遇到换行前不算翻转（保守：只有完整行才翻转）。这里返回已翻转的 o。
+    o
+}
+
+/// 计算缓冲区末尾“可能是部分 `<invoke` 开标签前缀”的字节数，需要保留等待更多内容
+///
+/// 例如缓冲区以 `<inv` / `<` / `<i` 结尾时，可能是被切碎的 invoke 开标签，
+/// 保留这段尾巴等下一个 chunk 拼齐，避免把半个标签当文本吐出去。
+fn partial_invoke_tag_suffix_len(buf: &str) -> usize {
+    // 任何形如 `<...`（最后一个 '<' 之后没有 '>'）的尾巴都可能是部分开标签
+    if let Some(lt) = buf.rfind('<') {
+        if !buf[lt..].contains('>') {
+            return buf.len() - lt;
+        }
+    }
+    0
+}
+
 /// 从完整文本中提取 thinking 块（用于非流式响应）
 ///
 /// 使用与流式处理相同的标签检测逻辑（引用字符过滤），确保一致性。
@@ -230,6 +641,110 @@ pub(crate) fn extract_thinking_from_complete_text(text: &str) -> (Option<String>
     } else {
         (Some(thinking_content.to_string()), remaining)
     }
+}
+
+/// 一次性（非流式 / 整段已完整）把 assistant 文本切成 Anthropic content block 序列，
+/// 把混在文本里的字面 `<invoke name="...">...</invoke>` 工具调用捞回成结构化 `tool_use`。
+///
+/// 复用与流式 `drain_invoke_sniff_buffer` **完全相同**的安全判定，避免误抓正文里讨论的命令：
+///   ① 行首判定 `invoke_looks_like_real_leak`（块前去 stray token 后须在行首）
+///   ② 代码围栏判定 `fence_open_after`（被 ``` 包裹的展示文本不捞）
+///   ③ 工具表硬护栏 `known_tool_names`（解析出的工具名必须是本次请求声明的工具）
+/// 任一不满足 → 该 `<invoke>` 块当普通文本原样保留。
+///
+/// 与流式版本的区别：这里输入是**已完整**的整段文本，所以不需要 hold 缓冲、
+/// 部分开标签、`MAX_INVOKE_HOLD_BYTES` 那套增量逻辑——直接线性扫描即可。
+///
+/// 返回的 content block 形态与调用方现有约定一致：
+///   - 文本：`{"type":"text","text": "..."}`
+///   - 工具：`{"type":"tool_use","id":"toolu_...","name":"...","input": {...}}`
+/// 文本块按需合并相邻片段；空文本片段不产出。`input` 解析失败时 fall back 成 `{}`。
+///
+/// `tool_name_map`（短名 → 原始名）用于把捞回的工具名还原成客户端可识别的原始名，
+/// 与流式 `synthesize_tool_use` 一致；映射为空或命中失败时按原名返回。
+pub(crate) fn extract_invoke_content_blocks(
+    text: &str,
+    known_tool_names: &std::collections::HashSet<String>,
+    tool_name_map: &std::collections::HashMap<String, String>,
+) -> Vec<serde_json::Value> {
+    // 🛑 块级复读熔断：先把 Opus 退化的「同一 stray token 连续复读」截断，
+    // 再做 invoke 嗅探。覆盖 web_search loop（99.9% 真实流量）这条非流式路径。
+    let collapsed = collapse_stray_token_floods(text);
+    let text: &str = &collapsed;
+    let mut blocks: Vec<serde_json::Value> = Vec::new();
+    let mut pending_text = String::new();
+    // 围栏奇偶状态：跨「已吐出的文本」累进，确保 ``` 跨片段也能正确判定。
+    let mut fence_open = false;
+    let mut fence_partial = String::new();
+
+    let push_text = |blocks: &mut Vec<serde_json::Value>, pending: &mut String| {
+        if !pending.is_empty() {
+            blocks.push(serde_json::json!({"type": "text", "text": pending.clone()}));
+            pending.clear();
+        }
+    };
+
+    let mut rest = text;
+    loop {
+        let start = match find_invoke_start(rest) {
+            Some(s) => s,
+            None => {
+                pending_text.push_str(rest);
+                break;
+            }
+        };
+        let end = match find_invoke_block_end(rest, start) {
+            Some(e) => e,
+            None => {
+                // 块没闭合（整段已完整仍未见 </invoke>）→ 不是干净的工具调用，整段当文本。
+                pending_text.push_str(rest);
+                break;
+            }
+        };
+
+        let before = &rest[..start];
+        let stripped_before = strip_trailing_stray_tokens(before);
+        // ③ 围栏：在「块之前的文本」走完后围栏是否打开
+        let fence_after_before = fence_open_after(fence_open, &fence_partial, before);
+        // ② 工具名解析 + 工具表护栏
+        let parsed = parse_invoke_block(&rest[start..end]);
+        let name_known = parsed
+            .as_ref()
+            .map(|(n, _)| known_tool_names.contains(n))
+            .unwrap_or(false);
+
+        if invoke_looks_like_real_leak(stripped_before) && !fence_after_before && name_known {
+            // 真泄漏：保留剥过 stray token 的前文（推进围栏），再产出结构化 tool_use。
+            if !stripped_before.is_empty() {
+                advance_code_fence_state(&mut fence_open, &mut fence_partial, stripped_before);
+                pending_text.push_str(stripped_before);
+            }
+            push_text(&mut blocks, &mut pending_text);
+            let (name, input_json) = parsed.expect("parsed is Some when name_known");
+            let input: serde_json::Value =
+                serde_json::from_str(&input_json).unwrap_or_else(|_| serde_json::json!({}));
+            // Restore the original (client-facing) tool name: long names (>63) are shortened
+            // before being sent upstream, so the model may leak the SHORT name. The host
+            // matches on the original name — mirror synthesize_tool_use's restoration.
+            let name = tool_name_map.get(&name).cloned().unwrap_or(name);
+            let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
+            blocks.push(serde_json::json!({
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": name,
+                "input": input,
+            }));
+        } else {
+            // 不捞（句中 / 围栏内 / 工具名未知 / 解析失败）→ 整块（含 before）当文本，推进围栏。
+            let chunk = &rest[..end];
+            advance_code_fence_state(&mut fence_open, &mut fence_partial, chunk);
+            pending_text.push_str(chunk);
+        }
+        rest = &rest[end..];
+    }
+
+    push_text(&mut blocks, &mut pending_text);
+    blocks
 }
 
 /// SSE 事件
@@ -538,10 +1053,22 @@ pub struct StreamContext {
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
     pub tool_name_map: HashMap<String, String>,
+    /// 本次请求声明的所有工具名（原始 client 名）。`<invoke>` 文本容错的灾难兜底：
+    /// 只有合成名在此集合里才允许捞回成结构化 tool_use，否则当文本吐出。
+    /// 为空（请求未带 tools）时不捞回任何 invoke——宁可漏捞，不可误执行。
+    pub known_tool_names: std::collections::HashSet<String>,
+    /// 跨整条流的「代码围栏」奇偶状态：每遇到一行以 ``` 开头就翻转。
+    /// 在围栏内（true）时，`<invoke>` 一律不捞回（视为正文展示的代码块）。
+    pub code_fence_open: bool,
+    /// 围栏检测的「未完成行」累加器：只在遇到换行时才对完整行判定是否为 ``` 围栏行。
+    /// 这样即使 ``` 分隔符被切分到多个 chunk（如 `` `` + ` ``），重组成完整行后仍能正确识别。
+    pub fence_scan_partial: String,
     /// thinking 是否启用
     pub thinking_enabled: bool,
     /// thinking 内容缓冲区
     pub thinking_buffer: String,
+    /// invoke 文本嗅探缓冲区（用于从明文流里嗅探字面 `<invoke>` 工具调用块）
+    pub invoke_sniff_buffer: String,
     /// 是否在 thinking 块内
     pub in_thinking_block: bool,
     /// thinking 块是否已提取完成
@@ -559,6 +1086,14 @@ pub struct StreamContext {
     pub cache_read_input_tokens: i32,
     /// meteringEvent 上报的 credit 计费量（上游真实下发）
     pub credits: f64,
+    /// 复读熔断：最近一次作为文本吐出的「尾行」内容（去空白）。
+    /// Opus 长上下文退化时会把同一个 stray token（call/count/card）一行一行无限复读，
+    /// 我们在文本出口处统计「同一短行连续重复了多少次」。
+    repeat_guard_last_line: String,
+    /// 复读熔断：当前尾行已连续重复的次数。
+    repeat_guard_run: u32,
+    /// 复读熔断：是否已经触发过熔断（触发后本轮后续文本一律丢弃，不再吐、不写历史）。
+    repeat_guard_tripped: bool,
 }
 
 impl StreamContext {
@@ -568,6 +1103,7 @@ impl StreamContext {
         input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
+        known_tool_names: std::collections::HashSet<String>,
     ) -> Self {
         Self {
             state_manager: SseStateManager::new(),
@@ -578,8 +1114,12 @@ impl StreamContext {
             output_tokens: 0,
             tool_block_indices: HashMap::new(),
             tool_name_map,
+            known_tool_names,
+            code_fence_open: false,
+            fence_scan_partial: String::new(),
             thinking_enabled,
             thinking_buffer: String::new(),
+            invoke_sniff_buffer: String::new(),
             in_thinking_block: false,
             thinking_extracted: false,
             thinking_block_index: None,
@@ -588,6 +1128,9 @@ impl StreamContext {
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
             credits: 0.0,
+            repeat_guard_last_line: String::new(),
+            repeat_guard_run: 0,
+            repeat_guard_tripped: false,
         }
     }
 
@@ -870,14 +1413,256 @@ impl StreamContext {
         events
     }
 
-    /// 创建 text_delta 事件
+    /// 创建 text_delta 事件（带 invoke 嗅探的统一明文漏斗）
+    ///
+    /// 这是 thinking / 非 thinking 两条路径 + 两个端点唯一共用的明文出口。
+    /// 在这里把文本累进 `invoke_sniff_buffer`，循环嗅探完整的字面 `<invoke>` 工具调用块：
+    /// - 命中完整块：先把块前文本（剥掉尾部独立的 `call`/`count` 行）走 `emit_text_delta_raw` 吐出，
+    ///   再合成结构化 tool_use 事件，再继续循环；
+    /// - 未命中完整块：保留可能的部分标签尾巴留在缓冲区，其余走 `emit_text_delta_raw`。
+    fn create_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
+        if text.is_empty() {
+            return Vec::new();
+        }
+        self.invoke_sniff_buffer.push_str(text);
+        self.drain_invoke_sniff_buffer(false)
+    }
+
+    /// 行首未闭合 `<invoke` 块的字节上限。仅用于防止"行首一个永不闭合的 `<invoke`
+    /// 把整条流永久 hold 住"这种极端情况；正常的 invoke（哪怕是大 patch）都远小于此，
+    /// 所以不会误杀合法的多行/分片工具调用。
+    const MAX_INVOKE_HOLD_BYTES: usize = 262_144;
+
+    /// 嗅探并排空 `invoke_sniff_buffer`
+    ///
+    /// - `flush=false`（流式中途）：未命中完整块时，保留可能是部分标签的尾巴（最长一个未闭合
+    ///   `<invoke` 块或一段疑似开标签前缀），其余前缀文本走 `emit_text_delta_raw` 吐出。
+    /// - `flush=true`（流末尾）：不再保留尾巴，剩余全部走 `emit_text_delta_raw` 吐出（防尾字节丢）。
+    fn drain_invoke_sniff_buffer(&mut self, flush: bool) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        loop {
+            let buf = self.invoke_sniff_buffer.clone();
+            match find_invoke_start(&buf) {
+                Some(start) => {
+                    match find_invoke_block_end(&buf, start) {
+                        Some(end) => {
+                            // 命中完整块：先判定它像真泄漏还是正文讨论（P1 歧义信号）
+                            let before = strip_trailing_stray_tokens(&buf[..start]);
+                            // 🅱 先把 before 里的围栏开合并进一个「试算」状态：如果这个 <invoke>
+                            // 落在代码围栏内（正文展示的代码块），一律不捞回，当文本吐出。
+                            let fence_after_before = fence_open_after(
+                                self.code_fence_open,
+                                &self.fence_scan_partial,
+                                before,
+                            );
+                            // 🅳 灾难兜底：只有解析出的工具名在本次请求声明的工具表里，才允许捞回。
+                            // 表为空（请求没带 tools）或名字不在表里 → 当文本吐，宁可漏捞不可误执行。
+                            let parsed = parse_invoke_block(&buf[start..end]);
+                            let name_known = parsed
+                                .as_ref()
+                                .map(|(n, _)| self.known_tool_names.contains(n))
+                                .unwrap_or(false);
+                            if invoke_looks_like_real_leak(before) && !fence_after_before && name_known {
+                                // 真泄漏：吐块前文本（剥掉尾部独立的 call/count 行）+ 合成 tool_use
+                                if !before.is_empty() {
+                                    events.extend(self.emit_text_delta_raw(before));
+                                }
+                                // parsed 在上面已确认是 Some 且 name_known
+                                let (name, input_json) = parsed.expect("parsed is Some when name_known");
+                                events.extend(self.synthesize_tool_use(name, input_json));
+                            } else {
+                                // 不捞回（嵌句中 / 围栏内 / 工具名未知 / 解析失败）→ 整段当普通文本吐出
+                                events.extend(self.emit_text_delta_raw(&buf[..end]));
+                            }
+                            // 推进缓冲区到块之后，继续循环
+                            self.invoke_sniff_buffer = buf[end..].to_string();
+                        }
+                        None => {
+                            // 块还没到齐。先用 P1 行首判定：不在行首的 <invoke 当讨论文本，
+                            // 直接整段吐出，不进 hold 缓冲（P2：避免 hold 住后续文本到流末尾）。
+                            let before = strip_trailing_stray_tokens(&buf[..start]);
+                            // 🅱 围栏内的未闭合 <invoke> 也不 hold（是正文代码块），直接当文本吐。
+                            let fence_after_before = fence_open_after(
+                                self.code_fence_open,
+                                &self.fence_scan_partial,
+                                before,
+                            );
+                            if !invoke_looks_like_real_leak(before) || fence_after_before {
+                                let rest = std::mem::take(&mut self.invoke_sniff_buffer);
+                                if !rest.is_empty() {
+                                    events.extend(self.emit_text_delta_raw(&rest));
+                                }
+                                break;
+                            }
+                            // 行首的未闭合块：把 start 之前的文本吐出，保留 start.. 等闭合
+                            if start > 0 {
+                                events.extend(self.emit_text_delta_raw(&buf[..start]));
+                            }
+                            self.invoke_sniff_buffer = buf[start..].to_string();
+                            if flush {
+                                // flush 模式：残留半块当普通文本吐出
+                                let rest = std::mem::take(&mut self.invoke_sniff_buffer);
+                                if !rest.is_empty() {
+                                    events.extend(self.emit_text_delta_raw(&rest));
+                                }
+                            } else {
+                                // P2 上限：hold 的 <invoke 块累计超过阈值仍没等到 </invoke>，
+                                // 放弃等待，当普通文本吐出，避免无限期 hold 后续文本。
+                                // 仅用纯字节上限兜底"永不闭合的 `<invoke` 把流卡死"；
+                                // 不再按换行数放弃——多行参数（apply_patch 等）是常态，
+                                // 换行数不是放弃 hold 的好信号，否则会误杀分片到达的合法 invoke。
+                                let held = &self.invoke_sniff_buffer;
+                                let too_long = held.len() > Self::MAX_INVOKE_HOLD_BYTES;
+                                if too_long {
+                                    let rest = std::mem::take(&mut self.invoke_sniff_buffer);
+                                    events.extend(self.emit_text_delta_raw(&rest));
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                None => {
+                    // 没有任何 invoke 开标签
+                    if flush {
+                        let rest = std::mem::take(&mut self.invoke_sniff_buffer);
+                        if !rest.is_empty() {
+                            events.extend(self.emit_text_delta_raw(&rest));
+                        }
+                    } else {
+                        // 保留一段可能是部分 `<invoke` 开标签前缀的尾巴，其余吐出
+                        let keep = partial_invoke_tag_suffix_len(&buf);
+                        let split = buf.len() - keep;
+                        let safe = find_char_boundary(&buf, split);
+                        if safe > 0 {
+                            events.extend(self.emit_text_delta_raw(&buf[..safe]));
+                        }
+                        self.invoke_sniff_buffer = buf[safe..].to_string();
+                    }
+                    break;
+                }
+            }
+        }
+        events
+    }
+
+    /// 合成一组结构化 tool_use 事件（照抄 process_tool_use 的 6 步）
+    fn synthesize_tool_use(&mut self, parsed_name: String, input_json: String) -> Vec<SseEvent> {
+        let mut events = Vec::new();
+        self.state_manager.set_has_tool_use(true);
+        let block_index = self.state_manager.next_block_index();
+        let tool_use_id = format!("toolu_{}", Uuid::new_v4().to_string().replace('-', ""));
+        self.tool_block_indices
+            .insert(tool_use_id.clone(), block_index);
+        let name = self
+            .tool_name_map
+            .get(&parsed_name)
+            .cloned()
+            .unwrap_or(parsed_name);
+        events.extend(self.state_manager.handle_content_block_start(
+            block_index,
+            "tool_use",
+            json!({
+                "type": "content_block_start",
+                "index": block_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tool_use_id,
+                    "name": name,
+                    "input": {}
+                }
+            }),
+        ));
+        if let Some(d) = self.state_manager.handle_content_block_delta(
+            block_index,
+            json!({
+                "type": "content_block_delta",
+                "index": block_index,
+                "delta": {
+                    "type": "input_json_delta",
+                    "partial_json": input_json
+                }
+            }),
+        ) {
+            events.push(d);
+        }
+        if let Some(s) = self.state_manager.handle_content_block_stop(block_index) {
+            events.push(s);
+        }
+        events
+    }
+
+    /// 创建 text_delta 事件（原始逻辑，无嗅探）
     ///
     /// 如果文本块尚未创建，会先创建文本块。
     /// 当发生 tool_use 时，状态机会自动关闭当前文本块；后续文本会自动创建新的文本块继续输出。
     ///
     /// 返回值包含可能的 content_block_start 事件和 content_block_delta 事件。
-    fn create_text_delta_events(&mut self, text: &str) -> Vec<SseEvent> {
+    /// 复读熔断过滤器：在文本真正吐给客户端之前，逐行检测「同一 stray token 连续复读」。
+    ///
+    /// 工作方式（流式安全，跨 chunk 累计）：
+    /// - 把进来的 `text` 按行切，逐行和上一行（去空白）比较；
+    /// - 只对 `STRAY_INVOKE_TOKENS`（call/count/card）这类退化引导词计数，普通文本一律放行；
+    /// - 同一 stray token 连续重复达到 `REPEAT_GUARD_TRIP_THRESHOLD` 即「跳闸」；
+    /// - 跳闸后：本轮内后续任何文本（含继续复读的 count）一律丢弃，返回空串。
+    ///
+    /// 返回应当继续吐出的文本（跳闸时返回空串）。
+    fn repeat_guard_filter(&mut self, text: &str) -> String {
+        // 已跳闸：本轮剩余文本全部丢弃，断雪球。
+        if self.repeat_guard_tripped {
+            return String::new();
+        }
+
+        let mut kept = String::new();
+        // 用 split_inclusive 保留换行符，确保放行的正常文本不丢字节。
+        for segment in text.split_inclusive('\n') {
+            let line = segment.trim();
+            if STRAY_INVOKE_TOKENS.contains(&line) {
+                if line == self.repeat_guard_last_line {
+                    self.repeat_guard_run += 1;
+                } else {
+                    self.repeat_guard_last_line = line.to_string();
+                    self.repeat_guard_run = 1;
+                }
+                if self.repeat_guard_run >= REPEAT_GUARD_TRIP_THRESHOLD {
+                    // 跳闸：丢弃这一行及本轮后续所有文本。已经放行的 kept 保留
+                    // （阈值内的少量重复无害），但不再追加，并标记 tripped。
+                    self.repeat_guard_tripped = true;
+                    return kept;
+                }
+                // 阈值内：照常放行（少量引导词重复是正常的）。
+                kept.push_str(segment);
+            } else {
+                // 普通文本行（含空行）：重置复读计数，正常放行。
+                if !line.is_empty() {
+                    self.repeat_guard_last_line = line.to_string();
+                    self.repeat_guard_run = 0;
+                }
+                kept.push_str(segment);
+            }
+        }
+        kept
+    }
+
+    fn emit_text_delta_raw(&mut self, text: &str) -> Vec<SseEvent> {
         let mut events = Vec::new();
+
+        // 🛑 复读熔断（root cause: Opus 长上下文退化，把同一 stray token 一行行无限复读）。
+        // 在文本出口处过滤：一旦同一短行连续重复超过阈值，丢弃后续复读文本，
+        // 既不让它喷给客户端、不烧满 max_tokens，也不写进对话历史（断雪球）。
+        let kept = self.repeat_guard_filter(text);
+        if kept.is_empty() {
+            return events;
+        }
+        let text: &str = &kept;
+
+        // 🅱 维护跨流的代码围栏奇偶状态：所有真正作为「文本」吐出的内容都过这里，
+        // 在此累进围栏状态，使后续 <invoke> 能判断自己是否落在代码块内。
+        let mut fence_open = self.code_fence_open;
+        let mut fence_partial = std::mem::take(&mut self.fence_scan_partial);
+        advance_code_fence_state(&mut fence_open, &mut fence_partial, text);
+        self.code_fence_open = fence_open;
+        self.fence_scan_partial = fence_partial;
 
         // 如果当前 text_block_index 指向的块已经被关闭（例如 tool_use 开始时自动 stop），
         // 则丢弃该索引并创建新的文本块继续输出，避免 delta 被状态机拒绝导致“吞字”。
@@ -1176,6 +1961,12 @@ impl StreamContext {
             events.extend(self.create_text_delta_events(" "));
         }
 
+        // Flush invoke 嗅探缓冲区的残留：先再嗅探一次完整块（万一最后一块就是完整 invoke），
+        // 剩下的走 emit_text_delta_raw flush 出去（防尾字节丢）。
+        if !self.invoke_sniff_buffer.is_empty() {
+            events.extend(self.drain_invoke_sniff_buffer(true));
+        }
+
         // input: contextUsage 真实值优先；否则用客户端估算
         let final_input_tokens = self.context_input_tokens.unwrap_or(self.input_tokens);
 
@@ -1218,12 +2009,14 @@ impl BufferedStreamContext {
         estimated_input_tokens: i32,
         thinking_enabled: bool,
         tool_name_map: HashMap<String, String>,
+        known_tool_names: std::collections::HashSet<String>,
     ) -> Self {
         let inner = StreamContext::new_with_thinking(
             model,
             estimated_input_tokens,
             thinking_enabled,
             tool_name_map,
+            known_tool_names,
         );
         Self {
             inner,
@@ -1342,6 +2135,83 @@ pub fn estimate_tokens(text: &str) -> i32 {
 mod tests {
     use super::*;
 
+    /// 测试用的「已知工具表」：包含 invoke 测试里会合成的工具名，
+    /// 让 🅳 工具表校验放行这些名字，从而能验证捞回逻辑本身。
+    fn test_known_tools() -> std::collections::HashSet<String> {
+        ["exec_command", "apply_patch", "tool_a", "tool_b", "write_file", "wait_agent"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    // ---- extract_invoke_content_blocks: one-shot (non-streaming) reclamation ----
+
+    #[test]
+    fn extract_blocks_reclaims_clean_leak_and_strips_stray_token() {
+        let text = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">echo hi</parameter>\n</invoke>";
+        let blocks = extract_invoke_content_blocks(
+            text,
+            &test_known_tools(),
+            &std::collections::HashMap::new(),
+        );
+        let tu = blocks
+            .iter()
+            .find(|b| b["type"] == "tool_use")
+            .expect("must reclaim tool_use");
+        assert_eq!(tu["name"], "exec_command");
+        assert_eq!(tu["input"]["cmd"], "echo hi");
+        assert!(
+            !blocks.iter().any(|b| b["type"] == "text"
+                && b["text"].as_str().map(|t| t.contains("<invoke")).unwrap_or(false)),
+            "no literal <invoke> may remain as text"
+        );
+        assert!(
+            !blocks.iter().any(|b| b["type"] == "text" && b["text"] == "call\n"),
+            "stray token line must be stripped"
+        );
+    }
+
+    #[test]
+    fn extract_blocks_restores_shortened_name_via_map() {
+        let short = "shrunk_name_abcd1234";
+        let original = "an_extremely_long_original_tool_name_that_exceeds_the_limit";
+        let text = format!(
+            "call\n<invoke name=\"{}\">\n<parameter name=\"x\">y</parameter>\n</invoke>",
+            short
+        );
+        let mut known = std::collections::HashSet::new();
+        known.insert(short.to_string());
+        let mut map = std::collections::HashMap::new();
+        map.insert(short.to_string(), original.to_string());
+        let blocks = extract_invoke_content_blocks(&text, &known, &map);
+        let tu = blocks.iter().find(|b| b["type"] == "tool_use").expect("reclaimed");
+        assert_eq!(tu["name"], original, "shortened name must be restored to original");
+    }
+
+    #[test]
+    fn extract_blocks_does_not_reclaim_fenced_or_unknown() {
+        // fenced -> display, not reclaimed
+        let fenced = "see:\n```\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">rm -rf /</parameter>\n</invoke>\n```";
+        let b1 = extract_invoke_content_blocks(fenced, &test_known_tools(), &std::collections::HashMap::new());
+        assert!(!b1.iter().any(|b| b["type"] == "tool_use"), "fenced must not reclaim");
+        // unknown tool name -> not reclaimed
+        let unknown = "call\n<invoke name=\"not_a_real_tool\">\n<parameter name=\"x\">y</parameter>\n</invoke>";
+        let b2 = extract_invoke_content_blocks(unknown, &test_known_tools(), &std::collections::HashMap::new());
+        assert!(!b2.iter().any(|b| b["type"] == "tool_use"), "unknown name must not reclaim");
+    }
+
+    #[test]
+    fn extract_blocks_clean_text_is_single_unchanged_text_block() {
+        let blocks = extract_invoke_content_blocks(
+            "just a normal answer with no tool calls",
+            &test_known_tools(),
+            &std::collections::HashMap::new(),
+        );
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "just a normal answer with no tool calls");
+    }
+
     #[test]
     fn test_sse_event_format() {
         let event = SseEvent::new("message_start", json!({"type": "message_start"}));
@@ -1396,7 +2266,7 @@ mod tests {
             "mcp__very_long_original_tool_name".to_string(),
         );
 
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, map);
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, map, test_known_tools());
         let _ = ctx.generate_initial_events();
 
         // 模拟 Kiro 返回短名称的 tool_use
@@ -1422,7 +2292,7 @@ mod tests {
 
     #[test]
     fn test_text_delta_after_tool_use_restarts_text_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
 
         let initial_events = ctx.generate_initial_events();
         assert!(
@@ -1483,7 +2353,7 @@ mod tests {
     fn test_tool_use_flushes_pending_thinking_buffer_text_before_tool_block() {
         // thinking 模式下，短文本可能被暂存在 thinking_buffer 以等待 `<thinking>` 的跨 chunk 匹配。
         // 当紧接着出现 tool_use 时，应先 flush 这段文本，再开始 tool_use block。
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
         let _initial_events = ctx.generate_initial_events();
 
         // 两段短文本（各 2 个中文字符），总长度仍可能不足以满足 safe_len>0 的输出条件，
@@ -1690,7 +2560,7 @@ mod tests {
 
     #[test]
     fn test_tool_use_immediately_after_thinking_filters_end_tag_and_closes_thinking_block() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1745,7 +2615,7 @@ mod tests {
         // 客户端在 thinking 模式下要求 thinking 块带 signature 字段，否则下一轮回传时
         // 会抛出 "must be passed back to the API"。本测试验证 thinking 块结束前发送了
         // 一个非空的 signature_delta 事件。
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
         let _ = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1779,7 +2649,7 @@ mod tests {
 
     #[test]
     fn test_final_flush_filters_standalone_thinking_end_tag() {
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -1799,7 +2669,7 @@ mod tests {
     #[test]
     fn test_thinking_strips_leading_newline_same_chunk() {
         // <thinking>\n 在同一个 chunk 中，\n 应被剥离
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>\nHello world");
@@ -1828,7 +2698,7 @@ mod tests {
     #[test]
     fn test_thinking_strips_leading_newline_cross_chunk() {
         // <thinking> 在第一个 chunk 末尾，\n 在第二个 chunk 开头
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
         let _initial_events = ctx.generate_initial_events();
 
         let events1 = ctx.process_assistant_response("<thinking>");
@@ -1860,7 +2730,7 @@ mod tests {
     #[test]
     fn test_thinking_no_strip_when_no_leading_newline() {
         // <thinking> 后直接跟内容（无 \n），内容应完整保留
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>abc</thinking>\n\ntext");
@@ -1889,7 +2759,7 @@ mod tests {
     #[test]
     fn test_text_after_thinking_strips_leading_newlines() {
         // `</thinking>\n\n` 后的文本不应以 \n\n 开头
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
         let _initial_events = ctx.generate_initial_events();
 
         let events = ctx.process_assistant_response("<thinking>\nabc</thinking>\n\n你好");
@@ -1933,11 +2803,462 @@ mod tests {
             .collect()
     }
 
+    /// 辅助函数：从事件列表中提取所有合成的 tool_use 调用
+    ///
+    /// 抓 `content_block_start` 里 `content_block.type == "tool_use"` 的 name，
+    /// 再配对同 index 的 `input_json_delta.partial_json`，返回 (name, input_json)。
+    fn collect_tool_uses(events: &[SseEvent]) -> Vec<(String, String)> {
+        let mut result = Vec::new();
+        for e in events.iter() {
+            if e.event == "content_block_start" && e.data["content_block"]["type"] == "tool_use" {
+                let index = e.data["index"].as_i64();
+                let name = e.data["content_block"]["name"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                // 找同 index 的 input_json_delta
+                let input = events
+                    .iter()
+                    .find(|d| {
+                        d.event == "content_block_delta"
+                            && d.data["index"].as_i64() == index
+                            && d.data["delta"]["type"] == "input_json_delta"
+                    })
+                    .and_then(|d| d.data["delta"]["partial_json"].as_str())
+                    .unwrap_or("")
+                    .to_string();
+                result.push((name, input));
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn test_invoke_sniff_backtick_wrapped_is_not_captured() {
+        // 🔴 防误伤：被反引号包裹的 <invoke> 是引用，不应被抓
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response("示例：`<invoke name=\"x\">` 这种写法"));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert!(tools.is_empty(), "被反引号包裹的不应被抓: {:?}", tools);
+
+        let text = collect_text_content(&all);
+        assert!(
+            text.contains("<invoke name=\"x\">"),
+            "原文应原样保留在 text 中: {:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn test_invoke_sniff_single_bare_invoke() {
+        // 🟢 单个裸 invoke（无外壳）
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(
+            "<invoke name=\"exec_command\"><parameter name=\"cmd\">ls</parameter></invoke>",
+        ));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert_eq!(tools.len(), 1, "应合成 1 个 tool_use: {:?}", tools);
+        assert_eq!(tools[0].0, "exec_command", "name 应为 exec_command");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&tools[0].1).expect("input 应为合法 JSON");
+        assert_eq!(parsed["cmd"], "ls", "input 应含 cmd=ls");
+    }
+
+    #[test]
+    fn test_invoke_sniff_param_value_with_lt_multiline_chinese() {
+        // 🟢 参数值含 `<`、多行、中文 → 不被截断
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+
+        let value = "第一行 a < b\n第二行 路径 /tmp/中文";
+        let chunk = format!(
+            "<invoke name=\"write_file\"><parameter name=\"content\">{}</parameter></invoke>",
+            value
+        );
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(&chunk));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert_eq!(tools.len(), 1, "应合成 1 个 tool_use: {:?}", tools);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&tools[0].1).expect("input 应为合法 JSON");
+        assert_eq!(
+            parsed["content"], value,
+            "参数值应完整保留（含 < / 多行 / 中文）"
+        );
+    }
+
+    #[test]
+    fn test_invoke_sniff_two_invokes_sequential() {
+        // 🟢 2 个 invoke 串联 → 2 个 tool_use
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(
+            "<invoke name=\"tool_a\"><parameter name=\"x\">1</parameter></invoke><invoke name=\"tool_b\"><parameter name=\"y\">2</parameter></invoke>",
+        ));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert_eq!(tools.len(), 2, "应合成 2 个 tool_use: {:?}", tools);
+        assert_eq!(tools[0].0, "tool_a");
+        assert_eq!(tools[1].0, "tool_b");
+    }
+
+    #[test]
+    fn test_invoke_sniff_split_across_chunks() {
+        // 🟢 跨 chunk 分片：标签被切碎多次喂入
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response("<inv"));
+        all.extend(ctx.process_assistant_response("oke name=\"exec_command\">"));
+        all.extend(ctx.process_assistant_response("<parameter name=\"cmd\">ls</parameter></in"));
+        all.extend(ctx.process_assistant_response("voke>"));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert_eq!(tools.len(), 1, "跨 chunk 应合成 1 个 tool_use: {:?}", tools);
+        assert_eq!(tools[0].0, "exec_command");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&tools[0].1).expect("input 应为合法 JSON");
+        assert_eq!(parsed["cmd"], "ls");
+    }
+
+    #[test]
+    fn test_invoke_sniff_strips_stray_call_token() {
+        // 🟢 stray token：<invoke> 前有单独一行 `call` → 剥掉，text 不含残留 call
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(
+            "call\n<invoke name=\"exec_command\"><parameter name=\"cmd\">ls</parameter></invoke>",
+        ));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert_eq!(tools.len(), 1, "应合成 1 个 tool_use: {:?}", tools);
+
+        let text = collect_text_content(&all);
+        assert!(
+            !text.contains("call"),
+            "前置的 stray `call` 应被剥掉，text 不应残留: {:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn test_invoke_sniff_keeps_narrative_before_invoke() {
+        // 🟢 invoke 前有叙述：text 含"先看看"，1 个 tool_use
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(
+            "先看看\n<invoke name=\"exec_command\"><parameter name=\"cmd\">ls</parameter></invoke>",
+        ));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert_eq!(tools.len(), 1, "应合成 1 个 tool_use: {:?}", tools);
+
+        let text = collect_text_content(&all);
+        assert!(
+            text.contains("先看看"),
+            "叙述文本应保留在 text 中: {:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn test_invoke_sniff_truncated_block_not_captured() {
+        // 🔴 截断半块（无 </invoke> 闭合）→ 0 tool_use
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(
+            "<invoke name=\"exec_command\"><parameter name=\"cmd\">ls",
+        ));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert!(tools.is_empty(), "未闭合的块不应被抓: {:?}", tools);
+    }
+
+    #[test]
+    fn test_invoke_midsentence_not_captured() {
+        // 🔴 P1：正文里嵌在句子中间（无反引号、非行首）的 <invoke> 是讨论文本，不应被抓
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(
+            "解析器示意：模型吐出 <invoke name=\"exec_command\"><parameter name=\"cmd\">ls</parameter></invoke> 这种文本",
+        ));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert!(
+            tools.is_empty(),
+            "句中讨论的 <invoke> 不应被抓: {:?}",
+            tools
+        );
+
+        let text = collect_text_content(&all);
+        assert!(
+            text.contains("解析器示意") && text.contains("这种文本"),
+            "正文应完整保留（含前后叙述）: {:?}",
+            text
+        );
+        assert!(
+            text.contains("<invoke name=\"exec_command\">"),
+            "原 <invoke> 文本应原样保留在 text 中: {:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn test_invoke_midsentence_unclosed_not_hold() {
+        // 🔴 P2：流式中途遇到句中不闭合的 <invoke，不应 hold 住后续文本到流末尾
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+
+        // 第一次 process：句中不闭合的 <invoke>，前面同一行有正文“讨论”
+        let first = ctx.process_assistant_response("讨论 <invoke name=\"x\"> 语义，");
+        let first_text = collect_text_content(&first);
+        assert!(
+            first_text.contains("讨论"),
+            "句中不闭合的 <invoke 不应 hold 住正文，应及时吐出“讨论”: {:?}",
+            first_text
+        );
+
+        let mut all = first;
+        all.extend(ctx.process_assistant_response("后面内容。"));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert!(
+            tools.is_empty(),
+            "不闭合的句中 <invoke 不应被抓: {:?}",
+            tools
+        );
+
+        let text = collect_text_content(&all);
+        assert!(
+            text.contains("讨论") && text.contains("语义") && text.contains("后面内容。"),
+            "全部正文应完整保留: {:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn test_invoke_multiline_patch_split_still_captured() {
+        // 🟢 P3：行首合法 invoke，参数值是 20+ 行多行文本（模拟 apply_patch），
+        // 逐行流式喂入。修复前换行数 ≥16 会被 too_long 误杀降级成文本；修复后应抓到。
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+
+        // 构造一个 24 行的多行 patch 内容
+        let mut patch_lines = Vec::new();
+        for i in 0..24 {
+            patch_lines.push(format!("+ line number {i} of the patch body"));
+        }
+        let patch_value = patch_lines.join("\n");
+
+        // 整块拼好后，按行切片逐片喂入（每片末尾补回换行，最后一行不补）
+        let full = format!(
+            "<invoke name=\"apply_patch\"><parameter name=\"input\">{}</parameter></invoke>",
+            patch_value
+        );
+        let mut all = Vec::new();
+        // 按换行拆成片，逐片喂；保证 invoke 在每片到齐前换行数早已 ≥16
+        let bytes = full.as_bytes();
+        let mut idx = 0;
+        while idx < bytes.len() {
+            // 找到下一个换行边界（含换行）作为一片
+            let mut end = idx;
+            while end < bytes.len() && bytes[end] != b'\n' {
+                end += 1;
+            }
+            if end < bytes.len() {
+                end += 1; // 把换行也带上
+            }
+            let piece = std::str::from_utf8(&bytes[idx..end]).unwrap();
+            all.extend(ctx.process_assistant_response(piece));
+            idx = end;
+        }
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert_eq!(
+            tools.len(),
+            1,
+            "分片喂入的多行 invoke 应抓到 1 个 tool_use: {:?}",
+            tools
+        );
+        assert_eq!(tools[0].0, "apply_patch", "name 应为 apply_patch");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&tools[0].1).expect("input 应为合法 JSON");
+        assert_eq!(
+            parsed["input"], patch_value,
+            "多行参数值应完整保留（换行不丢）"
+        );
+    }
+
+    #[test]
+    fn test_invoke_large_patch_split_captured() {
+        // 🟢 P3：参数值 ~17KB 多行，分片喂入，断言抓到 1 个 tool_use（在 256KB 上限之下）。
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+
+        // 每行 ~70 字节 × 250 行 ≈ 17KB
+        let mut lines = Vec::new();
+        for i in 0..250 {
+            lines.push(format!(
+                "+ patch content row {i:04} padding xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            ));
+        }
+        let big_value = lines.join("\n");
+        assert!(
+            big_value.len() > 16 * 1024,
+            "测试数据应 >16KB，实际 {}",
+            big_value.len()
+        );
+
+        let full = format!(
+            "<invoke name=\"apply_patch\"><parameter name=\"input\">{}</parameter></invoke>",
+            big_value
+        );
+        // 固定 512 字节一片喂入（注意 UTF-8 边界，这里内容是 ASCII 安全）
+        let mut all = Vec::new();
+        let bytes = full.as_bytes();
+        let mut idx = 0;
+        while idx < bytes.len() {
+            let end = (idx + 512).min(bytes.len());
+            let piece = std::str::from_utf8(&bytes[idx..end]).unwrap();
+            all.extend(ctx.process_assistant_response(piece));
+            idx = end;
+        }
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert_eq!(
+            tools.len(),
+            1,
+            "~17KB 分片喂入的 invoke 应抓到 1 个 tool_use: {:?}",
+            tools.iter().map(|t| &t.0).collect::<Vec<_>>()
+        );
+        assert_eq!(tools[0].0, "apply_patch");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&tools[0].1).expect("input 应为合法 JSON");
+        assert_eq!(parsed["input"], big_value, "大 patch 参数值应完整保留");
+    }
+
+    #[test]
+    fn test_unclosed_invoke_eventually_flushed_as_text() {
+        // 🟢 锁定字节兜底仍在：行首 `<invoke>` 永不闭合、喂入超过 MAX_INVOKE_HOLD_BYTES，
+        // 应被当文本吐出（不无限 hold）。
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+
+        // 行首开标签，永不闭合；填充超过上限的纯文本（无 </invoke>）
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response("<invoke name=\"x\">"));
+        // 一次喂入超过上限的内容（用不含 `<` 的填充，避免触发其它路径）
+        let filler = "A".repeat(StreamContext::MAX_INVOKE_HOLD_BYTES + 1024);
+        all.extend(ctx.process_assistant_response(&filler));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert!(
+            tools.is_empty(),
+            "永不闭合的 invoke 不应被抓: {:?}",
+            tools.len()
+        );
+
+        let text = collect_text_content(&all);
+        assert!(
+            text.contains("<invoke name=\"x\">"),
+            "超上限的未闭合块应被当文本吐出（含开标签）"
+        );
+        assert!(
+            text.contains(&"A".repeat(100)),
+            "填充文本应被吐出，不应无限 hold"
+        );
+    }
+
+    #[test]
+    fn test_invoke_in_markdown_list_not_captured() {
+        // 🔴 markdown 列表项 `- <invoke>` 当讨论文本，不抓。
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(
+            "- <invoke name=\"exec_command\"><parameter name=\"cmd\">rm -rf /</parameter></invoke>",
+        ));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert!(
+            tools.is_empty(),
+            "markdown 列表里的 <invoke> 不应被抓: {:?}",
+            tools
+        );
+        let text = collect_text_content(&all);
+        assert!(
+            text.contains("rm -rf /"),
+            "危险命令应留在文本里、不被执行: {:?}",
+            text
+        );
+    }
+
+    #[test]
+    fn test_invoke_in_blockquote_not_captured() {
+        // 🔴 引用 `> <invoke>` 当讨论文本，不抓。
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(
+            "> <invoke name=\"exec_command\"><parameter name=\"cmd\">rm -rf /</parameter></invoke>",
+        ));
+        all.extend(ctx.generate_final_events());
+
+        let tools = collect_tool_uses(&all);
+        assert!(
+            tools.is_empty(),
+            "引用块里的 <invoke> 不应被抓: {:?}",
+            tools
+        );
+        let text = collect_text_content(&all);
+        assert!(
+            text.contains("rm -rf /"),
+            "危险命令应留在文本里、不被执行: {:?}",
+            text
+        );
+    }
+
     #[test]
     fn test_end_tag_newlines_split_across_events() {
         // `</thinking>\n` 在 chunk 1，`\n` 在 chunk 2，`text` 在 chunk 3
         // 确保 `</thinking>` 不会被部分当作 thinking 内容发出
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1960,7 +3281,7 @@ mod tests {
     #[test]
     fn test_end_tag_alone_in_chunk_then_newlines_in_next() {
         // `</thinking>` 单独在一个 chunk，`\n\ntext` 在下一个 chunk
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -1982,7 +3303,7 @@ mod tests {
     #[test]
     fn test_start_tag_newline_split_across_events() {
         // `\n\n` 在 chunk 1，`<thinking>` 在 chunk 2，`\n` 在 chunk 3
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -2006,7 +3327,7 @@ mod tests {
     #[test]
     fn test_full_flow_maximally_split() {
         // 极端拆分：每个关键边界都在不同 chunk
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all = Vec::new();
@@ -2039,7 +3360,7 @@ mod tests {
     #[test]
     fn test_thinking_only_sets_max_tokens_stop_reason() {
         // 整个流只有 thinking 块，没有 text 也没有 tool_use，stop_reason 应为 max_tokens
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2094,7 +3415,7 @@ mod tests {
     #[test]
     fn test_thinking_with_text_keeps_end_turn_stop_reason() {
         // thinking + text 的情况，stop_reason 应为 end_turn
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2115,7 +3436,7 @@ mod tests {
     #[test]
     fn test_thinking_with_tool_use_keeps_tool_use_stop_reason() {
         // thinking + tool_use 的情况，stop_reason 应为 tool_use
-        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new());
+        let mut ctx = StreamContext::new_with_thinking("test-model", 1, true, HashMap::new(), test_known_tools());
         let _initial_events = ctx.generate_initial_events();
 
         let mut all_events = Vec::new();
@@ -2138,6 +3459,332 @@ mod tests {
         assert_eq!(
             message_delta.data["delta"]["stop_reason"], "tool_use",
             "stop_reason should be tool_use when tool_use is present"
+        );
+    }
+
+    // ===== 新增回归测试：P0-1 参数含字面 XML / 🅱 代码围栏 / 🅳 工具表 / 🅲 card =====
+
+    /// 🅿️ P0-1：参数值里含字面 `</invoke>`，块不应被假闭合截断，input 要完整。
+    #[test]
+    fn test_invoke_param_value_contains_literal_invoke_close() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        // patch 正文里出现字面 </invoke>，真正的闭合在最后
+        let payload = "count\n<invoke name=\"apply_patch\"><parameter name=\"input\">line1\n</invoke>\nstill in patch\nline3</parameter></invoke>";
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(payload));
+        all.extend(ctx.generate_final_events());
+        let tools = collect_tool_uses(&all);
+        assert_eq!(tools.len(), 1, "应合成 1 个 tool_use: {:?}", tools);
+        assert_eq!(tools[0].0, "apply_patch");
+        let parsed: serde_json::Value = serde_json::from_str(&tools[0].1).expect("合法 JSON");
+        let input = parsed["input"].as_str().expect("有 input");
+        assert!(input.contains("still in patch"), "input 不应被假闭合截断: {input:?}");
+        assert!(input.contains("line3"), "input 应含 line3: {input:?}");
+        let text = collect_text_content(&all);
+        assert!(!text.contains("still in patch"), "patch 正文不应泄漏到 text: {text:?}");
+    }
+
+    /// 🅿️ P0-1：参数值里含字面 `</parameter>`，值不应被截断丢失后半段。
+    #[test]
+    fn test_invoke_param_value_contains_literal_parameter_close() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        let payload = "count\n<invoke name=\"apply_patch\"><parameter name=\"input\">before</parameter> after the fake close</parameter></invoke>";
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(payload));
+        all.extend(ctx.generate_final_events());
+        let tools = collect_tool_uses(&all);
+        assert_eq!(tools.len(), 1, "应合成 1 个 tool_use: {:?}", tools);
+        let parsed: serde_json::Value = serde_json::from_str(&tools[0].1).expect("合法 JSON");
+        let input = parsed["input"].as_str().expect("有 input");
+        assert!(input.contains("after the fake close"), "后半段不应丢: {input:?}");
+    }
+
+    /// 🅱：代码围栏（```）内的 <invoke> 是正文展示，不应被捞回成 tool_use。
+    #[test]
+    fn test_invoke_inside_code_fence_not_captured() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        let payload = "示例代码：\n```\n<invoke name=\"exec_command\"><parameter name=\"cmd\">rm -rf /</parameter></invoke>\n```\n讲解完毕。";
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(payload));
+        all.extend(ctx.generate_final_events());
+        let tools = collect_tool_uses(&all);
+        assert!(tools.is_empty(), "围栏内展示文本不应被捞回: {:?}", tools);
+        let text = collect_text_content(&all);
+        assert!(text.contains("<invoke name=\"exec_command\">"), "应原样保留: {text:?}");
+    }
+
+    /// 🅳：合成出的工具名不在已知工具表里 → 不捞回，当文本吐出（防误执行）。
+    #[test]
+    fn test_invoke_unknown_tool_name_not_synthesized() {
+        // 已知工具表里没有 totally_unknown_tool
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        let payload = "count\n<invoke name=\"totally_unknown_tool\"><parameter name=\"x\">1</parameter></invoke>";
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(payload));
+        all.extend(ctx.generate_final_events());
+        let tools = collect_tool_uses(&all);
+        assert!(tools.is_empty(), "未知工具名不应被合成: {:?}", tools);
+        let text = collect_text_content(&all);
+        assert!(text.contains("totally_unknown_tool"), "未知工具应原样当文本: {text:?}");
+    }
+
+    /// 🅳：已知工具表为空（请求没带 tools）→ 一律不捞回，宁可漏捞不可误执行。
+    #[test]
+    fn test_invoke_empty_known_tools_never_captured() {
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let _ = ctx.generate_initial_events();
+        let payload = "count\n<invoke name=\"exec_command\"><parameter name=\"cmd\">ls</parameter></invoke>";
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(payload));
+        all.extend(ctx.generate_final_events());
+        let tools = collect_tool_uses(&all);
+        assert!(tools.is_empty(), "工具表为空时不应捞回: {:?}", tools);
+    }
+
+    /// 🅲：stray token `card` 也应被剥掉，块仍被捞回。
+    #[test]
+    fn test_invoke_strips_stray_card_token() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        let payload = "我先等结果。\n\ncard\n<invoke name=\"wait_agent\"><parameter name=\"x\">1</parameter></invoke>";
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(payload));
+        all.extend(ctx.generate_final_events());
+        let tools = collect_tool_uses(&all);
+        assert_eq!(tools.len(), 1, "card 前缀的块应被捞回: {:?}", tools);
+        assert_eq!(tools[0].0, "wait_agent");
+        let text = collect_text_content(&all);
+        assert!(!text.contains("card"), "card stray token 不应泄漏: {text:?}");
+        assert!(text.contains("我先等结果"), "正常叙述应保留: {text:?}");
+    }
+
+    /// 🅱 跨 chunk：``` 围栏开标签在 chunk 边界被切碎，仍能正确识别围栏内不捞回。
+    #[test]
+    fn test_invoke_fence_split_across_chunks() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        let mut all = Vec::new();
+        // 围栏开标签分两个 chunk 到达
+        all.extend(ctx.process_assistant_response("看代码：\n``"));
+        all.extend(ctx.process_assistant_response("`\n<invoke name=\"exec_command\"><parameter name=\"cmd\">x</parameter></invoke>\n```"));
+        all.extend(ctx.generate_final_events());
+        let tools = collect_tool_uses(&all);
+        assert!(tools.is_empty(), "跨 chunk 围栏内不应捞回: {:?}", tools);
+    }
+
+    /// 🟡 回归（Reviewer 问题1）：连发 burst，块 A 在 `</invoke>` 前混了非 `>` 收尾文字，
+    /// 不应把 A、B 误合并成一个块、也不应让 B 的参数串进 A。两个块都应独立捞回。
+    #[test]
+    fn test_invoke_burst_with_trailing_text_not_merged() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        let payload = "count\n<invoke name=\"tool_a\"><parameter name=\"x\">1</parameter>trailing plain</invoke><invoke name=\"tool_b\"><parameter name=\"y\">2</parameter></invoke>";
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(payload));
+        all.extend(ctx.generate_final_events());
+        let tools = collect_tool_uses(&all);
+        assert_eq!(tools.len(), 2, "应独立合成 2 个 tool_use，不能误合并: {:?}", tools);
+        assert_eq!(tools[0].0, "tool_a");
+        assert_eq!(tools[1].0, "tool_b");
+        let a: serde_json::Value = serde_json::from_str(&tools[0].1).expect("合法 JSON");
+        let b: serde_json::Value = serde_json::from_str(&tools[1].1).expect("合法 JSON");
+        assert!(a.get("y").is_none(), "B 的参数 y 不应串进 A: {a:?}");
+        assert_eq!(a["x"], "1");
+        assert_eq!(b["y"], "2");
+    }
+
+    /// 🟢 正常连发 burst（块紧贴、A 以 </parameter> 收尾）仍应正确拆成两个。
+    #[test]
+    fn test_invoke_burst_clean_two_blocks() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        let payload = "count\n<invoke name=\"tool_a\"><parameter name=\"x\">1</parameter></invoke><invoke name=\"tool_b\"><parameter name=\"y\">2</parameter></invoke>";
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(payload));
+        all.extend(ctx.generate_final_events());
+        let tools = collect_tool_uses(&all);
+        assert_eq!(tools.len(), 2, "紧贴连发应拆成 2 个: {:?}", tools);
+        assert_eq!(tools[0].0, "tool_a");
+        assert_eq!(tools[1].0, "tool_b");
+    }
+
+    /// 🔁 回放验证：用问题 thread `019e9e8d` 里真实的 `count\n<invoke>` 泄漏原文，
+    /// 断言新容错把它捞回成结构化 tool_use（而不是泄漏成字面 XML 文本）。
+    /// 真实工具名 exec_command 在工具表里 → 应捞回；参数 cmd / yield_time_ms 完整。
+    #[test]
+    fn test_invoke_real_leak_sample_from_thread_019e9e8d() {
+        let known: std::collections::HashSet<String> =
+            ["exec_command", "update_plan", "update_goal"].iter().map(|s| s.to_string()).collect();
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), known);
+        let _ = ctx.generate_initial_events();
+        // 逐字摘自 thread 019e9e8d 真实泄漏 assistant 消息
+        let real = "）。\n\ncount\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">cd /Users/yuyifeng/.codex/everything-codex/runtime/agent-tools && python3 -m pytest -q -p no:cacheprovider objects/dev/beads/leaves/create_issue/ 2>&1 | tail -8</parameter>\n<parameter name=\"yield_time_ms\">60000</parameter>\n</invoke>";
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(real));
+        all.extend(ctx.generate_final_events());
+        let tools = collect_tool_uses(&all);
+        assert_eq!(tools.len(), 1, "真实泄漏样本应被捞回成 1 个 tool_use: {:?}", tools);
+        assert_eq!(tools[0].0, "exec_command", "name 应为 exec_command");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&tools[0].1).expect("input 应为合法 JSON");
+        assert!(
+            parsed["cmd"].as_str().unwrap_or("").contains("pytest"),
+            "cmd 参数应完整保留: {:?}", parsed
+        );
+        assert_eq!(parsed["yield_time_ms"], "60000", "yield_time_ms 参数应保留");
+        // 关键：字面 <invoke> 不应泄漏到 text
+        let text = collect_text_content(&all);
+        assert!(
+            !text.contains("<invoke name=\"exec_command\">"),
+            "字面 <invoke> 不应泄漏到文本: {:?}", text
+        );
+        // count stray token 也不应泄漏
+        assert!(!text.contains("\ncount\n") && !text.ends_with("count"),
+            "count stray token 不应泄漏: {:?}", text);
+    }
+
+    // ---- 复读熔断 (repeat guard)：root cause = Opus 长上下文退化复读 ----
+
+    /// 🔴→🟢 复现真实泄漏：模型一句正常话后无限复读 `count`（thread 019ea4e9 的真账）。
+    /// 熔断后吐出的 count 数必须远小于喂入的数量，且不撑满输出。
+    #[test]
+    fn repeat_guard_trips_on_count_flood() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+
+        // 真实形态：正常话 + call + 海量 count（这里用 5000 次模拟 3.2 万次）
+        let mut payload = String::from("先看 crawlee 状态。\n\ncall\n\n");
+        for _ in 0..5000 {
+            payload.push_str("count\n\n");
+        }
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(&payload));
+        all.extend(ctx.generate_final_events());
+
+        let text = collect_text_content(&all);
+        let emitted_counts = text.matches("count").count();
+        assert!(
+            emitted_counts < 64,
+            "复读应被熔断：吐出的 count 数应远小于喂入的 5000，实际={}",
+            emitted_counts
+        );
+        // 正常开头那句话必须保留（熔断不能误伤正文）
+        assert!(
+            text.contains("先看 crawlee 状态"),
+            "熔断不应误伤正常正文: {:?}",
+            &text[..text.len().min(80)]
+        );
+    }
+
+    /// 🟢 不误伤：正常工具调用前的 1 个引导词 `count` + 真 <invoke> 仍被正常捞回。
+    #[test]
+    fn repeat_guard_does_not_trip_on_single_stray_token() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        let payload =
+            "count\n<invoke name=\"exec_command\"><parameter name=\"cmd\">ls</parameter></invoke>";
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(payload));
+        all.extend(ctx.generate_final_events());
+        let tools = collect_tool_uses(&all);
+        assert_eq!(tools.len(), 1, "单个引导词不应触发熔断，invoke 应正常捞回: {:?}", tools);
+        assert_eq!(tools[0].0, "exec_command");
+    }
+
+    /// 🟢 不误伤：正常多行文本里偶尔出现 count 单词（非独占行复读）不熔断。
+    #[test]
+    fn repeat_guard_does_not_trip_on_normal_prose() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        let payload = "我数了一下 count = 3，然后继续做别的事。\n这是第二行正常文字。\n第三行也正常。";
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response(payload));
+        all.extend(ctx.generate_final_events());
+        let text = collect_text_content(&all);
+        assert!(text.contains("我数了一下"), "正常正文不应被熔断: {:?}", text);
+        assert!(text.contains("第三行也正常"), "正常正文应完整保留: {:?}", text);
+    }
+
+    /// 🟢 跨 chunk 复读也能熔断（流式分片到达，每片一个 count）。
+    #[test]
+    fn repeat_guard_trips_across_chunks() {
+        let mut ctx =
+            StreamContext::new_with_thinking("test-model", 1, false, HashMap::new(), test_known_tools());
+        let _ = ctx.generate_initial_events();
+        let mut all = Vec::new();
+        all.extend(ctx.process_assistant_response("call\n\n"));
+        for _ in 0..2000 {
+            all.extend(ctx.process_assistant_response("count\n\n"));
+        }
+        all.extend(ctx.generate_final_events());
+        let text = collect_text_content(&all);
+        let emitted_counts = text.matches("count").count();
+        assert!(
+            emitted_counts < 64,
+            "跨 chunk 复读也应熔断：实际吐出 count={}",
+            emitted_counts
+        );
+    }
+
+    // ---- 块级复读熔断 (collapse_stray_token_floods)：覆盖 web_search loop 路径 ----
+
+    /// 🔴→🟢 块级路径（extract_invoke_content_blocks / web_search loop）也必须熔断 count 洪水。
+    #[test]
+    fn extract_blocks_collapses_count_flood() {
+        let mut text = String::from("先看 crawlee 状态。\n\ncall\n\n");
+        for _ in 0..5000 {
+            text.push_str("count\n\n");
+        }
+        let blocks = extract_invoke_content_blocks(
+            &text,
+            &test_known_tools(),
+            &std::collections::HashMap::new(),
+        );
+        let joined: String = blocks
+            .iter()
+            .filter(|b| b["type"] == "text")
+            .filter_map(|b| b["text"].as_str())
+            .collect();
+        let emitted = joined.matches("count").count();
+        assert!(emitted < 64, "块级路径应折叠 count 洪水：实际={}", emitted);
+        assert!(joined.contains("先看 crawlee 状态"), "正常正文应保留: {:?}", &joined[..joined.len().min(60)]);
+    }
+
+    /// 🟢 块级不误伤：单个引导词 count + 真 invoke 仍被捞回。
+    #[test]
+    fn extract_blocks_keeps_single_stray_and_reclaims() {
+        let text = "count\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">ls</parameter>\n</invoke>";
+        let blocks = extract_invoke_content_blocks(
+            text,
+            &test_known_tools(),
+            &std::collections::HashMap::new(),
+        );
+        assert!(
+            blocks.iter().any(|b| b["type"] == "tool_use" && b["name"] == "exec_command"),
+            "单个引导词不应触发折叠，invoke 应捞回: {:?}",
+            blocks
         );
     }
 }

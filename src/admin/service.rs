@@ -19,17 +19,16 @@ use crate::model::config::Config;
 use super::error::AdminServiceError;
 use super::proxy_pool::{GetUrlResult, ProxyPoolManager};
 use super::types::{
-    AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse,
-    AssignProxyRequest, AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse,
-    BalanceResponse, BatchAddProxyRequest,
-    CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse, EnableOverageAllResult,
-    GitHubRateLimitInfo, ImageUpdateResponse, KamExportAccount, KamExportResponse,
-    LoadBalancingModeResponse, LogGovernanceConfigResponse, PollIdcLoginResponse,
-    ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
-    QuotaExceededResult, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
-    SetLogGovernanceConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
-    StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
-    UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
+    AccountThrottleConfigResponse, AddCredentialRequest, AddCredentialResponse, AssignProxyRequest,
+    AssignRoundRobinResponse, AvailableModelItem, AvailableModelsResponse, BalanceResponse,
+    BatchAddProxyRequest, CheckRateLimitRequest, CredentialStatusItem, CredentialsStatusResponse,
+    EnableOverageAllResult, GitHubRateLimitInfo, ImageUpdateResponse, KamExportAccount,
+    KamExportResponse, LoadBalancingModeResponse, LogGovernanceConfigResponse,
+    PollIdcLoginResponse, ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry,
+    ProxyPoolResponse, QuotaExceededResult, SetAccountThrottleConfigRequest,
+    SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetUpdateConfigRequest,
+    StartIdcLoginRequest, StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse,
+    UpdateCheckInfo, UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
 };
 
 /// 余额缓存过期时间（秒），5 分钟
@@ -240,7 +239,10 @@ const BUILD_TYPE: &str = "binary";
 /// 文件名中带版本号，便于 apply 复用 pull 已下载的二进制（命中时跳过重新下载）。
 fn staged_binary_path(exe: &std::path::Path, version: &str) -> std::path::PathBuf {
     let mut s = exe.as_os_str().to_os_string();
-    s.push(format!(".staged-{}", version.trim().trim_start_matches('v')));
+    s.push(format!(
+        ".staged-{}",
+        version.trim().trim_start_matches('v')
+    ));
     std::path::PathBuf::from(s)
 }
 
@@ -451,10 +453,7 @@ impl AdminService {
     /// 返回的结构体含 refreshToken、accessToken、clientSecret 等敏感字段，
     /// 调用方需自行保证传输与存储安全；按 priority 升序排序，与 UI 列表一致。
     /// `id_filter` 为 None 时导出全部凭据；为 Some 时仅导出集合内的 ID。
-    pub fn export_kam_credentials(
-        &self,
-        id_filter: Option<&HashSet<u64>>,
-    ) -> KamExportResponse {
+    pub fn export_kam_credentials(&self, id_filter: Option<&HashSet<u64>>) -> KamExportResponse {
         let mut credentials = self.token_manager.clone_all_credentials();
         if let Some(filter) = id_filter {
             credentials.retain(|c| c.id.map(|id| filter.contains(&id)).unwrap_or(false));
@@ -786,8 +785,8 @@ impl AdminService {
                         );
 
                         let hit = now.hour() == target_hour && now.minute() == target_minute;
-                        let already_ran_this_minute = last_run_marker.as_deref()
-                            == Some(date_minute_marker.as_str());
+                        let already_ran_this_minute =
+                            last_run_marker.as_deref() == Some(date_minute_marker.as_str());
 
                         if hit && !already_ran_this_minute {
                             last_run_marker = Some(date_minute_marker);
@@ -803,7 +802,7 @@ impl AdminService {
                                     info.latest_version,
                                     info.current_version
                                 );
-                            match svc.apply_image_update().await {
+                                match svc.apply_image_update().await {
                                     Ok(res) => {
                                         tracing::info!("自动更新完成：{}", res.message);
                                         last_applied_version = Some(info.latest_version);
@@ -1084,10 +1083,7 @@ impl AdminService {
             message: if reused {
                 format!("v{} 已下载并校验，可直接执行「更新并重启」", version)
             } else {
-                format!(
-                    "已下载并校验 v{} 二进制，可直接执行「更新并重启」",
-                    version
-                )
+                format!("已下载并校验 v{} 二进制，可直接执行「更新并重启」", version)
             },
             output: Some(format!(
                 "{}: v{}\nstaged: {}",
@@ -1352,10 +1348,7 @@ impl AdminService {
     /// `req.github_token` 不为空时使用该 token 验证（用于"保存前先试一下"），
     /// 否则使用配置中已保存的 `config.github_token`，再缺则匿名查询。
     /// `/rate_limit` 端点本身不消耗任何配额。
-    pub async fn check_rate_limit(
-        &self,
-        req: CheckRateLimitRequest,
-    ) -> GitHubRateLimitInfo {
+    pub async fn check_rate_limit(&self, req: CheckRateLimitRequest) -> GitHubRateLimitInfo {
         // 优先用入参 token；空字符串视作"尝试匿名"；缺省回退到已保存 token
         let token = req
             .github_token
@@ -1471,13 +1464,22 @@ impl AdminService {
             .get("resources")
             .and_then(|r| r.get("core"))
             .or_else(|| payload.get("rate"));
-        let limit = core.and_then(|c| c.get("limit")).and_then(|v| v.as_u64()).unwrap_or(0);
+        let limit = core
+            .and_then(|c| c.get("limit"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let remaining = core
             .and_then(|c| c.get("remaining"))
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        let used = core.and_then(|c| c.get("used")).and_then(|v| v.as_u64()).unwrap_or(0);
-        let reset = core.and_then(|c| c.get("reset")).and_then(|v| v.as_u64()).unwrap_or(0);
+        let used = core
+            .and_then(|c| c.get("used"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let reset = core
+            .and_then(|c| c.get("reset"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
 
         // 同时尝试拿 token 对应的用户名；失败不影响主结果
         let login = if authenticated {
@@ -1725,9 +1727,9 @@ impl AdminService {
                 skipped.push(entry.id);
                 continue;
             }
-            let cached = cache_snapshot.get(&entry.id).filter(|c| {
-                (now_ts - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64
-            });
+            let cached = cache_snapshot
+                .get(&entry.id)
+                .filter(|c| (now_ts - c.cached_at) < BALANCE_CACHE_TTL_SECS as f64);
 
             match cached {
                 // 缓存命中：明确不可开启，跳过
@@ -1750,7 +1752,11 @@ impl AdminService {
         let mut failure_messages: Vec<String> = Vec::new();
 
         for id in targets {
-            match self.token_manager.set_user_preference_for(id, "ENABLED").await {
+            match self
+                .token_manager
+                .set_user_preference_for(id, "ENABLED")
+                .await
+            {
                 Ok(()) => {
                     enabled_ids.push(id);
                     // 失效本地缓存

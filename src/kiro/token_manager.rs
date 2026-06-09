@@ -412,10 +412,7 @@ pub(crate) async fn get_available_models(
     let node_version = &config.node_version;
 
     // 构建 URL（profileArn 可选）
-    let mut url = format!(
-        "https://{}/ListAvailableModels?origin=AI_EDITOR",
-        host
-    );
+    let mut url = format!("https://{}/ListAvailableModels?origin=AI_EDITOR", host);
     if let Some(profile_arn) = &credentials.profile_arn {
         url.push_str(&format!("&profileArn={}", urlencoding::encode(profile_arn)));
     }
@@ -1892,7 +1889,10 @@ impl MultiTokenManager {
                 .iter()
                 .filter(|e| {
                     !e.disabled
-                        && !e.throttled_until.map(|t| t > throttled_now).unwrap_or(false)
+                        && !e
+                            .throttled_until
+                            .map(|t| t > throttled_now)
+                            .unwrap_or(false)
                 })
                 .count()
         }
@@ -2113,10 +2113,7 @@ impl MultiTokenManager {
     /// 复用 [`Self::get_usage_limits_for`] 的 token 准备流程：API Key 凭据直接用
     /// kiroApiKey；OAuth 凭据按需在 `refresh_lock` 内刷新并持久化。返回的凭据是
     /// 刷新后重新读取的最新快照，调用方据此构造请求。
-    async fn prepare_request_token(
-        &self,
-        id: u64,
-    ) -> anyhow::Result<(String, KiroCredentials)> {
+    async fn prepare_request_token(&self, id: u64) -> anyhow::Result<(String, KiroCredentials)> {
         let credentials = {
             let entries = self.entries.lock();
             entries
@@ -2749,7 +2746,11 @@ impl MultiTokenManager {
         Ok(())
     }
 
-    fn persist_account_throttle_config(&self, failover: bool, cooldown_secs: u64) -> anyhow::Result<()> {
+    fn persist_account_throttle_config(
+        &self,
+        failover: bool,
+        cooldown_secs: u64,
+    ) -> anyhow::Result<()> {
         use anyhow::Context;
 
         let config_path = match self.config.config_path() {

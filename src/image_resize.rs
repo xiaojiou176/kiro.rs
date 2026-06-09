@@ -97,11 +97,7 @@ pub struct ProcessedImage {
 /// `data_base64` is the base64-encoded raw bytes.
 ///
 /// Never panics and never drops an image. On failure it returns an owned copy of the input and logs a warning.
-pub fn maybe_shrink_image(
-    cfg: ResizeConfig,
-    format: &str,
-    data_base64: &str,
-) -> ProcessedImage {
+pub fn maybe_shrink_image(cfg: ResizeConfig, format: &str, data_base64: &str) -> ProcessedImage {
     let format_lc = format.to_ascii_lowercase();
     let original_bytes = data_base64.len();
 

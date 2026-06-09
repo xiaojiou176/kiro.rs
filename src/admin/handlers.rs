@@ -9,6 +9,7 @@ use axum::{
 use super::{
     client_keys::mask_client_key,
     middleware::AdminState,
+    trace_db::TraceQuery,
     types::{
         AddCredentialRequest, AddProxyRequest, AssignProxyRequest, AssignRoundRobinRequest,
         BatchAddProxyRequest, ClientKeyItem, ClientKeysResponse, CompleteSocialLoginRequest,
@@ -20,7 +21,6 @@ use super::{
         UpdateRefreshTokenRequest,
     },
     usage_stats::Range,
-    trace_db::TraceQuery,
 };
 
 // Path 元组提取：(credential_id, session_id)
@@ -117,11 +117,7 @@ pub async fn clear_throttle(
     Path(id): Path<u64>,
 ) -> impl IntoResponse {
     match state.service.clear_throttle(id) {
-        Ok(_) => Json(SuccessResponse::new(format!(
-            "凭据 #{} 风控冷却已解除",
-            id
-        )))
-        .into_response(),
+        Ok(_) => Json(SuccessResponse::new(format!("凭据 #{} 风控冷却已解除", id))).into_response(),
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
 }
@@ -896,11 +892,7 @@ pub async fn stats_overview(State(state): State<AdminState>) -> impl IntoRespons
     // 附加：当前活跃 Key / 凭据数
     let active_keys = state.client_keys.active_count() as u64;
     let snapshot = state.service.get_all_credentials();
-    let active_credentials = snapshot
-        .credentials
-        .iter()
-        .filter(|c| !c.disabled)
-        .count() as u64;
+    let active_credentials = snapshot.credentials.iter().filter(|c| !c.disabled).count() as u64;
     let response = serde_json::json!({
         "todayCalls": overview.today_calls,
         "todayInputTokens": overview.today_input_tokens,
@@ -979,7 +971,9 @@ pub async fn list_traces(
     let query = TraceQuery {
         status: params.get("status").filter(|s| !s.is_empty()).cloned(),
         error_type: params.get("errorType").filter(|s| !s.is_empty()).cloned(),
-        credential_id: params.get("credentialId").and_then(|s| s.parse::<u64>().ok()),
+        credential_id: params
+            .get("credentialId")
+            .and_then(|s| s.parse::<u64>().ok()),
         failed_attempt_credential_id: params
             .get("failedAttemptCredentialId")
             .and_then(|s| s.parse::<u64>().ok()),

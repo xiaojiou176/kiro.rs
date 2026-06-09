@@ -42,9 +42,7 @@ pub fn current_request_id() -> String {
 
 /// Returns the current traceparent or an empty string if absent.
 pub fn current_traceparent() -> String {
-    TRACE_PARENT
-        .try_with(|tp| tp.clone())
-        .unwrap_or_default()
+    TRACE_PARENT.try_with(|tp| tp.clone()).unwrap_or_default()
 }
 
 /// Process-wide observability paths. Set once at startup by `init_logging`.
@@ -98,14 +96,11 @@ pub fn init_logging(log_dir: impl Into<PathBuf>) -> anyhow::Result<LoggingGuards
     std::fs::create_dir_all(&errors_dir)?;
     std::fs::create_dir_all(&captures_dir)?;
 
-    let info_appender =
-        tracing_appender::rolling::daily(&structured_dir, "info.jsonl");
-    let error_appender =
-        tracing_appender::rolling::daily(&structured_dir, "error.jsonl");
+    let info_appender = tracing_appender::rolling::daily(&structured_dir, "info.jsonl");
+    let error_appender = tracing_appender::rolling::daily(&structured_dir, "error.jsonl");
     let (info_writer, info_guard) = tracing_appender::non_blocking(info_appender);
     let (error_writer, error_guard) = tracing_appender::non_blocking(error_appender);
-    let (stdout_writer, stdout_guard) =
-        tracing_appender::non_blocking(std::io::stdout());
+    let (stdout_writer, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
 
     let info_layer = fmt::layer()
         .json()
@@ -168,7 +163,13 @@ pub fn archive_error_body(kind: &str, raw_body: &str) {
     let ts = Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
     let safe_kind: String = kind
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     let path = d.errors_dir.join(format!("{ts}-{rid}-{safe_kind}.json"));
 
@@ -204,9 +205,7 @@ pub fn capture_outbound(
     let Some(d) = OBS_DIRS.get() else { return };
     let rid = current_request_id();
     let ts = Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
-    let path = d
-        .captures_dir
-        .join(format!("{ts}-{rid}-{direction}.json"));
+    let path = d.captures_dir.join(format!("{ts}-{rid}-{direction}.json"));
 
     // Redact obvious auth in captures so they're safe to share / mail.
     let headers_redacted: Vec<_> = headers
@@ -330,10 +329,8 @@ mod tests {
     #[test]
     fn archive_error_body_writes_disk() {
         // Spin up a self-contained log dir so we don't depend on prod state.
-        let tmp = std::env::temp_dir().join(format!(
-            "kiro-rs-obs-test-{}",
-            Utc::now().format("%s%9f")
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("kiro-rs-obs-test-{}", Utc::now().format("%s%9f")));
         std::fs::create_dir_all(&tmp).unwrap();
         let dirs = ObsDirs {
             log_dir: tmp.clone(),
@@ -372,10 +369,8 @@ mod tests {
     fn capture_outbound_writes_disk_when_enabled() {
         // SAFETY: serialized via --test-threads=1 in CI; restore env after.
         unsafe { std::env::set_var("KIRO_RS_CAPTURE", "1") };
-        let tmp = std::env::temp_dir().join(format!(
-            "kiro-rs-cap-test-{}",
-            Utc::now().format("%s%9f")
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("kiro-rs-cap-test-{}", Utc::now().format("%s%9f")));
         std::fs::create_dir_all(&tmp).unwrap();
         let dirs = ObsDirs {
             log_dir: tmp.clone(),
@@ -402,7 +397,10 @@ mod tests {
             .collect();
         assert!(!entries.is_empty(), "capture_outbound produced no file");
         let body = std::fs::read_to_string(entries[0].path()).unwrap();
-        assert!(body.contains("\"value\":\"<redacted>\""), "authorization not redacted");
+        assert!(
+            body.contains("\"value\":\"<redacted>\""),
+            "authorization not redacted"
+        );
         assert!(body.contains("\"effort\":\"max\""), "body not preserved");
     }
 }
