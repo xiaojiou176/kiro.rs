@@ -4,10 +4,10 @@ use std::convert::Infallible;
 use std::time::Instant;
 
 use crate::admin::client_keys::SharedClientKeyManager;
+use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::admin::trace_db::{
     SharedTraceStore, TraceAttempt, TraceKeySource, TraceRecord, TraceSink, outcome,
 };
-use crate::admin::usage_stats::{SharedAggregator, SharedRecorder, UsageRecord};
 use crate::kiro::model::events::Event;
 use crate::kiro::model::requests::kiro::KiroRequest;
 use crate::kiro::parser::decoder::EventStreamDecoder;
@@ -249,17 +249,11 @@ fn count_image_budget(payload: &super::types::MessagesRequest) -> ImageBudget {
                 if item.get("type").and_then(|v| v.as_str()) != Some("image") {
                     continue;
                 }
-                let Some(src) = item.get("source") else {
-                    continue;
-                };
+                let Some(src) = item.get("source") else { continue };
                 if src.get("type").and_then(|v| v.as_str()) != Some("base64") {
                     continue;
                 }
-                let n = src
-                    .get("data")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.len())
-                    .unwrap_or(0);
+                let n = src.get("data").and_then(|v| v.as_str()).map(|s| s.len()).unwrap_or(0);
                 count += 1;
                 total += n;
                 if n > largest {
@@ -282,7 +276,6 @@ pub(super) fn map_provider_error(err: Error) -> Response {
     // 上下文窗口满了（对话历史累积超出模型上下文窗口限制）
     if err_str.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
         tracing::warn!(error = %err, "上游拒绝请求：上下文窗口已满（不应重试）");
-        crate::observability::archive_error_body("context-window-full", &err_str);
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
@@ -296,7 +289,6 @@ pub(super) fn map_provider_error(err: Error) -> Response {
     // 单次输入太长（请求体本身超出上游限制）
     if err_str.contains("Input is too long") {
         tracing::warn!(error = %err, "上游拒绝请求：输入过长（不应重试）");
-        crate::observability::archive_error_body("input-too-long", &err_str);
         return (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse::new(
@@ -317,8 +309,6 @@ pub(super) fn map_provider_error(err: Error) -> Response {
             error = %err,
             "client messages array violates the protocol (Bedrock validation; mapped to 400 to avoid a false cooldown)"
         );
-        // Local: archive the raw upstream body for offline replay/diagnostics.
-        crate::observability::archive_error_body("tool-use-result-mismatch", &err_str);
         // Return a stable, client-facing message and avoid echoing the raw upstream
         // error string (which can carry request IDs or internal validation details).
         // The full error is already logged above for diagnostics.
@@ -333,7 +323,6 @@ pub(super) fn map_provider_error(err: Error) -> Response {
     }
 
     tracing::error!("Kiro API 调用失败: {}", err);
-    crate::observability::archive_error_body("upstream-bad-gateway", &err_str);
     (
         StatusCode::BAD_GATEWAY,
         Json(ErrorResponse::new(
@@ -577,11 +566,7 @@ pub async fn post_messages(
 
         let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
         // WebSearch 路径走 MCP 端点，没有 credential_id 上下文，统一记 0
-        let status = if resp.status().is_success() {
-            "success"
-        } else {
-            "error"
-        };
+        let status = if resp.status().is_success() { "success" } else { "error" };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
     }
@@ -590,9 +575,7 @@ pub async fn post_messages(
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
-        tracing::info!(
-            "detected mixed tools containing web_search, entering the web_search agentic loop"
-        );
+        tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
         return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream)
             .await;
     }
@@ -735,20 +718,12 @@ async fn handle_stream_request(
     tracer: std::sync::Arc<RequestTracer>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()))
-        .await
-    {
+    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref())).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
             // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
-            tracer.finalize(
-                "error",
-                last_attempt_outcome(&tracer),
-                Some(&e.to_string()),
-                None,
-            );
+            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None);
             return map_provider_error(e);
         }
     };
@@ -756,13 +731,7 @@ async fn handle_stream_request(
     let credential_id = call_result.credential_id;
 
     // 创建流处理上下文
-    let mut ctx = StreamContext::new_with_thinking(
-        model,
-        input_tokens,
-        thinking_enabled,
-        tool_name_map,
-        known_tool_names,
-    );
+    let mut ctx = StreamContext::new_with_thinking(model, input_tokens, thinking_enabled, tool_name_map, known_tool_names);
     ctx.cache_usage = cache_usage;
 
     // 生成初始事件
@@ -939,12 +908,7 @@ async fn handle_non_stream_request(
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize(
-                "error",
-                last_attempt_outcome(&tracer),
-                Some(&e.to_string()),
-                None,
-            );
+            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None);
             return map_provider_error(e);
         }
     };
@@ -1334,11 +1298,7 @@ pub async fn post_messages_cc(
         ) as i32;
 
         let resp = websearch::handle_websearch_request(provider, &payload, input_tokens).await;
-        let status = if resp.status().is_success() {
-            "success"
-        } else {
-            "error"
-        };
+        let status = if resp.status().is_success() { "success" } else { "error" };
         hook.record(0, input_tokens, 0, 0, 0, 0.0, status);
         return resp;
     }
@@ -1347,9 +1307,7 @@ pub async fn post_messages_cc(
     // Mixed-tools (web_search + exec...) case: web_search coexists with other tools and falls onto the normal chat path,
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
-        tracing::info!(
-            "detected mixed tools containing web_search, entering the web_search agentic loop"
-        );
+        tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
         return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream)
             .await;
     }
@@ -1495,19 +1453,11 @@ async fn handle_stream_request_buffered(
     tracer: std::sync::Arc<RequestTracer>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
-        .call_api_stream(request_body, Some(tracer.as_ref()))
-        .await
-    {
+    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref())).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize(
-                "error",
-                last_attempt_outcome(&tracer),
-                Some(&e.to_string()),
-                None,
-            );
+            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None);
             return map_provider_error(e);
         }
     };
@@ -1753,14 +1703,11 @@ mod tests {
 
     #[test]
     fn count_image_budget_handles_empty() {
-        let req: super::super::types::MessagesRequest = serde_json::from_str(
-            r#"{
+        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
             "model": "claude-opus-4-7",
             "max_tokens": 100,
             "messages": []
-        }"#,
-        )
-        .unwrap();
+        }"#).unwrap();
         let stats = count_image_budget(&req);
         assert_eq!(stats.count, 0);
         assert_eq!(stats.total_b64_bytes, 0);
@@ -1790,8 +1737,7 @@ mod tests {
 
     #[test]
     fn count_image_budget_skips_url_only_images() {
-        let req: super::super::types::MessagesRequest = serde_json::from_str(
-            r#"{
+        let req: super::super::types::MessagesRequest = serde_json::from_str(r#"{
             "model": "claude-opus-4-7",
             "max_tokens": 100,
             "messages": [{
@@ -1800,9 +1746,7 @@ mod tests {
                     {"type": "image", "source": {"type": "url", "url": "https://example.com/x.png"}}
                 ]
             }]
-        }"#,
-        )
-        .unwrap();
+        }"#).unwrap();
         let stats = count_image_budget(&req);
         assert_eq!(stats.count, 0);
     }
