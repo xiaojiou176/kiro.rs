@@ -153,6 +153,32 @@ pub fn default_is_account_throttled(body: &str) -> bool {
     body.contains("suspicious activity") && body.contains("temporary limits")
 }
 
+/// 默认的"纯速率限流"判断逻辑（请求太快，慢点重试即可，账号配额未耗尽）
+///
+/// 上游 Amazon Q 在短时间内请求过密时返回：
+/// `429 Too Many Requests {"__type":"...#ThrottlingException",
+///  "message":"Too many requests, please wait before trying again.",
+///  "reason":"SERVICE_REQUEST_RATE_EXCEEDED"}`
+///
+/// 与其它 429 的关键区分：
+/// - 账号级风控（`default_is_account_throttled`）：含 "suspicious activity"，是账号被针对；
+/// - 月度/超额配额耗尽（`MONTHLY_REQUEST_COUNT` / `OVERAGE_REQUEST_LIMIT_EXCEEDED`）：
+///   真没额度，重试无意义；
+/// - 本函数覆盖的纯速率限流：额度仍在，只是太快，短暂退避后能成功。
+///
+/// 用途：让 `map_provider_error` 把这类错误映射为 HTTP 429（而非兜底 502）。
+/// 502 会被 CPA 当上游服务故障，对凭据冷却 60 秒；单凭据场景下放大成 503 风暴。
+/// 映射为 429 后 CPA 走配额退避（base 1 秒），且语义诚实（确实是限流）。
+///
+/// 必须排除配额耗尽类 reason，避免把"真没额度"误判成"慢点重试"而空转。
+pub fn default_is_rate_limited(body: &str) -> bool {
+    // 配额耗尽不是速率限流：优先排除，避免误判空转。
+    if body.contains("MONTHLY_REQUEST_COUNT") || body.contains("OVERAGE_REQUEST_LIMIT_EXCEEDED") {
+        return false;
+    }
+    body.contains("SERVICE_REQUEST_RATE_EXCEEDED") || body.contains("ThrottlingException")
+}
+
 /// 默认的上游网关超时判断逻辑。
 pub fn default_is_gateway_timeout(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
@@ -315,6 +341,36 @@ mod tests {
         // 宽泛的 ValidationException 不再单独命中（无精确 reason / 无特异短语时）
         assert!(!default_is_client_validation_error(
             r#"{"__type":"ValidationException","message":"some other validation"}"#
+        ));
+    }
+
+    #[test]
+    fn test_default_is_rate_limited() {
+        // 真实样本：Amazon Q 速率限流（纯 ThrottlingException，账号配额未耗尽）
+        assert!(default_is_rate_limited(
+            r#"{"__type":"com.amazon.kiro.runtimeservice#ThrottlingException","message":"Too many requests, please wait before trying again.","reason":"SERVICE_REQUEST_RATE_EXCEEDED"}"#
+        ));
+        // provider 错误串里嵌着上游 body 的形态
+        assert!(default_is_rate_limited(
+            "流式 API 请求失败: 429 Too Many Requests {\"reason\":\"SERVICE_REQUEST_RATE_EXCEEDED\"}"
+        ));
+        // 仅 ThrottlingException 类型也算（部分响应可能不带 reason）
+        assert!(default_is_rate_limited(
+            r#"{"__type":"com.amazon.kiro.runtimeservice#ThrottlingException"}"#
+        ));
+
+        // 关键区分：账号级月度/超额配额耗尽不是"速率限流"，不应命中
+        // （那是真没额度，重试无意义；速率限流是太快、慢点能成）
+        assert!(!default_is_rate_limited(
+            r#"{"reason":"MONTHLY_REQUEST_COUNT"}"#
+        ));
+        assert!(!default_is_rate_limited(
+            r#"{"reason":"OVERAGE_REQUEST_LIMIT_EXCEEDED"}"#
+        ));
+        // 普通上游故障不应被误判为限流
+        assert!(!default_is_rate_limited("connection reset by peer"));
+        assert!(!default_is_rate_limited(
+            r#"{"message":"Internal server error"}"#
         ));
     }
 }

@@ -322,6 +322,35 @@ pub(super) fn map_provider_error(err: Error) -> Response {
             .into_response();
     }
 
+    // Pure upstream rate limiting (ThrottlingException / SERVICE_REQUEST_RATE_EXCEEDED):
+    // the request was simply too fast; the account quota is NOT exhausted and a short
+    // backoff will succeed. If this falls through to the 502 bottom default, CPA treats
+    // it as an upstream service failure and cools the claude credential down for 60s;
+    // with a single active credential that turns one rate-limit into a 60s burst of 503
+    // (auth_unavailable). Mapping it to 429 makes CPA take the quota-backoff path (base
+    // 1s, far below 60s) and is semantically honest (it really is rate limiting, not a
+    // client-side 400). A Retry-After hint lets CPA size the backoff precisely.
+    if crate::kiro::endpoint::default_is_rate_limited(&err_str) {
+        tracing::warn!(
+            error = %err,
+            "upstream rate limited (throttling; mapped to 429 to avoid a 60s false cooldown)"
+        );
+        let mut resp = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                "Upstream is rate limiting requests; retry after a short delay.".to_string(),
+            )),
+        )
+            .into_response();
+        // Conservative retry hint; CPA reads Retry-After to size its backoff.
+        if let Ok(value) = axum::http::HeaderValue::from_str("1") {
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, value);
+        }
+        return resp;
+    }
+
     tracing::error!("Kiro API 调用失败: {}", err);
     (
         StatusCode::BAD_GATEWAY,
@@ -1634,6 +1663,29 @@ mod tests {
             "ValidationException: transient backend issue".to_string()
         ));
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn rate_limit_throttling_maps_to_429_not_502() {
+        // 纯速率限流（SERVICE_REQUEST_RATE_EXCEEDED / ThrottlingException）是
+        // "请求太快、慢点重试"的瞬态信号，账号配额并未耗尽。
+        //
+        // 若兜底成 502，CPA 会把它当上游服务故障，对该 claude 凭据冷却 60 秒；
+        // 单凭据场景下 60 秒内所有请求秒回 503（auth_unavailable 风暴）。
+        //
+        // 映射成 429 后，CPA 走配额退避分支（base 1 秒，远小于 60 秒），
+        // 且语义诚实（确实是限流，不是把限流谎称成客户端 400）。
+        for needle in [
+            // provider 错误串里嵌着上游 throttling body（今天 2000 次真实样本的形态）
+            "流式 API 请求失败: 429 Too Many Requests {\"__type\":\"com.amazon.kiro.runtimeservice#ThrottlingException\",\"message\":\"Too many requests, please wait before trying again.\",\"reason\":\"SERVICE_REQUEST_RATE_EXCEEDED\"}",
+        ] {
+            let resp = map_provider_error(anyhow::anyhow!(needle.to_string()));
+            assert_eq!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "速率限流 `{needle}` 应映射为 429（而非 502），避免触发 60 秒 cooldown 风暴"
+            );
+        }
     }
 
     #[test]
