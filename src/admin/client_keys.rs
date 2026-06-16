@@ -453,10 +453,14 @@ impl ClientKeyManager {
     /// 用 `ConstantTimeEq` 对所有 active Key 做常量时间比对，防止时序攻击；
     /// 之前的 HashMap 直接 lookup 仅作快速短路（命中后还会再做一次常量时间比较）。
     pub fn verify_and_touch(&self, presented: &str) -> Option<u64> {
-        if !presented.starts_with(CLIENT_KEY_PREFIX) {
-            return None;
-        }
         let mut inner = self.inner.write();
+        // NOTE(local): do NOT fast-reject keys lacking the `csk_` prefix here.
+        // The bootstrapped system key (id=0, imported from config.json `apiKey`)
+        // keeps its original non-`csk_` plaintext (e.g. `sk-kiro-rs-...`). Upstream
+        // v0.6.6 routes ALL `/v1` traffic through this verifier, so an early
+        // prefix reject would 401 the system/master key and break CPA->kiro auth.
+        // The constant-time scan below already compares against every stored key
+        // (system key included), so the prefix check was only an optimization.
         // 第一遍：扫描所有 entry 做常量时间比较，避免 HashMap 短路泄露
         let mut hit_id: Option<u64> = None;
         for (id, ck) in inner.entries.iter() {
