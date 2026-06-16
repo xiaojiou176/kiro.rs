@@ -1,19 +1,25 @@
 import { useState } from 'react'
 import { toast } from 'sonner'
 import {
-  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil,
+  Plus, KeyRound, Trash2, Copy, Eye, EyeOff, Power, RotateCcw, Pencil, RefreshCw,
 } from 'lucide-react'
 import { Card, CardContent } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import {
+  DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
+} from '@/components/ui/dropdown-menu'
+import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription,
 } from '@/components/ui/dialog'
 import {
   useClientKeys, useCreateClientKey, useDeleteClientKey,
   useSetClientKeyDisabled, useResetClientKeyStats, useUpdateClientKey,
+  useRotateClientKey,
 } from '@/hooks/use-client-keys'
+import { useGroupOptions } from '@/hooks/use-groups'
+import { GroupSingleSelect } from '@/components/group-select'
 import type { ClientKeyItem, CreateClientKeyResponse } from '@/types/api'
 import { extractErrorMessage } from '@/lib/utils'
 import { useConfirm } from '@/components/ui/confirm-dialog'
@@ -36,16 +42,20 @@ function formatRelative(ts?: string): string {
 
 export function ClientKeysPage() {
   const { data, isLoading } = useClientKeys()
+  // 已注册分组列表（来自 groups.json 注册表，与凭据的 groups 字段解耦）
+  const groupOptions = useGroupOptions()
   const createKey = useCreateClientKey()
   const deleteKey = useDeleteClientKey()
   const setDisabled = useSetClientKeyDisabled()
   const resetStats = useResetClientKeyStats()
   const updateKey = useUpdateClientKey()
+  const rotateKey = useRotateClientKey()
   const confirm = useConfirm()
 
   const [createOpen, setCreateOpen] = useState(false)
   const [createName, setCreateName] = useState('')
   const [createDesc, setCreateDesc] = useState('')
+  const [createGroup, setCreateGroup] = useState('')
   const [createdKey, setCreatedKey] = useState<CreateClientKeyResponse | null>(null)
   const [showCreatedPlain, setShowCreatedPlain] = useState(true)
 
@@ -53,6 +63,7 @@ export function ClientKeysPage() {
   const [editTarget, setEditTarget] = useState<ClientKeyItem | null>(null)
   const [editName, setEditName] = useState('')
   const [editDesc, setEditDesc] = useState('')
+  const [editGroup, setEditGroup] = useState('')
 
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -62,11 +73,16 @@ export function ClientKeysPage() {
       return
     }
     try {
-      const res = await createKey.mutateAsync({ name, description: createDesc.trim() || undefined })
+      const res = await createKey.mutateAsync({
+        name,
+        description: createDesc.trim() || undefined,
+        group: createGroup.trim() || undefined,
+      })
       setCreatedKey(res)
       setCreateOpen(false)
       setCreateName('')
       setCreateDesc('')
+      setCreateGroup('')
       setShowCreatedPlain(true)
     } catch (err) {
       toast.error('创建失败：' + extractErrorMessage(err))
@@ -117,10 +133,37 @@ export function ClientKeysPage() {
     }
   }
 
+  const handleRotate = async (item: ClientKeyItem) => {
+    const systemHint = item.isSystem
+      ? '这是系统密钥（config.json apiKey），重新生成后会同步更新 config.json 的 apiKey。'
+      : ''
+    if (
+      !(await confirm({
+        title: '重新生成 Key',
+        description: `重新生成 Key "${item.name}"？旧明文将立即失效，使用旧明文的下游需要换上新明文才能继续调用。Key 的名称、描述、绑定分组与累计统计保留不变。${systemHint ? ' ' + systemHint : ''}`,
+        confirmText: '重新生成',
+        destructive: true,
+      }))
+    )
+      return
+    try {
+      const res = await rotateKey.mutateAsync(item.id)
+      setCreatedKey(res)
+      setShowCreatedPlain(true)
+      // 系统密钥轮换后本地存储的 apiKey 已失效，提示用户用新明文重新登录
+      if (item.isSystem) {
+        toast.info('系统密钥已更新，若你正用该密钥登录管理面板，请用新明文重新登录')
+      }
+    } catch (err) {
+      toast.error('重新生成失败：' + extractErrorMessage(err))
+    }
+  }
+
   const startEdit = (item: ClientKeyItem) => {
     setEditTarget(item)
     setEditName(item.name)
     setEditDesc(item.description ?? '')
+    setEditGroup(item.group ?? '')
     setEditOpen(true)
   }
 
@@ -130,7 +173,7 @@ export function ClientKeysPage() {
     try {
       await updateKey.mutateAsync({
         id: editTarget.id,
-        req: { name: editName.trim(), description: editDesc.trim() },
+        req: { name: editName.trim(), description: editDesc.trim(), group: editGroup.trim() },
       })
       toast.success('已更新')
       setEditOpen(false)
@@ -183,8 +226,10 @@ export function ClientKeysPage() {
             <table className="w-full min-w-[920px] text-sm">
               <thead className="text-[12px] text-muted-foreground border-b border-border/60">
                 <tr className="whitespace-nowrap">
+                  <th className="text-left font-medium px-4 py-3">ID</th>
                   <th className="text-left font-medium px-4 py-3">名称</th>
                   <th className="text-left font-medium px-4 py-3">Key</th>
+                  <th className="text-left font-medium px-4 py-3">分组</th>
                   <th className="text-left font-medium px-4 py-3">状态</th>
                   <th className="text-right font-medium px-4 py-3">总调用</th>
                   <th className="text-right font-medium px-4 py-3">输入</th>
@@ -196,8 +241,18 @@ export function ClientKeysPage() {
               <tbody>
                 {data.keys.map((k) => (
                   <tr key={k.id} className="border-t border-border/40 whitespace-nowrap">
+                    <td className="px-4 py-3 font-mono text-[12px] text-muted-foreground tabular-nums">
+                      #{k.id}
+                    </td>
                     <td className="px-4 py-3">
-                      <div className="max-w-[220px] truncate font-medium">{k.name}</div>
+                      <div className="flex items-center gap-1.5">
+                        <span className="max-w-[220px] truncate font-medium">{k.name}</span>
+                        {k.isSystem && (
+                          <Badge variant="secondary" title="由 config.json apiKey 导入，不可删除 / 不可轮换">
+                            系统
+                          </Badge>
+                        )}
+                      </div>
                       {k.description && (
                         <div className="max-w-[220px] truncate text-[11px] text-muted-foreground">
                           {k.description}
@@ -205,7 +260,30 @@ export function ClientKeysPage() {
                       )}
                     </td>
                     <td className="px-4 py-3">
-                      <code className="text-[12px] font-mono text-muted-foreground">{k.maskedKey}</code>
+                      <DropdownMenu>
+                        <DropdownMenuTrigger asChild>
+                          <button
+                            type="button"
+                            className="rounded px-1 py-0.5 font-mono text-[12px] text-muted-foreground hover:bg-accent/60 focus:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                            title="点击展开 Key 操作"
+                          >
+                            {k.maskedKey}
+                          </button>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="start">
+                          <DropdownMenuItem onSelect={() => handleRotate(k)}>
+                            <RefreshCw className="h-3.5 w-3.5" />
+                            重新生成 Key（旧 Key 立即失效）
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </td>
+                    <td className="px-4 py-3">
+                      {k.group ? (
+                        <Badge variant="outline">{k.group}</Badge>
+                      ) : (
+                        <span className="text-[12px] text-muted-foreground">全部账号</span>
+                      )}
                     </td>
                     <td className="px-4 py-3">
                       {k.disabled ? (
@@ -249,15 +327,17 @@ export function ClientKeysPage() {
                         >
                           <RotateCcw className="h-3.5 w-3.5" />
                         </Button>
-                        <Button
-                          size="icon"
-                          variant="ghost"
-                          className="h-7 w-7"
-                          onClick={() => handleDelete(k)}
-                          title="删除"
-                        >
-                          <Trash2 className="h-3.5 w-3.5 text-destructive" />
-                        </Button>
+                        {!k.isSystem && (
+                          <Button
+                            size="icon"
+                            variant="ghost"
+                            className="h-7 w-7"
+                            onClick={() => handleDelete(k)}
+                            title="删除"
+                          >
+                            <Trash2 className="h-3.5 w-3.5 text-destructive" />
+                          </Button>
+                        )}
                       </div>
                     </td>
                   </tr>
@@ -296,6 +376,19 @@ export function ClientKeysPage() {
                 onChange={(e) => setCreateDesc(e.target.value)}
                 disabled={createKey.isPending}
               />
+            </div>
+            <div>
+              <label className="text-[12px] text-muted-foreground">绑定分组（可选）</label>
+              <GroupSingleSelect
+                value={createGroup}
+                options={groupOptions}
+                onChange={setCreateGroup}
+                disabled={createKey.isPending}
+                noneLabel="（不绑定，可用全部账号）"
+              />
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                绑定后该 Key 仅会使用含此分组的账号（严格隔离，分组内无可用账号时请求会失败）。
+              </p>
             </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setCreateOpen(false)} disabled={createKey.isPending}>
@@ -377,6 +470,19 @@ export function ClientKeysPage() {
             <div>
               <label className="text-[12px] text-muted-foreground">描述</label>
               <Input value={editDesc} onChange={(e) => setEditDesc(e.target.value)} />
+            </div>
+            <div>
+              <label className="text-[12px] text-muted-foreground">绑定分组</label>
+              <GroupSingleSelect
+                value={editGroup}
+                options={groupOptions}
+                onChange={setEditGroup}
+                disabled={updateKey.isPending}
+                noneLabel="（不绑定，可用全部账号）"
+              />
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                绑定后仅调度该分组内账号（严格隔离）。选「不绑定」表示解除绑定。
+              </p>
             </div>
             <DialogFooter>
               <Button type="button" variant="outline" onClick={() => setEditOpen(false)}>取消</Button>

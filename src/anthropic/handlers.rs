@@ -130,10 +130,26 @@ pub(crate) struct RequestTracer {
     model: String,
     is_stream: bool,
     started_at: Instant,
+    /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
+    first_token_at: parking_lot::Mutex<Option<Instant>>,
     attempts: parking_lot::Mutex<Vec<TraceAttempt>>,
-    /// 最终 token 用量 (input, output, cache_creation, cache_read)，互斥口径。
-    /// 由各上报路径在 token 算出后调 [`Self::set_usage`] 填入，finalize 时落库。
-    usage: parking_lot::Mutex<Option<(i32, i32, i32, i32)>>,
+}
+
+/// 本次请求的用量快照（落入 trace 行，与 usage_log 同源）
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TraceUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub credits: f64,
+}
+
+impl TraceUsage {
+    /// 错误早退等无用量场景
+    pub fn zero() -> Self {
+        Self::default()
+    }
 }
 
 struct RequestTraceOptions {
@@ -153,15 +169,17 @@ impl RequestTracer {
             model: options.model,
             is_stream: options.is_stream,
             started_at: Instant::now(),
+            first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
-            usage: parking_lot::Mutex::new(None),
         }
     }
 
-    /// 记录本次请求的最终 token 用量（互斥口径，与 usage 日志 / SSE 上报同源）。
-    /// 在 finalize 之前调用；多次调用以最后一次为准。
-    pub fn set_usage(&self, input: i32, output: i32, cache_creation: i32, cache_read: i32) {
-        *self.usage.lock() = Some((input, output, cache_creation, cache_read));
+    /// 标记首个上游 chunk 到达（幂等，仅记录第一次）
+    pub fn mark_first_token(&self) {
+        let mut slot = self.first_token_at.lock();
+        if slot.is_none() {
+            *slot = Some(Instant::now());
+        }
     }
 
     /// 组装并落库一条完整链路。store 为 None 时不做任何事。
@@ -171,14 +189,16 @@ impl RequestTracer {
         error_type: Option<&str>,
         error_message: Option<&str>,
         interrupted_after_bytes: Option<u64>,
+        usage: TraceUsage,
     ) {
         let Some(store) = &self.store else { return };
         let attempts = std::mem::take(&mut *self.attempts.lock());
         // 最终凭据：最后一跳的命中凭据（成功跳即命中凭据，失败跳即最后尝试的凭据）
         let final_credential_id = attempts.last().map(|a| a.credential_id).unwrap_or(0);
-        // 最终 token 用量（互斥口径）；未上报时记 0。
-        let (input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens) =
-            self.usage.lock().unwrap_or((0, 0, 0, 0));
+        let first_token_ms = self
+            .first_token_at
+            .lock()
+            .map(|t| t.duration_since(self.started_at).as_millis() as u64);
         let rec = TraceRecord {
             trace_id: self.trace_id.clone(),
             ts: self.ts.clone(),
@@ -193,10 +213,12 @@ impl RequestTracer {
             total_attempts: attempts.len() as u32,
             duration_ms: self.started_at.elapsed().as_millis() as u64,
             interrupted_after_bytes,
-            input_tokens: input_tokens.max(0) as u64,
-            output_tokens: output_tokens.max(0) as u64,
-            cache_creation_tokens: cache_creation_tokens.max(0) as u64,
-            cache_read_tokens: cache_read_tokens.max(0) as u64,
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            credits: usage.credits,
+            first_token_ms,
             attempts,
         };
         store.insert(&rec);
@@ -605,7 +627,7 @@ pub async fn post_messages(
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
         tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
-        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream)
+        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone())
             .await;
     }
 
@@ -688,7 +710,7 @@ pub async fn post_messages(
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
-                key_ctx,
+                key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: true,
             },
@@ -704,6 +726,7 @@ pub async fn post_messages(
             hook,
             cache_usage,
             tracer,
+            key_ctx.group.clone(),
         )
         .await
     } else {
@@ -712,7 +735,7 @@ pub async fn post_messages(
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
-                key_ctx,
+                key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: false,
             },
@@ -728,6 +751,7 @@ pub async fn post_messages(
             hook,
             cache_usage,
             tracer,
+            key_ctx.group.clone(),
         )
         .await
     }
@@ -745,14 +769,15 @@ async fn handle_stream_request(
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
+    group: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref())).await {
+    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
             // 重试链路全部失败、未开始返回内容：error_type 取最后一跳分类
-            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None);
+            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
             return map_provider_error(e);
         }
     };
@@ -819,6 +844,7 @@ fn create_sse_stream(
                 chunk_result = body_stream.next() => {
                     match chunk_result {
                         Some(Ok(chunk)) => {
+                            tracer.mark_first_token();
                             sent_bytes += chunk.len() as u64;
                             // 解码事件
                             if let Err(e) = decoder.feed(&chunk) {
@@ -852,13 +878,14 @@ fn create_sse_stream(
                             tracing::error!("读取响应流失败: {}", e);
                             // 发送最终事件并结束（记为 error）
                             let final_events = ctx.generate_final_events();
-                            record_stream_usage(&hook, &ctx, credential_id, "error", &tracer);
+                            record_stream_usage(&hook, &ctx, credential_id, "error");
                             // 已开始返回内容后上游断流：标记为 interrupted，带已发送字节数
                             tracer.finalize(
                                 "interrupted",
                                 Some(outcome::STREAM_INTERRUPTED),
                                 Some(&e.to_string()),
                                 Some(sent_bytes),
+                                stream_trace_usage(&ctx),
                             );
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
@@ -869,8 +896,8 @@ fn create_sse_stream(
                         None => {
                             // 流结束，发送最终事件
                             let final_events = ctx.generate_final_events();
-                            record_stream_usage(&hook, &ctx, credential_id, "success", &tracer);
-                            tracer.finalize("success", None, None, None);
+                            record_stream_usage(&hook, &ctx, credential_id, "success");
+                            tracer.finalize("success", None, None, None, stream_trace_usage(&ctx));
                             let bytes: Vec<Result<Bytes, Infallible>> = final_events
                                 .into_iter()
                                 .map(|e| Ok(Bytes::from(e.to_sse_string())))
@@ -893,15 +920,14 @@ fn create_sse_stream(
     initial_stream.chain(processing_stream)
 }
 
-/// 从 StreamContext 提取最终用量，写入 hook，并同步给 tracer（trace 与 usage 同源）。
+/// 从 StreamContext 提取最终用量并写入 hook
 fn record_stream_usage(
     hook: &UsageRecordHook,
     ctx: &StreamContext,
     credential_id: u64,
     status: &str,
-    tracer: &RequestTracer,
 ) {
-    // 互斥分摊后的 (input, cache_creation, cache_read)，与 SSE 上报口径一致。
+    // 互斥分摊后的 (input, cache_creation, cache_read)，与 trace 上报口径一致。
     let (input, cache_creation, cache_read) = ctx.resolved_usage();
     hook.record(
         credential_id,
@@ -912,7 +938,18 @@ fn record_stream_usage(
         ctx.credits,
         status,
     );
-    tracer.set_usage(input, ctx.output_tokens, cache_creation, cache_read);
+}
+
+/// 从 StreamContext 提取用量，转成 trace 行用量（与 record_stream_usage 同源）
+fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
+    let (input, cache_creation, cache_read) = ctx.resolved_usage();
+    TraceUsage {
+        input_tokens: input.max(0) as u64,
+        output_tokens: ctx.output_tokens.max(0) as u64,
+        cache_creation_tokens: cache_creation.max(0) as u64,
+        cache_read_tokens: cache_read.max(0) as u64,
+        credits: if ctx.credits.is_finite() && ctx.credits > 0.0 { ctx.credits } else { 0.0 },
+    }
 }
 
 use super::converter::get_context_window_size;
@@ -931,13 +968,14 @@ async fn handle_non_stream_request(
     hook: UsageRecordHook,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
+    group: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api(request_body, Some(tracer.as_ref())).await {
+    let call_result = match provider.call_api(request_body, Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None);
+            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
             return map_provider_error(e);
         }
     };
@@ -955,6 +993,7 @@ async fn handle_non_stream_request(
                 Some(outcome::STREAM_INTERRUPTED),
                 Some(&e.to_string()),
                 None,
+                TraceUsage::zero(),
             );
             return (
                 StatusCode::BAD_GATEWAY,
@@ -982,9 +1021,8 @@ async fn handle_non_stream_request(
     let mut stop_reason = "end_turn".to_string();
     // 从 contextUsageEvent 计算的实际输入 tokens
     let mut context_input_tokens: Option<i32> = None;
-    // meteringEvent 上报的 token 与缓存数据
-    // 上游 metering 只给 credit；input 来自 contextUsage，output 来自估算。
-    // 缓存 input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
+    // meteringEvent 上报的 credit 计费量（上游真实下发）；
+    // input/cache_* 的互斥分摊在拿到 total 真值后由 cache_usage 完成。
     let mut credits: f64 = 0.0;
 
     // 收集工具调用的增量 JSON
@@ -1108,9 +1146,9 @@ async fn handle_non_stream_request(
     // 估算输出 tokens（上游不下发 token，全部走估算）
     let output_tokens = token::estimate_output_tokens(&content);
 
-    // 全量 prompt token：contextUsage 真实值优先，否则用客户端估算。
+    // 输入 tokens：contextUsage 真实值优先，否则用客户端估算
     let total_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
-    // 互斥分摊：total − 缓存覆盖 = 未缓存 input；三者相加恒等于 total。
+    // 互斥分摊：input + cache_creation + cache_read == total
     let (final_input_tokens, cache_creation_tokens, cache_read_tokens) =
         cache_usage.split_against_total(total_input_tokens);
 
@@ -1140,13 +1178,19 @@ async fn handle_non_stream_request(
         credits,
         "success",
     );
-    tracer.set_usage(
-        final_input_tokens,
-        output_tokens,
-        cache_creation_tokens,
-        cache_read_tokens,
+    tracer.finalize(
+        "success",
+        None,
+        None,
+        None,
+        TraceUsage {
+            input_tokens: final_input_tokens.max(0) as u64,
+            output_tokens: output_tokens.max(0) as u64,
+            cache_creation_tokens: cache_creation_tokens.max(0) as u64,
+            cache_read_tokens: cache_read_tokens.max(0) as u64,
+            credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+        },
     );
-    tracer.finalize("success", None, None, None);
     (StatusCode::OK, Json(response_body)).into_response()
 }
 
@@ -1337,7 +1381,7 @@ pub async fn post_messages_cc(
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
         tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
-        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream)
+        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone())
             .await;
     }
 
@@ -1407,8 +1451,7 @@ pub async fn post_messages_cc(
     let tool_name_map = conversion_result.tool_name_map;
     let known_tool_names = conversion_result.known_tool_names;
 
-    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存。
-    // 返回 estimate 口径的覆盖量；真实 input/cache 互斥分摊在拿到 total 真值时进行。
+    // CacheMeter：根据 cache_control 断点查 / 写中转层提示词缓存（estimate 口径）。
     let cache_usage = state
         .cache_meter
         .as_ref()
@@ -1420,7 +1463,7 @@ pub async fn post_messages_cc(
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
-                key_ctx,
+                key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: true,
             },
@@ -1436,6 +1479,7 @@ pub async fn post_messages_cc(
             total_input_tokens,
             cache_usage,
             tracer,
+            key_ctx.group.clone(),
         )
         .await
     } else {
@@ -1444,7 +1488,7 @@ pub async fn post_messages_cc(
         let tracer = std::sync::Arc::new(RequestTracer::new(
             &state,
             RequestTraceOptions {
-                key_ctx,
+                key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: false,
             },
@@ -1460,6 +1504,7 @@ pub async fn post_messages_cc(
             hook,
             cache_usage,
             tracer,
+            key_ctx.group.clone(),
         )
         .await
     }
@@ -1480,13 +1525,14 @@ async fn handle_stream_request_buffered(
     fallback_input_tokens: i32,
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
+    group: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref())).await {
+    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
-            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None);
+            tracer.finalize("error", last_attempt_outcome(&tracer), Some(&e.to_string()), None, TraceUsage::zero());
             return map_provider_error(e);
         }
     };
@@ -1566,6 +1612,7 @@ fn create_buffered_sse_stream(
                     chunk_result = body_stream.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
+                                tracer.mark_first_token();
                                 sent_bytes += chunk.len() as u64;
                                 // 解码事件
                                 if let Err(e) = decoder.feed(&chunk) {
@@ -1593,13 +1640,19 @@ fn create_buffered_sse_stream(
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
                                 hook.record(credential_id, i, o, cc, cr, credits, "error");
-                                tracer.set_usage(i, o, cc, cr);
                                 // 缓冲模式 chunk 读取失败：上游中途断流
                                 tracer.finalize(
                                     "interrupted",
                                     Some(outcome::STREAM_INTERRUPTED),
                                     Some(&e.to_string()),
                                     Some(sent_bytes),
+                                    TraceUsage {
+                                        input_tokens: i.max(0) as u64,
+                                        output_tokens: o.max(0) as u64,
+                                        cache_creation_tokens: cc.max(0) as u64,
+                                        cache_read_tokens: cr.max(0) as u64,
+                                        credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+                                    },
                                 );
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
@@ -1612,8 +1665,19 @@ fn create_buffered_sse_stream(
                                 let all_events = ctx.finish_and_get_all_events();
                                 let (i, o, cc, cr, credits) = ctx.final_usage();
                                 hook.record(credential_id, i, o, cc, cr, credits, "success");
-                                tracer.set_usage(i, o, cc, cr);
-                                tracer.finalize("success", None, None, None);
+                                tracer.finalize(
+                                    "success",
+                                    None,
+                                    None,
+                                    None,
+                                    TraceUsage {
+                                        input_tokens: i.max(0) as u64,
+                                        output_tokens: o.max(0) as u64,
+                                        cache_creation_tokens: cc.max(0) as u64,
+                                        cache_read_tokens: cr.max(0) as u64,
+                                        credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+                                    },
+                                );
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
                                     .into_iter()
                                     .map(|e| Ok(Bytes::from(e.to_sse_string())))

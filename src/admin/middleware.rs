@@ -13,6 +13,7 @@ use axum::{
 };
 
 use super::client_keys::SharedClientKeyManager;
+use super::groups::SharedGroupManager;
 use super::service::AdminService;
 use super::trace_db::SharedTraceStore;
 use super::types::AdminErrorResponse;
@@ -22,10 +23,8 @@ use crate::common::auth;
 /// Admin API 共享状态
 #[derive(Clone)]
 pub struct AdminState {
-    /// Admin API 密钥（运行时可修改）
+    /// 登录API密钥（管理面板登录用，运行时可修改）
     pub admin_api_key: Arc<RwLock<String>>,
-    /// 管理员API密钥（运行时可修改，与 anthropic 路由共享）
-    pub api_key: Arc<RwLock<String>>,
     /// Admin 服务
     pub service: Arc<AdminService>,
     /// 客户端 Key 管理器（与 anthropic 路由共享）
@@ -34,29 +33,31 @@ pub struct AdminState {
     pub usage_aggregator: SharedAggregator,
     /// 请求链路追踪存储（与 anthropic 路由共享）
     pub trace_store: SharedTraceStore,
+    /// 账号分组注册表（持久化到 groups.json）
+    pub groups: SharedGroupManager,
 }
 
 impl AdminState {
     pub fn new(
         admin_api_key: impl Into<String>,
-        api_key: Arc<RwLock<String>>,
         service: AdminService,
         client_keys: SharedClientKeyManager,
         usage_aggregator: SharedAggregator,
         trace_store: SharedTraceStore,
+        groups: SharedGroupManager,
     ) -> Self {
         Self {
             admin_api_key: Arc::new(RwLock::new(admin_api_key.into())),
-            api_key,
             service: Arc::new(service),
             client_keys,
             usage_aggregator,
             trace_store,
+            groups,
         }
     }
 }
 
-/// Admin API 认证中间件
+/// Admin API 认证中间件 — 校验登录API密钥（adminApiKey）
 pub async fn admin_auth_middleware(
     State(state): State<AdminState>,
     request: Request<Body>,

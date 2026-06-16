@@ -28,6 +28,7 @@ import {
   Copy,
   Wand2,
   Zap,
+  Tags,
 } from "lucide-react";
 
 function GithubIcon({ className }: { className?: string }) {
@@ -68,6 +69,7 @@ import {
 import { CredentialCard } from "@/components/credential-card";
 import { AddCredentialDialog } from "@/components/add-credential-dialog";
 import { BatchImportDialog } from "@/components/batch-import-dialog";
+import { BatchEditCredentialDialog } from "@/components/batch-edit-credential-dialog";
 import { IdcLoginDialog } from "@/components/idc-login-dialog";
 import { SocialLoginDialog } from "@/components/social-login-dialog";
 import { KamImportDialog } from "@/components/kam-import-dialog";
@@ -89,7 +91,15 @@ import {
 } from "@/hooks/use-credentials";
 import { useUpdateCheck } from "@/hooks/use-update-check";
 import { useFailureStats } from "@/hooks/use-traces";
+import { useGroupOptions } from "@/hooks/use-groups";
 import { useRectSelect } from "@/hooks/use-rect-select";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import {
   DndContext,
   PointerSensor,
@@ -106,11 +116,10 @@ import {
 import {
   getCredentialBalance,
   forceRefreshToken,
-  updateAdminKey,
   disableQuotaExceeded,
-  updateApiKey,
   enableOverageForAllCapable,
   exportKamCredentials,
+  updateAdminKey,
 } from "@/api/credentials";
 import {
   extractErrorMessage,
@@ -131,6 +140,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const confirm = useConfirm();
   const [addDialogOpen, setAddDialogOpen] = useState(false);
   const [batchImportDialogOpen, setBatchImportDialogOpen] = useState(false);
+  const [batchEditDialogOpen, setBatchEditDialogOpen] = useState(false);
   const [idcLoginDialogOpen, setIdcLoginDialogOpen] = useState(false);
   const [enterpriseLoginDialogOpen, setEnterpriseLoginDialogOpen] = useState(false);
   const [socialLoginDialogOpen, setSocialLoginDialogOpen] = useState(false);
@@ -141,8 +151,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const [newAdminKey, setNewAdminKey] = useState("");
   const [updatingAdminKey, setUpdatingAdminKey] = useState(false);
   const [showAdminKeyPlain, setShowAdminKeyPlain] = useState(false);
-  /** 当前对话框正在编辑哪个 Key：'admin' = 管理面板登录 Key；'api' = 业务 /v1 流量 Key */
-  const [keyEditMode, setKeyEditMode] = useState<"admin" | "api">("admin");
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [verifyDialogOpen, setVerifyDialogOpen] = useState(false);
   const [verifying, setVerifying] = useState(false);
@@ -191,11 +199,30 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   const setPriority = useSetPriority();
   const { data: updateCheck } = useUpdateCheck();
   const { data: failureStatsMap } = useFailureStats();
+  const groupOptions = useGroupOptions();
 
-  const totalPages = Math.ceil((data?.credentials.length || 0) / itemsPerPage);
+  // 分组筛选：'' = 全部；'__none__' = 仅显示未分组；其他 = 按分组名筛选
+  const [groupFilter, setGroupFilter] = useState<string>('');
+
+  // 应用分组筛选后的凭据全集（分页前先过滤，确保翻页粒度正确）
+  const filteredCredentials = (() => {
+    const all = data?.credentials ?? [];
+    if (!groupFilter) return all;
+    if (groupFilter === '__none__') {
+      return all.filter((c) => !c.groups || c.groups.length === 0);
+    }
+    return all.filter((c) => c.groups?.includes(groupFilter));
+  })();
+
+  // 切换分组筛选时复位到第 1 页，避免空页
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [groupFilter]);
+
+  const totalPages = Math.ceil(filteredCredentials.length / itemsPerPage);
   const startIndex = (currentPage - 1) * itemsPerPage;
   const endIndex = startIndex + itemsPerPage;
-  const serverPageCreds = data?.credentials.slice(startIndex, endIndex) || [];
+  const serverPageCreds = filteredCredentials.slice(startIndex, endIndex);
   // 拖拽排序的本地乐观顺序：仅当 id 集合与当前页一致时生效，否则回落到服务端顺序，
   // 避免翻页 / 数据变更后顺序错乱。
   const [pageOrder, setPageOrder] = useState<number[] | null>(null);
@@ -793,6 +820,28 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
   };
 
   const [exportingKam, setExportingKam] = useState(false);
+
+  const handleUpdateAdminKey = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const key = newAdminKey.trim();
+    if (!key) {
+      toast.error("新登录API密钥不能为空");
+      return;
+    }
+    setUpdatingAdminKey(true);
+    try {
+      await updateAdminKey({ newKey: key });
+      storage.setApiKey(key);
+      toast.success("登录API密钥已更新，已自动切换到新 Key");
+      setAdminKeyDialogOpen(false);
+      setNewAdminKey("");
+    } catch (error) {
+      toast.error(`更新失败: ${extractErrorMessage(error)}`);
+    } finally {
+      setUpdatingAdminKey(false);
+    }
+  };
+
   const handleExportKam = async () => {
     if (selectedIds.size === 0) {
       toast.info("请先勾选要导出的凭据");
@@ -835,37 +884,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
     }
   };
 
-  const handleUpdateAdminKey = async (e: React.FormEvent) => {
-    e.preventDefault();
-    const key = newAdminKey.trim();
-    if (!key) {
-      toast.error(
-        keyEditMode === "admin"
-          ? "新登录API密钥不能为空"
-          : "新管理员API密钥不能为空",
-      );
-      return;
-    }
-    setUpdatingAdminKey(true);
-    try {
-      if (keyEditMode === "admin") {
-        await updateAdminKey({ newKey: key });
-        storage.setApiKey(key);
-        toast.success("登录API密钥已更新，已自动切换到新 Key");
-      } else {
-        await updateApiKey({ newKey: key });
-        toast.success(
-          "管理员API密钥已更新，所有使用 /v1 接口的客户端都需要切换",
-        );
-      }
-      setAdminKeyDialogOpen(false);
-      setNewAdminKey("");
-    } catch (error) {
-      toast.error(`更新失败: ${extractErrorMessage(error)}`);
-    } finally {
-      setUpdatingAdminKey(false);
-    }
-  };
 
   const handleToggleLoadBalancing = () => {
     const cur = loadBalancingData?.mode || "priority";
@@ -1000,7 +1018,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
                   <DropdownMenuItem
                     onSelect={() => {
-                      setKeyEditMode("admin");
                       setNewAdminKey("");
                       setShowAdminKeyPlain(false);
                       setAdminKeyDialogOpen(true);
@@ -1008,17 +1025,6 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   >
                     <Key />
                     修改登录API密钥（管理面板登录）
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    onSelect={() => {
-                      setKeyEditMode("api");
-                      setNewAdminKey("");
-                      setShowAdminKeyPlain(false);
-                      setAdminKeyDialogOpen(true);
-                    }}
-                  >
-                    <Key />
-                    修改管理员API密钥（客户端 /v1 调用）
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
@@ -1094,7 +1100,24 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             <h2 className="text-lg font-semibold tracking-tight">凭据列表</h2>
             {data?.credentials && data.credentials.length > 0 && (
-              <Badge variant="secondary">{data.credentials.length}</Badge>
+              <Badge variant="secondary">
+                {groupFilter
+                  ? `${filteredCredentials.length} / ${data.credentials.length}`
+                  : data.credentials.length}
+              </Badge>
+            )}
+            {groupFilter && (
+              <Badge variant="outline" className="gap-1">
+                筛选：{groupFilter === '__none__' ? '未分组' : groupFilter}
+                <button
+                  type="button"
+                  className="ml-1 text-muted-foreground hover:text-foreground"
+                  onClick={() => setGroupFilter('')}
+                  title="清除筛选"
+                >
+                  ×
+                </button>
+              </Badge>
             )}
             {currentCredentials.length > 0 && (
               <Button
@@ -1169,6 +1192,15 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                   恢复异常
                 </Button>
                 <Button
+                  onClick={() => setBatchEditDialogOpen(true)}
+                  size="sm"
+                  variant="outline"
+                  title="批量编辑分组 / 来源渠道"
+                >
+                  <Tags className="h-3.5 w-3.5" />
+                  分组/来源
+                </Button>
+                <Button
                   onClick={handleExportKam}
                   size="sm"
                   variant="outline"
@@ -1192,6 +1224,25 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 <span className="mx-1 hidden h-5 w-px bg-border/70 sm:inline-block" />
               </>
             )}
+
+            {/* 分组筛选 */}
+            <Select value={groupFilter || 'all'} onValueChange={(v) => setGroupFilter(v === 'all' ? '' : v)}>
+              <SelectTrigger
+                className="h-8 w-full rounded-full border-border bg-card/60 px-3 backdrop-blur sm:w-[160px]"
+                title="按分组筛选凭据"
+              >
+                <SelectValue placeholder="全部分组" />
+              </SelectTrigger>
+              <SelectContent align="end">
+                <SelectItem value="all">全部分组</SelectItem>
+                <SelectItem value="__none__">未分组</SelectItem>
+                {groupOptions.map((g) => (
+                  <SelectItem key={g} value={g}>
+                    {g}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
 
             {/* 刷新当前页余额 */}
             <Button
@@ -1450,6 +1501,13 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         open={batchImportDialogOpen}
         onOpenChange={setBatchImportDialogOpen}
       />
+      <BatchEditCredentialDialog
+        open={batchEditDialogOpen}
+        onOpenChange={setBatchEditDialogOpen}
+        credentials={(data?.credentials ?? []).filter((c) => selectedIds.has(c.id))}
+        groupOptions={groupOptions}
+        onDone={deselectAll}
+      />
       <SocialLoginDialog
         open={socialLoginDialogOpen}
         onOpenChange={setSocialLoginDialogOpen}
@@ -1485,27 +1543,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
         onOpenChange={setImageUpdateDialogOpen}
       />
 
-      {rectSelection.active && rectSelection.rect && (
-        <div
-          className="pointer-events-none fixed z-50 rounded-sm border border-primary/70 bg-primary/15"
-          style={{
-            left: rectSelection.rect.left,
-            top: rectSelection.rect.top,
-            width: rectSelection.rect.width,
-            height: rectSelection.rect.height,
-          }}
-        />
-      )}
-      <BatchVerifyDialog
-        open={verifyDialogOpen}
-        onOpenChange={setVerifyDialogOpen}
-        verifying={verifying}
-        progress={verifyProgress}
-        results={verifyResults}
-        onCancel={handleCancelVerify}
-      />
-
-      {/* 修改登录API密钥对话框 */}
+      {/* 修改登录API密钥对话框（adminApiKey —— 管理面板登录密钥） */}
       <Dialog
         open={adminKeyDialogOpen}
         onOpenChange={(open) => {
@@ -1516,25 +1554,17 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Key className="h-4 w-4" />
-              {keyEditMode === "admin"
-                ? "修改登录API密钥"
-                : "修改管理员API密钥"}
+              修改登录API密钥
             </DialogTitle>
             <DialogDescription>
-              {keyEditMode === "admin"
-                ? "用于登录此管理面板。修改后将自动更新本地存储的 Key，无需重新登录。"
-                : "客户端调用 /v1/* 接口时携带的密钥。修改后所有第三方客户端（Cline、Cursor、SDK 等）都需要更新为新值。"}
+              用于登录此管理面板。修改后将自动更新本地存储的 Key，无需重新登录。
             </DialogDescription>
           </DialogHeader>
           <form onSubmit={handleUpdateAdminKey} className="space-y-4 py-2">
             <div className="relative">
               <Input
                 type={showAdminKeyPlain ? "text" : "password"}
-                placeholder={
-                  keyEditMode === "admin"
-                    ? "输入或生成新的登录API密钥"
-                    : "输入或生成新的管理员API密钥"
-                }
+                placeholder="输入或生成新的登录API密钥"
                 value={newAdminKey}
                 onChange={(e) => setNewAdminKey(e.target.value)}
                 disabled={updatingAdminKey}
@@ -1587,9 +1617,7 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
                 size="sm"
                 variant="outline"
                 onClick={() => {
-                  const key = generateApiKey(
-                    keyEditMode === "admin" ? "sk-admin-" : "sk-kiro-",
-                  );
+                  const key = generateApiKey("sk-admin-");
                   setNewAdminKey(key);
                   setShowAdminKeyPlain(true);
                 }}
@@ -1621,6 +1649,27 @@ export function Dashboard({ onLogout, embedded = false }: DashboardProps) {
           </form>
         </DialogContent>
       </Dialog>
+
+      {rectSelection.active && rectSelection.rect && (
+        <div
+          className="pointer-events-none fixed z-50 rounded-sm border border-primary/70 bg-primary/15"
+          style={{
+            left: rectSelection.rect.left,
+            top: rectSelection.rect.top,
+            width: rectSelection.rect.width,
+            height: rectSelection.rect.height,
+          }}
+        />
+      )}
+      <BatchVerifyDialog
+        open={verifyDialogOpen}
+        onOpenChange={setVerifyDialogOpen}
+        verifying={verifying}
+        progress={verifyProgress}
+        results={verifyResults}
+        onCancel={handleCancelVerify}
+      />
+
     </div>
   );
 }

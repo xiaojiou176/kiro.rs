@@ -19,9 +19,11 @@ export async function getTraces(query: TraceQuery): Promise<TracePage> {
   if (query.status) params.status = query.status
   if (query.errorType) params.errorType = query.errorType
   if (query.credentialId != null) params.credentialId = String(query.credentialId)
+  if (query.keyId != null) params.keyId = String(query.keyId)
   if (query.failedAttemptCredentialId != null)
     params.failedAttemptCredentialId = String(query.failedAttemptCredentialId)
   if (query.model) params.model = query.model
+  if (query.group) params.group = query.group
   if (query.onlyFailed) params.onlyFailed = 'true'
   if (query.limit != null) params.limit = String(query.limit)
   if (query.offset != null) params.offset = String(query.offset)

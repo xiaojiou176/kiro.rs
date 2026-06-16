@@ -835,6 +835,12 @@ pub struct CredentialEntrySnapshot {
     /// 端点名称（未显式配置时返回 None，由 Admin 层回退到默认值）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// 账号所属分组（可属于多个分组）
+    #[serde(default)]
+    pub groups: Vec<String>,
+    /// 账号来源渠道（纯备注）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_channel: Option<String>,
 }
 
 /// 凭据管理器状态快照
@@ -898,6 +904,17 @@ pub struct CallContext {
     pub credentials: KiroCredentials,
     /// 访问 Token
     pub token: String,
+}
+
+/// 判断某账号的分组集合是否匹配请求所属分组（严格隔离）
+///
+/// - `group = None`：Key 未绑定分组（含 master apiKey），匹配所有账号。
+/// - `group = Some(g)`：仅匹配 `cred_groups` 包含 `g` 的账号。
+fn group_matches(cred_groups: &[String], group: Option<&str>) -> bool {
+    match group {
+        None => true,
+        Some(g) => cred_groups.iter().any(|cg| cg == g),
+    }
 }
 
 impl MultiTokenManager {
@@ -1070,6 +1087,17 @@ impl MultiTokenManager {
         self.entries.lock().len()
     }
 
+    /// 获取指定分组的凭据总数（group=None 时等于 total_count）
+    ///
+    /// 用于按分组计算 failover 重试预算，避免小分组按全局账号数获得过多无效重试。
+    pub fn total_count_in_group(&self, group: Option<&str>) -> usize {
+        self.entries
+            .lock()
+            .iter()
+            .filter(|e| group_matches(&e.credentials.groups, group))
+            .count()
+    }
+
     /// 获取可用凭据数量
     pub fn available_count(&self) -> usize {
         let now = Instant::now();
@@ -1087,7 +1115,7 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    fn select_next_credential(&self, model: Option<&str>, group: Option<&str>) -> Option<(u64, KiroCredentials)> {
         let entries = self.entries.lock();
         let now = Instant::now();
 
@@ -1109,6 +1137,10 @@ impl MultiTokenManager {
                 }
                 // 如果是 opus 模型，需要检查订阅等级
                 if is_opus && !e.credentials.supports_opus() {
+                    return false;
+                }
+                // 账号分组隔离：Key 绑定分组时只用该分组内的账号
+                if !group_matches(&e.credentials.groups, group) {
                     return false;
                 }
                 true
@@ -1150,8 +1182,8 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>) -> anyhow::Result<CallContext> {
-        let total = self.total_count();
+    pub async fn acquire_context(&self, model: Option<&str>, group: Option<&str>) -> anyhow::Result<CallContext> {
+        let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
 
@@ -1181,6 +1213,7 @@ impl MultiTokenManager {
                             e.id == current_id
                                 && !e.disabled
                                 && !e.throttled_until.map(|t| t > now).unwrap_or(false)
+                                && group_matches(&e.credentials.groups, group)
                         })
                         .map(|e| (e.id, e.credentials.clone()))
                 };
@@ -1189,7 +1222,7 @@ impl MultiTokenManager {
                     hit
                 } else {
                     // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model);
+                    let mut best = self.select_next_credential(model, group);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -1208,7 +1241,7 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model);
+                            best = self.select_next_credential(model, group);
                         }
                     }
 
@@ -2021,6 +2054,8 @@ impl MultiTokenManager {
                         .map(|d| d.as_secs())
                         .filter(|s| *s > 0),
                     endpoint: e.credentials.endpoint.clone(),
+                    groups: e.credentials.groups.clone(),
+                    source_channel: e.credentials.source_channel.clone(),
                 })
                 .collect(),
             current_id,
@@ -2733,6 +2768,8 @@ impl MultiTokenManager {
         proxy_url: Option<Option<String>>,
         proxy_username: Option<Option<String>>,
         proxy_password: Option<Option<String>>,
+        groups: Option<Vec<String>>,
+        source_channel: Option<Option<String>>,
     ) -> anyhow::Result<()> {
         {
             let mut entries = self.entries.lock();
@@ -2753,9 +2790,102 @@ impl MultiTokenManager {
             if let Some(v) = proxy_password {
                 entry.credentials.proxy_password = v.filter(|s| !s.is_empty());
             }
+            if let Some(g) = groups {
+                entry.credentials.groups =
+                    g.into_iter().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            }
+            if let Some(v) = source_channel {
+                entry.credentials.source_channel =
+                    v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            }
         }
         self.persist_credentials()?;
         Ok(())
+    }
+
+    /// 列出所有凭据当前引用的分组名（去重排序）。
+    /// 用于启动迁移到 GroupManager 注册表，以及前端的引用计数显示。
+    pub fn list_credential_groups(&self) -> Vec<String> {
+        let entries = self.entries.lock();
+        let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for e in entries.iter() {
+            for g in &e.credentials.groups {
+                if !g.is_empty() {
+                    set.insert(g.clone());
+                }
+            }
+        }
+        let mut list: Vec<String> = set.into_iter().collect();
+        list.sort();
+        list
+    }
+
+    /// 统计指定分组被多少个凭据引用（用于分组管理页 / 删除前提示）。
+    pub fn count_credentials_with_group(&self, group: &str) -> usize {
+        let entries = self.entries.lock();
+        entries
+            .iter()
+            .filter(|e| e.credentials.groups.iter().any(|g| g == group))
+            .count()
+    }
+
+    /// 把所有凭据 `groups` 字段中等于 `old` 的元素改为 `new`（分组改名级联用）。
+    /// 已经显式带 `new` 的凭据不会重复添加。返回受影响的凭据数。
+    pub fn rename_credential_group(&self, old: &str, new: &str) -> anyhow::Result<usize> {
+        let mut affected = 0usize;
+        {
+            let mut entries = self.entries.lock();
+            for entry in entries.iter_mut() {
+                let groups = &mut entry.credentials.groups;
+                let mut hit = false;
+                let mut already_has_new = false;
+                for g in groups.iter() {
+                    if g == old {
+                        hit = true;
+                    }
+                    if g == new {
+                        already_has_new = true;
+                    }
+                }
+                if hit {
+                    if already_has_new {
+                        // old 和 new 共存：只去掉 old，避免重复
+                        groups.retain(|g| g != old);
+                    } else {
+                        for g in groups.iter_mut() {
+                            if g == old {
+                                *g = new.to_string();
+                            }
+                        }
+                    }
+                    affected += 1;
+                }
+            }
+        }
+        if affected > 0 {
+            self.persist_credentials()?;
+        }
+        Ok(affected)
+    }
+
+    /// 把 `name` 这个分组从所有凭据的 `groups` 字段中移除（强删分组级联用）。
+    /// 返回受影响的凭据数。
+    pub fn remove_credential_group(&self, name: &str) -> anyhow::Result<usize> {
+        let mut affected = 0usize;
+        {
+            let mut entries = self.entries.lock();
+            for entry in entries.iter_mut() {
+                let before = entry.credentials.groups.len();
+                entry.credentials.groups.retain(|g| g != name);
+                if entry.credentials.groups.len() != before {
+                    affected += 1;
+                }
+            }
+        }
+        if affected > 0 {
+            self.persist_credentials()?;
+        }
+        Ok(affected)
     }
 
     /// 删除凭据（Admin API）
@@ -3468,7 +3598,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -3491,7 +3621,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None).await.unwrap();
+        let ctx = manager.acquire_context(None, None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
     }
@@ -3537,7 +3667,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         let err = manager
-            .acquire_context(None)
+            .acquire_context(None, None)
             .await
             .err()
             .unwrap()
@@ -3582,7 +3712,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         let err = manager
-            .acquire_context(None)
+            .acquire_context(None, None)
             .await
             .err()
             .unwrap()
@@ -4018,5 +4148,134 @@ mod tests {
         assert!(reloaded, "单凭据无 ID 时仍应能匹配并 reload");
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ===== 账号分组隔离回归测试 =====
+
+    /// 构造一个带 token、属于指定分组的可用凭据
+    fn grouped_cred(token: &str, groups: &[&str]) -> KiroCredentials {
+        let mut c = KiroCredentials::default();
+        c.access_token = Some(token.to_string());
+        c.expires_at = Some((Utc::now() + Duration::hours(1)).to_rfc3339());
+        c.groups = groups.iter().map(|s| s.to_string()).collect();
+        c
+    }
+
+    #[test]
+    fn test_group_matches_helper() {
+        // 未绑定分组(None)匹配任何账号
+        assert!(group_matches(&[], None));
+        assert!(group_matches(&["g1".to_string()], None));
+        // 绑定分组时只匹配 groups 含该名的账号
+        assert!(group_matches(&["g1".to_string(), "g2".to_string()], Some("g1")));
+        assert!(!group_matches(&["g2".to_string()], Some("g1")));
+        assert!(!group_matches(&[], Some("g1")));
+    }
+
+    #[test]
+    fn test_select_next_credential_filters_by_group() {
+        // A∈g1, B∈g2, C∈无分组
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                grouped_cred("a", &["g1"]),
+                grouped_cred("b", &["g2"]),
+                grouped_cred("c", &[]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // g1 只能选到 A(id=1)
+        let g1 = manager.select_next_credential(None, Some("g1"));
+        assert_eq!(g1.map(|(id, _)| id), Some(1));
+        // g2 只能选到 B(id=2)
+        let g2 = manager.select_next_credential(None, Some("g2"));
+        assert_eq!(g2.map(|(id, _)| id), Some(2));
+        // 不存在的分组 → 无可用账号
+        assert!(manager.select_next_credential(None, Some("nope")).is_none());
+        // 未绑定分组(None) → 可选到账号
+        assert!(manager.select_next_credential(None, None).is_some());
+    }
+
+    #[test]
+    fn test_total_count_in_group() {
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                grouped_cred("a", &["g1"]),
+                grouped_cred("b", &["g1", "g2"]),
+                grouped_cred("c", &[]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(manager.total_count_in_group(Some("g1")), 2); // A,B
+        assert_eq!(manager.total_count_in_group(Some("g2")), 1); // B
+        assert_eq!(manager.total_count_in_group(None), 3); // 全部
+        assert_eq!(manager.total_count_in_group(Some("none")), 0);
+    }
+
+    #[test]
+    fn test_balanced_mode_independent_per_group() {
+        let mut config = Config::default();
+        config.load_balancing_mode = "balanced".to_string();
+        // g1: A(id1),B(id2)；g2: C(id3)
+        let manager = MultiTokenManager::new(
+            config,
+            vec![
+                grouped_cred("a", &["g1"]),
+                grouped_cred("b", &["g1"]),
+                grouped_cred("c", &["g2"]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 让 A(id1) 成功若干次 → balanced 应转向 success_count 更小的 B(id2)
+        manager.report_success(1);
+        manager.report_success(1);
+        let pick = manager.select_next_credential(None, Some("g1"));
+        assert_eq!(pick.map(|(id, _)| id), Some(2), "balanced 应在 g1 内选 success_count 最小的 B");
+        // g2 不受 g1 计数影响，仍只会选到 C(id3)
+        let pick_g2 = manager.select_next_credential(None, Some("g2"));
+        assert_eq!(pick_g2.map(|(id, _)| id), Some(3));
+    }
+
+    #[tokio::test]
+    async fn test_acquire_context_strict_isolation_fails_when_group_empty() {
+        // g1 只有一个账号 A(id1)，禁用后绑定 g1 的请求应直接失败，不回退到 g2/无分组
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![
+                grouped_cred("a", &["g1"]),
+                grouped_cred("b", &["g2"]),
+                grouped_cred("c", &[]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // 正常情况下 g1 能拿到 context
+        assert!(manager.acquire_context(None, Some("g1")).await.is_ok());
+
+        // 手动禁用 g1 内唯一账号 A(id1)
+        manager.set_disabled(1, true).unwrap();
+
+        // 严格隔离：g1 无可用账号 → Err，且不会选到 B/C
+        let res = manager.acquire_context(None, Some("g1")).await;
+        assert!(res.is_err(), "g1 内全部账号禁用后应失败，不回退到其他分组");
+
+        // 但 g2 仍可用
+        assert!(manager.acquire_context(None, Some("g2")).await.is_ok());
     }
 }

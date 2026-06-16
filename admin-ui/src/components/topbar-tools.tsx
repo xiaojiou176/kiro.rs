@@ -21,7 +21,7 @@ import {
   useAccountThrottleConfig, useSetAccountThrottleConfig,
 } from '@/hooks/use-credentials'
 import { useUpdateCheck } from '@/hooks/use-update-check'
-import { updateAdminKey, updateApiKey } from '@/api/credentials'
+import { updateAdminKey } from '@/api/credentials'
 import { extractErrorMessage, generateApiKey } from '@/lib/utils'
 import { ImageUpdateDialog } from '@/components/image-update-dialog'
 
@@ -44,9 +44,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const { data: updateCheck } = useUpdateCheck()
 
   const [imageUpdateOpen, setImageUpdateOpen] = useState(false)
-
   const [keyDialogOpen, setKeyDialogOpen] = useState(false)
-  const [keyEditMode, setKeyEditMode] = useState<'admin' | 'api'>('admin')
   const [newKey, setNewKey] = useState('')
   const [showPlain, setShowPlain] = useState(false)
   const [updating, setUpdating] = useState(false)
@@ -76,8 +74,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     })
   }
 
-  const openKeyDialog = (mode: 'admin' | 'api') => {
-    setKeyEditMode(mode)
+  const openKeyDialog = () => {
     setNewKey('')
     setShowPlain(false)
     setKeyDialogOpen(true)
@@ -87,19 +84,14 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     e.preventDefault()
     const key = newKey.trim()
     if (!key) {
-      toast.error(keyEditMode === 'admin' ? '新登录API密钥不能为空' : '新管理员API密钥不能为空')
+      toast.error('新登录API密钥不能为空')
       return
     }
     setUpdating(true)
     try {
-      if (keyEditMode === 'admin') {
-        await updateAdminKey({ newKey: key })
-        storage.setApiKey(key)
-        toast.success('登录API密钥已更新，已自动切换到新 Key')
-      } else {
-        await updateApiKey({ newKey: key })
-        toast.success('管理员API密钥已更新，所有使用 /v1 接口的客户端都需要切换')
-      }
+      await updateAdminKey({ newKey: key })
+      storage.setApiKey(key)
+      toast.success('登录API密钥已更新，已自动切换到新 Key')
       setKeyDialogOpen(false)
       setNewKey('')
     } catch (err) {
@@ -143,23 +135,17 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Key className="h-4 w-4" />
-              {keyEditMode === 'admin' ? '修改登录API密钥' : '修改管理员API密钥'}
+              修改登录API密钥
             </DialogTitle>
             <DialogDescription>
-              {keyEditMode === 'admin'
-                ? '用于登录此管理面板。修改后将自动更新本地存储的 Key，无需重新登录。'
-                : '客户端调用 /v1/* 接口时携带的密钥。修改后所有第三方客户端（Cline、Cursor、SDK 等）都需要更新为新值。'}
+              用于登录此管理面板。修改后将自动更新本地存储的 Key，无需重新登录。
             </DialogDescription>
           </DialogHeader>
           <form onSubmit={handleUpdateKey} className="space-y-4 py-2">
             <div className="relative">
               <Input
                 type={showPlain ? 'text' : 'password'}
-                placeholder={
-                  keyEditMode === 'admin'
-                    ? '输入或生成新的登录API密钥'
-                    : '输入或生成新的管理员API密钥'
-                }
+                placeholder="输入或生成新的登录API密钥"
                 value={newKey}
                 onChange={(e) => setNewKey(e.target.value)}
                 disabled={updating}
@@ -208,9 +194,7 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
                 size="sm"
                 variant="outline"
                 onClick={() => {
-                  const key = generateApiKey(
-                    keyEditMode === 'admin' ? 'sk-admin-' : 'sk-kiro-',
-                  )
+                  const key = generateApiKey('sk-admin-')
                   setNewKey(key)
                   setShowPlain(true)
                 }}
@@ -247,7 +231,7 @@ interface ToolControls {
   isSettingThrottle: boolean
   loadBalancingMode?: 'priority' | 'balanced'
   openImageUpdate: () => void
-  openKeyDialog: (mode: 'admin' | 'api') => void
+  openKeyDialog: () => void
   throttleConfig?: { failover: boolean; cooldownSecs: number }
   updateCheck?: { hasUpdate: boolean; latestVersion: string; currentVersion: string }
   updateCooldown: (secs: number) => void
@@ -308,7 +292,9 @@ function CompactTools({ controls }: { controls: ToolControls }) {
         </DropdownMenuItem>
         <ThrottleCompactItems {...throttleProps} />
         <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
-        <KeyMenuItems onOpenKeyDialog={controls.openKeyDialog} />
+        <DropdownMenuItem onSelect={controls.openKeyDialog}>
+          <Key />修改登录API密钥（管理面板登录）
+        </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -358,6 +344,24 @@ function ImageUpdateButton({ controls }: { controls: ToolControls }) {
   )
 }
 
+function KeySettingsMenu({ onOpenKeyDialog }: { onOpenKeyDialog: () => void }) {
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button variant="ghost" size="icon" title="设置">
+          <Settings className="h-4 w-4" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end">
+        <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
+        <DropdownMenuItem onSelect={onOpenKeyDialog}>
+          <Key />修改登录API密钥（管理面板登录）
+        </DropdownMenuItem>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
 function imageUpdateTitle(updateCheck: ToolControls['updateCheck']) {
   if (!updateCheck?.hasUpdate) return '镜像在线更新'
   return `发现新版本 v${updateCheck.latestVersion}（当前 v${updateCheck.currentVersion}）`
@@ -369,43 +373,6 @@ function UpdateDot() {
       <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-red-400 opacity-75" />
       <span className="relative inline-flex h-2 w-2 rounded-full bg-red-500" />
     </span>
-  )
-}
-
-function KeySettingsMenu({
-  onOpenKeyDialog,
-}: {
-  onOpenKeyDialog: (mode: 'admin' | 'api') => void
-}) {
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button variant="ghost" size="icon" title="设置">
-          <Settings className="h-4 w-4" />
-        </Button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
-        <DropdownMenuLabel>密钥管理</DropdownMenuLabel>
-        <KeyMenuItems onOpenKeyDialog={onOpenKeyDialog} />
-      </DropdownMenuContent>
-    </DropdownMenu>
-  )
-}
-
-function KeyMenuItems({
-  onOpenKeyDialog,
-}: {
-  onOpenKeyDialog: (mode: 'admin' | 'api') => void
-}) {
-  return (
-    <>
-      <DropdownMenuItem onSelect={() => onOpenKeyDialog('admin')}>
-        <Key />修改登录API密钥（管理面板登录）
-      </DropdownMenuItem>
-      <DropdownMenuItem onSelect={() => onOpenKeyDialog('api')}>
-        <Key />修改管理员API密钥（客户端 /v1 调用）
-      </DropdownMenuItem>
-    </>
   )
 }
 

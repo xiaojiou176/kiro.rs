@@ -49,6 +49,16 @@ pub struct ClientKey {
     /// 累计 credit 计费量（meteringEvent.usage 累加）
     #[serde(default)]
     pub total_credits: f64,
+    /// 绑定的账号分组名（可选）
+    ///
+    /// 设置后，用该 Key 发起的请求只会调度到 groups 包含此分组名的上游账号（严格隔离）。
+    /// None 表示不绑定分组，可使用全部账号（与 master apiKey 行为一致）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// 系统 Key（由 config.json apiKey bootstrap 生成，不可删除 / 不可轮换）。
+    /// 老数据无此字段，默认 false。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_system: bool,
 }
 
 /// 客户端 Key 管理器
@@ -140,14 +150,34 @@ impl ClientKeyManager {
     }
 
     /// 创建新 Key（生成明文随机串），返回新建条目
-    pub fn create(&self, name: String, description: Option<String>) -> ClientKey {
-        let key = generate_client_key();
+    pub fn create(
+        &self,
+        name: String,
+        description: Option<String>,
+        group: Option<String>,
+    ) -> ClientKey {
+        self.create_with_key(name, description, group, generate_client_key())
+    }
+
+    /// 用指定明文创建 Key（仅供首次启动 bootstrap 用，把 config.json apiKey 直接导入为第一条分发密钥）。
+    /// 若该明文已存在则跳过，返回已存在的条目。
+    pub fn create_with_key(
+        &self,
+        name: String,
+        description: Option<String>,
+        group: Option<String>,
+        plaintext: String,
+    ) -> ClientKey {
         let mut inner = self.inner.write();
+        // 防止 bootstrap 重复导入同一明文
+        if let Some(&id) = inner.by_key.get(&plaintext) {
+            return inner.entries.get(&id).cloned().expect("by_key 与 entries 应一致");
+        }
         let id = inner.next_id;
         inner.next_id += 1;
         let entry = ClientKey {
             id,
-            key: key.clone(),
+            key: plaintext.clone(),
             name,
             description,
             disabled: false,
@@ -159,15 +189,95 @@ impl ClientKeyManager {
             total_cache_creation_tokens: 0,
             total_cache_read_tokens: 0,
             total_credits: 0.0,
+            group: group.filter(|g| !g.trim().is_empty()),
+            is_system: false,
         };
-        inner.by_key.insert(key, id);
+        inner.by_key.insert(plaintext, id);
         inner.entries.insert(id, entry.clone());
         self.save_locked(&inner);
         entry
     }
 
+    /// 确保 config.json apiKey 对应的系统 Key 存在（幂等，每次启动调用）。
+    ///
+    /// 系统 Key **固定占用 id=0**：历史 master apiKey 的用量数据都记在 keyId=0 桶里，
+    /// 固定 id=0 可让「默认密钥」直接查到升级前的全部用量，保证数据连续。
+    ///
+    /// - 若该明文已在 id=0：确保 is_system=true（no-op）。
+    /// - 若该明文在其它 id（旧版 bootstrap 误建）：迁移到 id=0。
+    /// - 明文不存在：在 id=0 新建（id=0 被占用时回退 next_id，极罕见）。
+    /// 系统 Key 不可删除；可轮换（轮换时同步 config.apiKey）。
+    pub fn ensure_system_key(&self, name: String, description: Option<String>, plaintext: String) {
+        let mut inner = self.inner.write();
+        match inner.by_key.get(&plaintext).copied() {
+            Some(0) => {
+                // 已在 id=0：确保 is_system
+                if let Some(e) = inner.entries.get_mut(&0) {
+                    if !e.is_system {
+                        e.is_system = true;
+                        self.save_locked(&inner);
+                    }
+                }
+            }
+            Some(other) => {
+                // 明文在非 0 id 上：尽量迁移到 id=0（对齐历史 keyId=0 用量）
+                if !inner.entries.contains_key(&0) {
+                    let mut entry = inner
+                        .entries
+                        .remove(&other)
+                        .expect("by_key 与 entries 应一致");
+                    entry.id = 0;
+                    entry.is_system = true;
+                    inner.entries.insert(0, entry);
+                    inner.by_key.insert(plaintext, 0);
+                    self.save_locked(&inner);
+                } else if let Some(e) = inner.entries.get_mut(&other) {
+                    // id=0 被别的 Key 占用：仅在原位标记 system
+                    if !e.is_system {
+                        e.is_system = true;
+                        self.save_locked(&inner);
+                    }
+                }
+            }
+            None => {
+                // 明文不存在：在 id=0 新建（占用则回退 next_id）
+                let id = if !inner.entries.contains_key(&0) {
+                    0
+                } else {
+                    let id = inner.next_id;
+                    inner.next_id += 1;
+                    id
+                };
+                let entry = ClientKey {
+                    id,
+                    key: plaintext.clone(),
+                    name,
+                    description,
+                    disabled: false,
+                    created_at: Utc::now().to_rfc3339(),
+                    last_used_at: None,
+                    total_calls: 0,
+                    total_input_tokens: 0,
+                    total_output_tokens: 0,
+                    total_cache_creation_tokens: 0,
+                    total_cache_read_tokens: 0,
+                    total_credits: 0.0,
+                    group: None,
+                    is_system: true,
+                };
+                inner.by_key.insert(plaintext, id);
+                inner.entries.insert(id, entry);
+                self.save_locked(&inner);
+            }
+        }
+    }
+
     pub fn delete(&self, id: u64) -> bool {
         let mut inner = self.inner.write();
+        // 系统 Key 拒绝删除
+        if inner.entries.get(&id).map(|e| e.is_system).unwrap_or(false) {
+            return false;
+        }
         let removed = match inner.entries.remove(&id) {
             Some(e) => {
                 inner.by_key.remove(&e.key);
@@ -201,6 +311,7 @@ impl ClientKeyManager {
         id: u64,
         name: Option<String>,
         description: Option<Option<String>>,
+        group: Option<Option<String>>,
     ) -> bool {
         let mut inner = self.inner.write();
         let updated = match inner.entries.get_mut(&id) {
@@ -211,6 +322,9 @@ impl ClientKeyManager {
                 if let Some(d) = description {
                     e.description = d;
                 }
+                if let Some(g) = group {
+                    e.group = g.filter(|s| !s.trim().is_empty());
+                }
                 true
             }
             None => false,
@@ -219,6 +333,98 @@ impl ClientKeyManager {
             self.save_locked(&inner);
         }
         updated
+    }
+
+    /// 返回指定 Key 绑定的分组名（None 表示未绑定或 Key 不存在）
+    pub fn group_of(&self, id: u64) -> Option<String> {
+        self.inner.read().entries.get(&id).and_then(|e| e.group.clone())
+    }
+
+    /// 列出所有当前被引用的分组名（仅去重，不带计数）。
+    pub fn used_group_names(&self) -> Vec<String> {
+        let inner = self.inner.read();
+        let mut set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for e in inner.entries.values() {
+            if let Some(g) = &e.group {
+                set.insert(g.clone());
+            }
+        }
+        let mut list: Vec<String> = set.into_iter().collect();
+        list.sort();
+        list
+    }
+
+    /// 统计指定分组被多少把 Key 绑定（用于分组管理页 / 删除前提示）。
+    pub fn count_with_group(&self, group: &str) -> usize {
+        self.inner
+            .read()
+            .entries
+            .values()
+            .filter(|e| e.group.as_deref() == Some(group))
+            .count()
+    }
+
+    /// 指定 id 的 Key 是否为系统 Key（不存在也返回 false）。
+    pub fn is_system(&self, id: u64) -> bool {
+        self.inner
+            .read()
+            .entries
+            .get(&id)
+            .map(|e| e.is_system)
+            .unwrap_or(false)
+    }
+
+    /// 把所有引用 `old` 的 Key 的 group 字段改为 `new`（分组改名级联用）。
+    /// 返回受影响的 Key 数。
+    pub fn rename_group(&self, old: &str, new: &str) -> usize {
+        let mut inner = self.inner.write();
+        let mut affected = 0usize;
+        for entry in inner.entries.values_mut() {
+            if entry.group.as_deref() == Some(old) {
+                entry.group = Some(new.to_string());
+                affected += 1;
+            }
+        }
+        if affected > 0 {
+            self.save_locked(&inner);
+        }
+        affected
+    }
+
+    /// 把所有引用 `name` 的 Key 的 group 字段清空（强删分组级联用）。
+    /// 返回受影响的 Key 数。
+    pub fn clear_group(&self, name: &str) -> usize {
+        let mut inner = self.inner.write();
+        let mut affected = 0usize;
+        for entry in inner.entries.values_mut() {
+            if entry.group.as_deref() == Some(name) {
+                entry.group = None;
+                affected += 1;
+            }
+        }
+        if affected > 0 {
+            self.save_locked(&inner);
+        }
+        affected
+    }
+
+    /// 轮换 Key 值：旧 Key 立即失效，生成新明文，保留 id/name/description/group/统计/disabled/is_system。
+    /// 用于「明文遗失」「下游怀疑泄漏」场景，比删后重建更安全（不会丢统计与分组绑定）。
+    /// 命中且替换成功返回新条目（含新明文）；id 不存在返回 None。
+    /// 注意：系统 Key 轮换后调用方需把新明文同步写回 config.json apiKey，避免下次启动重复导入。
+    pub fn rotate(&self, id: u64) -> Option<ClientKey> {
+        let new_key = generate_client_key();
+        let mut inner = self.inner.write();
+        // 取出旧条目并从 by_key 索引摘除
+        let old_key = inner.entries.get(&id).map(|e| e.key.clone())?;
+        inner.by_key.remove(&old_key);
+        // 写入新明文 + 索引（is_system 等其余字段保留不变）
+        let entry = inner.entries.get_mut(&id)?;
+        entry.key = new_key.clone();
+        let snapshot = entry.clone();
+        inner.by_key.insert(new_key, id);
+        self.save_locked(&inner);
+        Some(snapshot)
     }
 
     /// 重置计数（保留 Key 与名称）
@@ -312,6 +518,11 @@ impl Default for ClientKeyManager {
     }
 }
 
+/// serde 辅助：bool 为 false 时跳过序列化
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
 /// 生成 `csk_` 前缀 + 32 位 base62 随机字符串
 pub fn generate_client_key() -> String {
     const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
@@ -347,7 +558,7 @@ mod tests {
     #[test]
     fn create_and_verify() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None);
+        let entry = mgr.create("test".to_string(), None, None);
         assert!(entry.key.starts_with(CLIENT_KEY_PREFIX));
         assert_eq!(mgr.verify_and_touch(&entry.key), Some(entry.id));
         // 不带前缀的拒绝
@@ -357,7 +568,7 @@ mod tests {
     #[test]
     fn disabled_key_rejected() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None);
+        let entry = mgr.create("test".to_string(), None, None);
         mgr.set_disabled(entry.id, true);
         assert_eq!(mgr.verify_and_touch(&entry.key), None);
         mgr.set_disabled(entry.id, false);
@@ -367,7 +578,7 @@ mod tests {
     #[test]
     fn record_usage_accumulates() {
         let mgr = ClientKeyManager::new();
-        let entry = mgr.create("test".to_string(), None);
+        let entry = mgr.create("test".to_string(), None, None);
         mgr.record_usage(entry.id, 100, 50, 0, 0, 0.0);
         mgr.record_usage(entry.id, 200, 30, 5, 10, 1.5);
         let list = mgr.list();
@@ -382,5 +593,68 @@ mod tests {
     fn mask_format() {
         assert_eq!(mask_client_key("csk_abcdefghijklmnop"), "csk_abcd...mnop");
         assert_eq!(mask_client_key("short"), "short");
+    }
+
+    #[test]
+    fn rotate_replaces_key_but_keeps_metadata_and_stats() {
+        let mgr = ClientKeyManager::new();
+        let entry = mgr.create("kb".to_string(), Some("desc".into()), Some("groupA".into()));
+        // 累计一些统计
+        mgr.record_usage(entry.id, 100, 50, 5, 10, 1.5);
+        let old_key = entry.key.clone();
+        let rotated = mgr.rotate(entry.id).expect("rotate should succeed");
+        // 新 Key 与旧 Key 不同、且仍带前缀
+        assert_ne!(rotated.key, old_key);
+        assert!(rotated.key.starts_with(CLIENT_KEY_PREFIX));
+        // 元数据保留
+        assert_eq!(rotated.id, entry.id);
+        assert_eq!(rotated.name, "kb");
+        assert_eq!(rotated.description.as_deref(), Some("desc"));
+        assert_eq!(rotated.group.as_deref(), Some("groupA"));
+        // 统计保留
+        assert_eq!(rotated.total_input_tokens, 100);
+        assert_eq!(rotated.total_output_tokens, 50);
+        // 旧 Key 立即失效
+        assert_eq!(mgr.verify_and_touch(&old_key), None);
+        // 新 Key 命中
+        assert_eq!(mgr.verify_and_touch(&rotated.key), Some(entry.id));
+    }
+
+    #[test]
+    fn rotate_unknown_id_returns_none() {
+        let mgr = ClientKeyManager::new();
+        assert!(mgr.rotate(999).is_none());
+    }
+
+    #[test]
+    fn ensure_system_key_uses_id_zero() {
+        let mgr = ClientKeyManager::new();
+        mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
+        // 系统密钥固定在 id=0，对齐历史 keyId=0 用量桶
+        assert!(mgr.is_system(0));
+        assert_eq!(mgr.list().first().map(|k| k.id), Some(0));
+        // 幂等：再次调用不重复创建
+        mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
+        assert_eq!(mgr.list().iter().filter(|k| k.is_system).count(), 1);
+    }
+
+    #[test]
+    fn ensure_system_key_migrates_misplaced_id_to_zero() {
+        // 模拟旧版 bootstrap 把 apiKey 误建在 id=1 上的场景
+        let mgr = ClientKeyManager::new();
+        mgr.create_with_key("默认密钥".into(), None, None, "sk-kiro-abc".into());
+        assert_eq!(mgr.list().first().map(|k| k.id), Some(1));
+        // 修复后启动：应迁移到 id=0
+        mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
+        assert!(mgr.is_system(0));
+        assert!(!mgr.list().iter().any(|k| k.id == 1 && k.key == "sk-kiro-abc"));
+    }
+
+    #[test]
+    fn system_key_cannot_be_deleted() {
+        let mgr = ClientKeyManager::new();
+        mgr.ensure_system_key("默认密钥".into(), None, "sk-kiro-abc".into());
+        assert!(!mgr.delete(0), "系统密钥 id=0 不可删除");
+        assert!(mgr.is_system(0));
     }
 }

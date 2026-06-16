@@ -25,7 +25,11 @@ use parking_lot::Mutex;
 const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 
 /// 总重试次数硬上限（避免无限重试）
-const MAX_TOTAL_RETRIES: usize = 9;
+///
+/// 注：上游 429 多为账号级速率配额（SERVICE_REQUEST_RATE_EXCEEDED），高峰期
+/// 多账号同时触顶时，过多重试会在账号间连环撞墙、放大限流。故上限取较小值，
+/// 配合 429 专用长退避（见 retry_delay_throttle），被限时尽早返回而非耗尽配额。
+const MAX_TOTAL_RETRIES: usize = 4;
 
 /// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
@@ -229,8 +233,9 @@ impl KiroProvider {
         &self,
         request_body: &str,
         sink: Option<&dyn TraceSink>,
+        group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, false, sink).await
+        self.call_api_with_retry(request_body, false, sink, group).await
     }
 
     /// 发送流式 API 请求
@@ -238,8 +243,9 @@ impl KiroProvider {
         &self,
         request_body: &str,
         sink: Option<&dyn TraceSink>,
+        group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, true, sink).await
+        self.call_api_with_retry(request_body, true, sink, group).await
     }
 
     /// 发送 MCP API 请求（WebSearch 等工具调用）
@@ -255,8 +261,8 @@ impl KiroProvider {
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
-            // MCP 调用（WebSearch 等工具）不涉及模型选择，无需按模型过滤凭据
-            let ctx = match self.token_manager.acquire_context(None).await {
+            // MCP 调用（WebSearch 等工具）不涉及模型选择，也不参与分组隔离
+            let ctx = match self.token_manager.acquire_context(None, None).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -406,7 +412,13 @@ impl KiroProvider {
                 );
                 last_error = Some(anyhow::anyhow!("MCP 请求失败: {} {}", status, body));
                 if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt)).await;
+                    // 429 限流用更长退避；408/5xx 仍用通用快速退避
+                    let delay = if status.as_u16() == 429 {
+                        Self::retry_delay_throttle(attempt)
+                    } else {
+                        Self::retry_delay(attempt)
+                    };
+                    sleep(delay).await;
                 }
                 continue;
             }
@@ -439,8 +451,10 @@ impl KiroProvider {
         request_body: &str,
         is_stream: bool,
         sink: Option<&dyn TraceSink>,
+        group: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        let total_credentials = self.token_manager.total_count();
+        // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
+        let total_credentials = self.token_manager.total_count_in_group(group).max(1);
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
@@ -452,7 +466,7 @@ impl KiroProvider {
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
-            let mut ctx = match self.token_manager.acquire_context(model.as_deref()).await {
+            let mut ctx = match self.token_manager.acquire_context(model.as_deref(), group).await {
                 Ok(c) => c,
                 Err(e) => {
                     Self::emit_attempt(
@@ -842,7 +856,13 @@ impl KiroProvider {
                     body
                 ));
                 if attempt + 1 < max_retries {
-                    sleep(Self::retry_delay(attempt)).await;
+                    // 429 限流用更长退避给账号配额恢复时间；408/5xx 仍用通用快速退避
+                    let delay = if status.as_u16() == 429 {
+                        Self::retry_delay_throttle(attempt)
+                    } else {
+                        Self::retry_delay(attempt)
+                    };
+                    sleep(delay).await;
                 }
                 continue;
             }
@@ -945,6 +965,21 @@ impl KiroProvider {
         // 指数退避 + 少量抖动，避免上游抖动时放大故障
         const BASE_MS: u64 = 200;
         const MAX_MS: u64 = 2_000;
+        let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
+        let backoff = exp.min(MAX_MS);
+        let jitter_max = (backoff / 4).max(1);
+        let jitter = fastrand::u64(0..=jitter_max);
+        Duration::from_millis(backoff.saturating_add(jitter))
+    }
+
+    /// 429 限流专用退避：比通用退避更长。
+    ///
+    /// 上游 429（SERVICE_REQUEST_RATE_EXCEEDED）是账号级速率配额耗尽，需要更长
+    /// 时间恢复；用通用的 ≤2s 快速退避只会让请求在配额恢复前反复撞墙、持续触顶。
+    /// 这里 base 1s、封顶 8s，给账号配额留出恢复窗口。
+    fn retry_delay_throttle(attempt: usize) -> Duration {
+        const BASE_MS: u64 = 1_000;
+        const MAX_MS: u64 = 8_000;
         let exp = BASE_MS.saturating_mul(2u64.saturating_pow(attempt.min(6) as u32));
         let backoff = exp.min(MAX_MS);
         let jitter_max = (backoff / 4).max(1);

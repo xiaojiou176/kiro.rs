@@ -118,11 +118,9 @@ async fn main() {
         "已选定主凭证"
     );
 
-    // 获取 API Key
-    let api_key = config.api_key.clone().unwrap_or_else(|| {
-        tracing::error!("配置文件中未设置 apiKey");
-        std::process::exit(1);
-    });
+    // apiKey 仅用于首次启动时 bootstrap 第一条客户端 Key；
+    // 后续 /v1 认证全部走客户端 Key 系统。adminApiKey 仍是管理面板登录密钥。
+    let bootstrap_key = config.api_key.clone().filter(|k| !k.trim().is_empty());
 
     // 构建代理配置
     let proxy_config = config.proxy_url.as_ref().map(|url| {
@@ -227,6 +225,25 @@ async fn main() {
     let usage_aggregator = std::sync::Arc::new(admin::UsageAggregator::new());
     usage_aggregator.rebuild_from_logs(&cache_dir);
 
+    // 账号分组注册表（持久化到 groups.json）。
+    // 启动时若文件不存在则首次创建，并把现有凭据 / 客户端 Key 的 groups 字段反向迁移进去，
+    // 保证老用户升级后所有已用分组都自动注册，不会因为本次改造而消失。
+    let groups_path = admin::groups::default_path_in(&cache_dir);
+    let group_manager = std::sync::Arc::new(
+        admin::GroupManager::load(&groups_path).unwrap_or_else(|e| {
+            tracing::warn!("加载分组注册表失败 ({}): {}", groups_path.display(), e);
+            admin::GroupManager::new()
+        }),
+    );
+    {
+        let mut all_used: Vec<String> = token_manager.list_credential_groups();
+        all_used.extend(client_key_manager.used_group_names());
+        let added = group_manager.bootstrap_from_existing(all_used);
+        if added > 0 {
+            tracing::info!("分组注册表：自动迁移 {} 个已用分组", added);
+        }
+    }
+
     // 请求链路追踪存储（SQLite，traces.db）。失败不致命：trace 不可用但服务正常。
     let trace_store: Option<admin::SharedTraceStore> = match admin::TraceStore::open(
         cache_dir.join("traces.db"),
@@ -257,9 +274,15 @@ async fn main() {
         });
     }
 
-    // 构建 Anthropic API 路由（profile_arn 由 provider 层根据实际凭据动态注入）
-    // 把 api_key 包成 Arc<RwLock<...>>，以便 Admin 模块运行时改 key 后立刻生效
-    let shared_api_key = std::sync::Arc::new(parking_lot::RwLock::new(api_key.clone()));
+    // 每次启动幂等确保 config.apiKey 对应的系统 Key 存在（不可删除 / 不可轮换）。
+    // 老部署升级时会把已有的 apiKey 补成系统 Key，保证根密钥始终可用于 /v1 流量。
+    if let Some(initial_key) = bootstrap_key.as_ref() {
+        client_key_manager.ensure_system_key(
+            "默认密钥".to_string(),
+            Some("由 config.json apiKey 自动导入（系统密钥）".to_string()),
+            initial_key.clone(),
+        );
+    }
 
     // CacheMeter：模拟 Anthropic 缓存、计量 cache_read/creation token 的进程内组件。
     // 持久化到 cache_dir/cache_metering.json，启动时自动加载未过期条目。
@@ -268,8 +291,7 @@ async fn main() {
     )));
     cache_meter.clone().spawn_background();
 
-    let anthropic_app = anthropic::create_router_with_shared_key(
-        shared_api_key.clone(),
+    let anthropic_app = anthropic::create_router(
         Some(kiro_provider),
         config.extract_thinking,
         Some(client_key_manager.clone()),
@@ -279,14 +301,8 @@ async fn main() {
         trace_store.clone(),
     );
 
-    // 构建 Admin API 路由（如果配置了非空的 admin_api_key）
+    // 构建 Admin API 路由（配置了非空 adminApiKey 时启用）
     // 安全检查：空字符串被视为未配置，防止空 key 绕过认证
-    let admin_key_valid = config
-        .admin_api_key
-        .as_ref()
-        .map(|k| !k.trim().is_empty())
-        .unwrap_or(false);
-
     let app = if let Some(admin_key) = &config.admin_api_key {
         if admin_key.trim().is_empty() {
             tracing::warn!("admin_api_key 配置为空，Admin API 未启用");
@@ -306,11 +322,11 @@ async fn main() {
                     );
             let admin_state = admin::AdminState::new(
                 admin_key,
-                shared_api_key.clone(),
                 admin_service,
                 client_key_manager.clone(),
                 usage_aggregator.clone(),
                 admin_trace_store,
+                group_manager.clone(),
             );
 
             // 启动余额后台刷新调度器（每 5 分钟一次，与缓存 TTL 对齐）
@@ -345,21 +361,18 @@ async fn main() {
     // 启动服务器
     let addr = format!("{}:{}", config.host, config.port);
     tracing::info!("启动 Anthropic API 端点: {}", addr);
-    tracing::info!("API Key: {}***", &api_key[..(api_key.len() / 2)]);
     tracing::info!("可用 API:");
     tracing::info!("  GET  /v1/models");
     tracing::info!("  POST /v1/messages");
     tracing::info!("  POST /v1/messages/count_tokens");
-    if admin_key_valid {
-        tracing::info!("Admin API:");
-        tracing::info!("  GET  /api/admin/credentials");
-        tracing::info!("  POST /api/admin/credentials/:index/disabled");
-        tracing::info!("  POST /api/admin/credentials/:index/priority");
-        tracing::info!("  POST /api/admin/credentials/:index/reset");
-        tracing::info!("  GET  /api/admin/credentials/:index/balance");
-        tracing::info!("Admin UI:");
-        tracing::info!("  GET  /admin");
-    }
+    tracing::info!("Admin API:");
+    tracing::info!("  GET  /api/admin/credentials");
+    tracing::info!("  POST /api/admin/credentials/:index/disabled");
+    tracing::info!("  POST /api/admin/credentials/:index/priority");
+    tracing::info!("  POST /api/admin/credentials/:index/reset");
+    tracing::info!("  GET  /api/admin/credentials/:index/balance");
+    tracing::info!("Admin UI:");
+    tracing::info!("  GET  /admin");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -367,8 +380,8 @@ async fn main() {
 
 /// 文件不存在时初始化配置/凭证文件
 ///
-/// - `config.json`：写入带随机 `apiKey` / `adminApiKey` 的最小默认配置，
-///   `host` 设为 `0.0.0.0` 以适配容器场景，端口/默认端点等其余字段沿用代码默认值。
+/// - `config.json`：写入带随机 `apiKey`（首次启动自动导入为第一条客户端 Key）/ `adminApiKey`（管理面板登录密钥）
+///   的最小默认配置；`host` 设为 `0.0.0.0` 以适配容器场景，端口/默认端点等其余字段沿用代码默认值。
 /// - `credentials.json`：写入空数组 `[]`，便于后续通过 Admin UI 添加凭据。
 ///
 /// 任一步失败都仅打印警告，不中断启动；后续 `Config::load` / `CredentialsConfig::load`
@@ -400,8 +413,8 @@ fn ensure_config_files(config_path: &str, credentials_path: &str) {
         {
             Ok(_) => {
                 tracing::info!("已生成默认配置: {}", config_p.display());
-                tracing::info!("  apiKey      = {}", api_key);
-                tracing::info!("  adminApiKey = {}", admin_api_key);
+                tracing::info!("  apiKey      = {}（首次启动时将自动导入为第一条客户端 Key）", api_key);
+                tracing::info!("  adminApiKey = {}（管理面板登录密钥）", admin_api_key);
                 tracing::info!("请妥善保存上述密钥，可在配置文件中修改");
             }
             Err(e) => tracing::warn!("写入默认配置失败 {}: {}", config_p.display(), e),

@@ -277,3 +277,4 @@ export function generateApiKey(prefix: string = 'sk-kiro-', randomLen: number = 
   }
   return prefix + out
 }
+

@@ -33,7 +33,7 @@ pub fn extract_api_key(request: &Request<Body>) -> Option<String> {
 /// 常量时间字符串比较，防止时序攻击
 ///
 /// 无论字符串内容如何，比较所需的时间都是恒定的，
-/// 这可以防止攻击者通过测量响应时间来猜测 API Key。
+/// 这可以防止攻击者通过测量响应时间来猜测登录API密钥。
 ///
 /// 使用经过安全审计的 `subtle` crate 实现
 pub fn constant_time_eq(a: &str, b: &str) -> bool {

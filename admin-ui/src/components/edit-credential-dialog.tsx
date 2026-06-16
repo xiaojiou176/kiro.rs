@@ -20,8 +20,10 @@ import {
 } from '@/components/ui/select'
 import { Input } from '@/components/ui/input'
 import { useUpdateCredential } from '@/hooks/use-credentials'
+import { useGroupOptions } from '@/hooks/use-groups'
 import { getProxyPool } from '@/api/credentials'
 import { extractErrorMessage, maskProxyUrl } from '@/lib/utils'
+import { GroupMultiSelect } from '@/components/group-select'
 import type { CredentialStatusItem } from '@/types/api'
 
 interface EditCredentialDialogProps {
@@ -39,7 +41,11 @@ export function EditCredentialDialog({
   const [proxyUrl, setProxyUrl] = useState(credential.proxyUrl ?? '')
   const [proxyUsername, setProxyUsername] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
+  const [groups, setGroups] = useState<string[]>(credential.groups ?? [])
+  const [sourceChannel, setSourceChannel] = useState(credential.sourceChannel ?? '')
   const [manualMode, setManualMode] = useState(false)
+
+  const groupOptions = useGroupOptions()
 
   const { data: proxyPool } = useQuery({
     queryKey: ['proxy-pool'],
@@ -54,6 +60,8 @@ export function EditCredentialDialog({
       setProxyUrl(credential.proxyUrl ?? '')
       setProxyUsername('')
       setProxyPassword('')
+      setGroups(credential.groups ?? [])
+      setSourceChannel(credential.sourceChannel ?? '')
       setManualMode(false)
     }
   }, [open, credential])
@@ -71,6 +79,8 @@ export function EditCredentialDialog({
           proxyUrl: proxyUrl,
           proxyUsername: proxyUsername || undefined,
           proxyPassword: proxyPassword || undefined,
+          groups: groups,
+          sourceChannel: sourceChannel,
         },
       },
       {
@@ -122,6 +132,37 @@ export function EditCredentialDialog({
               />
               <p className="text-xs text-muted-foreground">
                 留空则显示凭据 ID，清除请提交空值
+              </p>
+            </div>
+
+            {/* 账号分组 */}
+            <div className="space-y-2">
+              <label className="text-sm font-medium">账号分组</label>
+              <GroupMultiSelect
+                value={groups}
+                options={groupOptions}
+                onChange={setGroups}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                绑定了某分组的客户端 Key 只会调度到含该分组的账号。不选表示不属于任何分组。
+              </p>
+            </div>
+
+            {/* 账号来源渠道 */}
+            <div className="space-y-2">
+              <label htmlFor="sourceChannel" className="text-sm font-medium">
+                账号来源渠道（备注）
+              </label>
+              <Input
+                id="sourceChannel"
+                placeholder="例: 官方, 转售商A, 采购平台X"
+                value={sourceChannel}
+                onChange={(e) => setSourceChannel(e.target.value)}
+                disabled={isPending}
+              />
+              <p className="text-xs text-muted-foreground">
+                纯备注，标记此账号的购买来源/渠道，便于追踪。留空表示清除。
               </p>
             </div>
 

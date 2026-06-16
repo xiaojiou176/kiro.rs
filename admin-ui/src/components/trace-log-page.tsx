@@ -36,6 +36,8 @@ import {
   SelectItem as UiSelectItem,
 } from '@/components/ui/select'
 import { useTraces } from '@/hooks/use-traces'
+import { useClientKeys } from '@/hooks/use-client-keys'
+import { useGroupOptions } from '@/hooks/use-groups'
 import {
   useLogGovernanceConfig,
   useSetLogGovernanceConfig,
@@ -105,15 +107,15 @@ function formatDuration(ms: number): string {
   return `${(ms / 1000).toFixed(2)}s`
 }
 
+function formatTokens(n: number): string {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(2) + 'M'
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + 'K'
+  return String(n)
+}
+
 /** 千位分隔的完整数值（用于明细悬浮框） */
 function formatTokenFull(n: number): string {
   return n.toLocaleString('en-US')
-}
-
-/** 紧凑数值：>=1000 显示为 K（用于表格列） */
-function formatTokenCompact(n: number): string {
-  if (n < 1000) return String(n)
-  return `${(n / 1000).toFixed(1)}K`
 }
 
 function credLabel(id: number, email?: string | null): string {
@@ -121,9 +123,9 @@ function credLabel(id: number, email?: string | null): string {
   return email ? email : `#${id}`
 }
 
-function keySourceLabel(rec: TraceRecord): string {
-  if (rec.keySource === 'clientKey') return rec.keyName ?? `#${rec.keyId}`
-  return '管理员API密钥'
+function keyLabel(keyId: number, keyName?: string | null): string {
+  if (keyName) return keyName
+  return `#${keyId}`
 }
 
 const STATUS_OPTIONS = [
@@ -144,58 +146,6 @@ const ERROR_TYPE_OPTIONS = [
   { value: 'stream_interrupted', label: '流中断' },
   { value: 'unknown', label: '未知' },
 ]
-
-/** Token 用量单元格：紧凑展示总量，hover 显示分项明细 */
-function TokenCell({ rec }: { rec: TraceRecord }) {
-  const total =
-    rec.totalTokens ??
-    rec.inputTokens + rec.outputTokens + rec.cacheCreationTokens + rec.cacheReadTokens
-  // 全 0（早期失败、未走到上游）时不显示明细，仅占位
-  if (total === 0) {
-    return <span className="text-muted-foreground">—</span>
-  }
-  const rows: Array<[string, number]> = [
-    ['输入 Token', rec.inputTokens],
-    ['输出 Token', rec.outputTokens],
-  ]
-  if (rec.cacheCreationTokens > 0) rows.push(['缓存创建 Token', rec.cacheCreationTokens])
-  if (rec.cacheReadTokens > 0) rows.push(['缓存读取 Token', rec.cacheReadTokens])
-  return (
-    <TooltipProvider delayDuration={150}>
-      <Tooltip>
-        <TooltipTrigger asChild>
-          <span className="inline-flex items-center gap-1 font-mono tabular-nums cursor-default border-b border-dotted border-muted-foreground/40">
-            <span className="text-emerald-600 dark:text-emerald-400">
-              ↓{formatTokenCompact(rec.inputTokens + rec.cacheCreationTokens + rec.cacheReadTokens)}
-            </span>
-            <span className="text-violet-600 dark:text-violet-400">
-              ↑{formatTokenCompact(rec.outputTokens)}
-            </span>
-          </span>
-        </TooltipTrigger>
-        <TooltipContent className="p-0">
-          <div className="min-w-[180px] px-3 py-2">
-            <div className="mb-1.5 text-[13px] font-semibold">Token 明细</div>
-            <div className="space-y-1 text-[12px]">
-              {rows.map(([label, val]) => (
-                <div key={label} className="flex items-center justify-between gap-6">
-                  <span className="text-muted-foreground">{label}</span>
-                  <span className="font-mono tabular-nums">{formatTokenFull(val)}</span>
-                </div>
-              ))}
-              <div className="mt-1 flex items-center justify-between gap-6 border-t border-border/50 pt-1">
-                <span className="font-medium">总 Token</span>
-                <span className="font-mono font-semibold tabular-nums">
-                  {formatTokenFull(total)}
-                </span>
-              </div>
-            </div>
-          </div>
-        </TooltipContent>
-      </Tooltip>
-    </TooltipProvider>
-  )
-}
 
 /** 单跳明细行 */
 function AttemptRow({ a }: { a: TraceAttempt }) {
@@ -224,6 +174,60 @@ function AttemptRow({ a }: { a: TraceAttempt }) {
 }
 
 /** 可展开的链路行 */
+/** Token 用量单元格：紧凑展示总量，hover 显示分项明细 */
+function TokenCell({ rec }: { rec: TraceRecord }) {
+  const input = rec.inputTokens ?? 0
+  const output = rec.outputTokens ?? 0
+  const cacheCreation = rec.cacheCreationTokens ?? 0
+  const cacheRead = rec.cacheReadTokens ?? 0
+  const total = rec.totalTokens ?? input + output + cacheCreation + cacheRead
+  // 全 0（早期失败、未走到上游）时不显示明细，仅占位
+  if (total === 0) {
+    return <span className="text-muted-foreground">—</span>
+  }
+  const rows: Array<[string, number]> = [
+    ['输入 Token', input],
+    ['输出 Token', output],
+  ]
+  if (cacheCreation > 0) rows.push(['缓存创建 Token', cacheCreation])
+  if (cacheRead > 0) rows.push(['缓存读取 Token', cacheRead])
+  return (
+    <TooltipProvider delayDuration={150}>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <span className="inline-flex items-center gap-1 font-mono tabular-nums cursor-default border-b border-dotted border-muted-foreground/40">
+            <span className="text-emerald-600 dark:text-emerald-400">
+              ↓{formatTokens(input + cacheCreation + cacheRead)}
+            </span>
+            <span className="text-violet-600 dark:text-violet-400">
+              ↑{formatTokens(output)}
+            </span>
+          </span>
+        </TooltipTrigger>
+        <TooltipContent className="p-0">
+          <div className="min-w-[180px] px-3 py-2">
+            <div className="mb-1.5 text-[13px] font-semibold">Token 明细</div>
+            <div className="space-y-1 text-[12px]">
+              {rows.map(([label, val]) => (
+                <div key={label} className="flex items-center justify-between gap-6">
+                  <span className="text-muted-foreground">{label}</span>
+                  <span className="font-mono tabular-nums">{formatTokenFull(val)}</span>
+                </div>
+              ))}
+              <div className="mt-1 flex items-center justify-between gap-6 border-t border-border/50 pt-1">
+                <span className="font-medium">总 Token</span>
+                <span className="font-mono font-semibold tabular-nums">
+                  {formatTokenFull(total)}
+                </span>
+              </div>
+            </div>
+          </div>
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
+  )
+}
+
 function TraceRow({ rec }: { rec: TraceRecord }) {
   const [open, setOpen] = useState(false)
   const errStyle = rec.errorType ? outcomeStyle(rec.errorType) : null
@@ -247,21 +251,27 @@ function TraceRow({ rec }: { rec: TraceRecord }) {
           <span className="inline-block max-w-[220px] truncate align-middle">{rec.model}</span>
           {rec.isStream && <Badge variant="outline" className="ml-1.5">流式</Badge>}
         </td>
+        <td className="py-2.5 pr-3 text-[13px]">
+          <Badge variant="outline">{keyLabel(rec.keyId, rec.keyName)}</Badge>
+        </td>
         <td className="py-2.5 pr-3">
           <StatusBadge status={rec.finalStatus} />
         </td>
-        <td className="py-2.5 pr-3 text-[13px] whitespace-nowrap">
-          {keySourceLabel(rec)}
-        </td>
         <TraceCredentialCell rec={rec} />
+        <td className="py-2.5 pr-3 text-[12px] tabular-nums">
+          <TokenCell rec={rec} />
+        </td>
+        <td className="py-2.5 pr-3 text-[13px] tabular-nums">
+          {rec.credits != null && rec.credits > 0 ? rec.credits.toFixed(4) : '—'}
+        </td>
+        <td className="py-2.5 pr-3 text-[13px] tabular-nums text-muted-foreground">
+          {rec.firstTokenMs != null ? formatDuration(rec.firstTokenMs) : '—'}
+        </td>
         <td className="py-2.5 pr-3">
           {errStyle ? <Badge variant={errStyle.variant}>{errStyle.label}</Badge> : '—'}
         </td>
         <td className="py-2.5 pr-3 text-[13px] tabular-nums">
           {Math.max(0, rec.totalAttempts - 1)}
-        </td>
-        <td className="py-2.5 pr-3 text-[13px]">
-          <TokenCell rec={rec} />
         </td>
         <td className="py-2.5 pr-3 text-[13px] tabular-nums text-muted-foreground">
           {formatDuration(rec.durationMs)}
@@ -285,7 +295,7 @@ function TraceCredentialCell({ rec }: { rec: TraceRecord }) {
 function ExpandedTraceRow({ rec }: { rec: TraceRecord }) {
   return (
     <tr className="border-b border-border/40 bg-secondary/20">
-      <td colSpan={10} className="px-3 py-3">
+      <td colSpan={12} className="px-3 py-3">
         <ExpandedDetail rec={rec} />
       </td>
     </tr>
@@ -469,8 +479,22 @@ const PAGE_SIZE = 50
 export function TraceLogPage() {
   const [status, setStatus] = useState('')
   const [errorType, setErrorType] = useState('')
+  const [keyId, setKeyId] = useState('')
+  const [group, setGroup] = useState('')
   const [onlyFailed, setOnlyFailed] = useState(false)
   const [page, setPage] = useState(0)
+
+  const { data: keysData } = useClientKeys()
+  const keyOptions = [
+    { value: '', label: '全部 Key' },
+    ...(keysData?.keys ?? []).map((k) => ({ value: String(k.id), label: k.name })),
+  ]
+
+  const groupOptions = useGroupOptions()
+  const groupSelectOptions = [
+    { value: '', label: '全部分组' },
+    ...groupOptions.map((g) => ({ value: g, label: g })),
+  ]
 
   // 筛选条件变化时回到第一页
   const resetTo = <T,>(setter: (v: T) => void) => (v: T) => {
@@ -481,6 +505,8 @@ export function TraceLogPage() {
   const query: TraceQuery = {
     status: status || undefined,
     errorType: errorType || undefined,
+    keyId: keyId ? Number(keyId) : undefined,
+    group: group || undefined,
     onlyFailed: onlyFailed || undefined,
     limit: PAGE_SIZE,
     offset: page * PAGE_SIZE,
@@ -500,6 +526,8 @@ export function TraceLogPage() {
           {total > 0 && <Badge variant="secondary">{total}</Badge>}
         </div>
         <div className="ml-auto flex flex-wrap items-center gap-2">
+          <Select value={keyId} onChange={resetTo(setKeyId)} options={keyOptions} />
+          <Select value={group} onChange={resetTo(setGroup)} options={groupSelectOptions} />
           <Select value={status} onChange={resetTo(setStatus)} options={STATUS_OPTIONS} />
           <Select
             value={errorType}
@@ -540,12 +568,14 @@ export function TraceLogPage() {
                     <th className="py-2 pl-3 pr-2 font-medium"></th>
                     <th className="py-2 pr-3 font-medium">时间</th>
                     <th className="py-2 pr-3 font-medium">模型</th>
-                    <th className="py-2 pr-3 font-medium">状态</th>
                     <th className="py-2 pr-3 font-medium">入口 Key</th>
+                    <th className="py-2 pr-3 font-medium">状态</th>
                     <th className="py-2 pr-3 font-medium">最终凭据</th>
+                    <th className="py-2 pr-3 font-medium">Token</th>
+                    <th className="py-2 pr-3 font-medium">费用</th>
+                    <th className="py-2 pr-3 font-medium">首Token</th>
                     <th className="py-2 pr-3 font-medium">错误类型</th>
                     <th className="py-2 pr-3 font-medium">重试</th>
-                    <th className="py-2 pr-3 font-medium">Token</th>
                     <th className="py-2 pr-3 font-medium">耗时</th>
                   </tr>
                 </thead>

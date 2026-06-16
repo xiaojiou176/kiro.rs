@@ -107,18 +107,24 @@ pub struct TraceRecord {
     pub duration_ms: u64,
     /// 流式中断时已发送的字节数（区分完整失败 vs 半截中断）
     pub interrupted_after_bytes: Option<u64>,
-    /// 输入 token（互斥口径：未被缓存覆盖的部分）。无 usage 时为 0。
+    /// 输入 token（Anthropic 口径）
     #[serde(default)]
     pub input_tokens: u64,
-    /// 输出 token（估算）。
+    /// 输出 token
     #[serde(default)]
     pub output_tokens: u64,
-    /// 缓存创建 token（互斥口径）。
+    /// 缓存创建 token
     #[serde(default)]
     pub cache_creation_tokens: u64,
-    /// 缓存读取 token（互斥口径）。
+    /// 缓存读取 token
     #[serde(default)]
     pub cache_read_tokens: u64,
+    /// 费用（上游 meteringEvent 累计的 credits）
+    #[serde(default)]
+    pub credits: f64,
+    /// 首 Token 延迟（毫秒，仅流式有值；非流式为 None）
+    #[serde(default)]
+    pub first_token_ms: Option<u64>,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
 }
@@ -167,6 +173,8 @@ pub struct TraceQuery {
     pub error_type: Option<String>,
     /// 最终凭据 id
     pub credential_id: Option<u64>,
+    /// 客户端 Key id（0 = master apiKey）
+    pub key_id: Option<u64>,
     /// 该凭据在某一跳失败过（attempt 级，跨 trace 最终状态）。
     /// 用于"凭据失败详情"：即便整条 trace 最终成功，只要该凭据某跳失败也会命中。
     pub failed_attempt_credential_id: Option<u64>,
@@ -174,6 +182,9 @@ pub struct TraceQuery {
     pub model: Option<String>,
     /// 仅返回非 success
     pub only_failed: bool,
+    /// 按账号分组筛选：只返回最终凭据属于这些 id 的 trace。
+    /// 由 handler 层在查询前根据 group 参数转换为凭据 id 白名单填入。
+    pub credential_ids: Option<Vec<u64>>,
     /// 返回条数上限
     pub limit: usize,
     /// 偏移量（分页用）
@@ -209,7 +220,7 @@ impl TraceStore {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.execute_batch(SCHEMA)?;
-        migrate_add_token_columns(&conn);
+        Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             enabled: AtomicBool::new(enabled),
@@ -221,12 +232,54 @@ impl TraceStore {
     pub fn open_in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
-        migrate_add_token_columns(&conn);
+        Self::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             enabled: AtomicBool::new(true),
             retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
         })
+    }
+
+    /// 旧库迁移：为 traces 表补齐新增列（幂等，缺哪列加哪列）。
+    /// 老版本的 traces.db 只有基础列，新增的 token/credits/first_token_ms/key_source 需在此 ALTER。
+    fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+        let mut existing: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            let mut stmt = conn.prepare("PRAGMA table_info(traces)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            for name in rows {
+                existing.insert(name?);
+            }
+        }
+        // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
+        // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
+        // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
+        let columns: [(&str, &str); 7] = [
+            ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("cache_creation_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("credits", "REAL NOT NULL DEFAULT 0"),
+            ("first_token_ms", "INTEGER"),
+            ("key_source", "TEXT"),
+        ];
+        let key_source_added = !existing.contains("key_source");
+        for (name, def) in columns {
+            if !existing.contains(name) {
+                conn.execute_batch(&format!(
+                    "ALTER TABLE traces ADD COLUMN {} {};",
+                    name, def
+                ))?;
+            }
+        }
+        // 老库 key_source 列首次添加后，按 key_id 语义回填：master apiKey (key_id=0) 之外都视为客户端 Key。
+        if key_source_added {
+            conn.execute_batch(
+                "UPDATE traces SET key_source = CASE WHEN key_id = 0 \
+                 THEN 'masterApiKey' ELSE 'clientKey' END WHERE key_source IS NULL;",
+            )?;
+        }
+        Ok(())
     }
 
     /// 是否启用 trace 写入
@@ -272,8 +325,9 @@ impl TraceStore {
                 "INSERT OR REPLACE INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, \
                  is_stream, final_status, final_credential_id, error_type, error_message, \
                  total_attempts, duration_ms, interrupted_after_bytes, \
-                 input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+                 input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
+                 credits, first_token_ms) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -293,6 +347,8 @@ impl TraceStore {
                     rec.output_tokens as i64,
                     rec.cache_creation_tokens as i64,
                     rec.cache_read_tokens as i64,
+                    rec.credits,
+                    rec.first_token_ms.map(|v| v as i64),
                 ],
             )?;
             for a in &rec.attempts {
@@ -346,35 +402,55 @@ impl TraceStore {
 
     /// 把 [`TraceQuery`] 的过滤条件拼成 WHERE 子句 + 参数（值全部参数化绑定）
     fn build_where(q: &TraceQuery) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
-        let mut clauses: Vec<&str> = Vec::new();
+        let mut clauses: Vec<String> = Vec::new();
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(s) = &q.status {
-            clauses.push("final_status = ?");
+            clauses.push("final_status = ?".to_string());
             params.push(Box::new(s.clone()));
         }
         if let Some(t) = &q.error_type {
-            clauses.push("error_type = ?");
+            clauses.push("error_type = ?".to_string());
             params.push(Box::new(t.clone()));
         }
         if let Some(c) = q.credential_id {
-            clauses.push("final_credential_id = ?");
+            clauses.push("final_credential_id = ?".to_string());
             params.push(Box::new(c as i64));
+        }
+        if let Some(k) = q.key_id {
+            clauses.push("key_id = ?".to_string());
+            params.push(Box::new(k as i64));
         }
         if let Some(c) = q.failed_attempt_credential_id {
             // 该凭据在某一跳失败过（不论 trace 最终成功与否）
             clauses.push(
                 "EXISTS (SELECT 1 FROM trace_attempts a \
                  WHERE a.trace_id = traces.trace_id \
-                 AND a.credential_id = ? AND a.outcome != 'success')",
+                 AND a.credential_id = ? AND a.outcome != 'success')"
+                    .to_string(),
             );
             params.push(Box::new(c as i64));
         }
         if let Some(m) = &q.model {
-            clauses.push("model = ?");
+            clauses.push("model = ?".to_string());
             params.push(Box::new(m.clone()));
         }
+        if let Some(ids) = &q.credential_ids {
+            if ids.is_empty() {
+                // 空白名单 = 该分组下无凭据 → 强制零匹配
+                clauses.push("1=0".to_string());
+            } else {
+                let placeholders: Vec<&str> = ids.iter().map(|_| "?").collect();
+                clauses.push(format!(
+                    "final_credential_id IN ({})",
+                    placeholders.join(",")
+                ));
+                for id in ids {
+                    params.push(Box::new(*id as i64));
+                }
+            }
+        }
         if q.only_failed {
-            clauses.push("final_status != 'success'");
+            clauses.push("final_status != 'success'".to_string());
         }
         let where_sql = if clauses.is_empty() {
             String::new()
@@ -403,7 +479,7 @@ impl TraceStore {
         let sql = format!(
             "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
-             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens \
+             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -428,6 +504,8 @@ impl TraceStore {
                 output_tokens: row.get::<_, i64>(14)? as u64,
                 cache_creation_tokens: row.get::<_, i64>(15)? as u64,
                 cache_read_tokens: row.get::<_, i64>(16)? as u64,
+                credits: row.get::<_, f64>(17)?,
+                first_token_ms: row.get::<_, Option<i64>>(18)?.map(|v| v as u64),
                 attempts: Vec::new(),
             })
         })?;
@@ -545,32 +623,13 @@ pub struct FailureStats {
 /// 共享存储句柄
 pub type SharedTraceStore = Arc<TraceStore>;
 
-/// 给已存在的老 `traces` 表补 token 列（幂等）。
-///
-/// SCHEMA 用 `CREATE TABLE IF NOT EXISTS` 不会给已建表加列，所以升级到带 token 的
-/// 版本时，旧库里没有这些列。这里对每列做一次 `ADD COLUMN`，已存在时 SQLite 报
-/// "duplicate column name"，直接忽略即可——纯幂等，不依赖版本号。
-fn migrate_add_token_columns(conn: &Connection) {
-    const COLS: [&str; 4] = [
-        "input_tokens",
-        "output_tokens",
-        "cache_creation_tokens",
-        "cache_read_tokens",
-    ];
-    for col in COLS {
-        let sql = format!("ALTER TABLE traces ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0");
-        // 列已存在会返回 Err（duplicate column），是预期内的幂等结果，忽略。
-        let _ = conn.execute(&sql, []);
-    }
-}
-
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS traces (
     trace_id          TEXT PRIMARY KEY,
     ts                TEXT NOT NULL,
     ts_epoch          INTEGER NOT NULL,
     key_id            INTEGER NOT NULL,
-    key_source        TEXT NOT NULL,
+    key_source        TEXT,
     model             TEXT NOT NULL,
     is_stream         INTEGER NOT NULL,
     final_status      TEXT NOT NULL,
@@ -583,7 +642,9 @@ CREATE TABLE IF NOT EXISTS traces (
     input_tokens      INTEGER NOT NULL DEFAULT 0,
     output_tokens     INTEGER NOT NULL DEFAULT 0,
     cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
-    cache_read_tokens INTEGER NOT NULL DEFAULT 0
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+    credits           REAL NOT NULL DEFAULT 0,
+    first_token_ms    INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
@@ -641,6 +702,8 @@ mod tests {
             output_tokens: 779,
             cache_creation_tokens: 0,
             cache_read_tokens: 101760,
+            credits: 0.0,
+            first_token_ms: None,
             attempts: vec![
                 TraceAttempt {
                     attempt: 0,

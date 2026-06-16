@@ -418,15 +418,9 @@ export async function checkGitHubRateLimit(
   return data
 }
 
-// 修改登录API密钥
+// 修改登录API密钥（adminApiKey —— 管理面板登录密钥）
 export async function updateAdminKey(req: UpdateAdminKeyRequest): Promise<SuccessResponse> {
   const { data } = await api.put<SuccessResponse>('/config/admin-key', req)
-  return data
-}
-
-// 修改管理员API密钥
-export async function updateApiKey(req: UpdateAdminKeyRequest): Promise<SuccessResponse> {
-  const { data } = await api.put<SuccessResponse>('/config/api-key', req)
   return data
 }
 

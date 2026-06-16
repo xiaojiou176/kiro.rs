@@ -125,6 +125,21 @@ pub struct KiroCredentials {
     /// 端点名必须在启动时注册的端点 registry 中存在。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+
+    /// 账号所属分组（可属于多个分组）
+    ///
+    /// 客户端 Key 绑定某个分组后，用该 Key 发起的请求只会调度到 groups 包含该分组名的账号。
+    /// 空数组表示该账号不属于任何分组（仅未绑定分组的 Key / master apiKey 可使用）。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
+
+    /// 账号来源渠道（纯备注）
+    ///
+    /// 标记该账号的购买来源/渠道，便于运营追踪。不参与调度、导出或筛选。
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_channel: Option<String>,
 }
 
 /// 判断是否为零（用于跳过序列化）
@@ -168,6 +183,8 @@ impl std::fmt::Debug for KiroCredentials {
             .field("disabled", &self.disabled)
             .field("kiro_api_key", &fmt_redacted(&self.kiro_api_key))
             .field("endpoint", &self.endpoint)
+            .field("groups", &self.groups)
+            .field("source_channel", &self.source_channel)
             .finish()
     }
 }
@@ -472,6 +489,8 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            groups: vec![],
+            source_channel: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -661,6 +680,8 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            groups: vec![],
+            source_channel: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -694,6 +715,8 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            groups: vec![],
+            source_channel: None,
         };
 
         let json = creds.to_pretty_json().unwrap();
@@ -810,6 +833,8 @@ mod tests {
             disabled: false,
             kiro_api_key: None,
             endpoint: None,
+            groups: vec![],
+            source_channel: None,
         };
 
         let json = original.to_pretty_json().unwrap();
