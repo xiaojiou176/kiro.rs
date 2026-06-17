@@ -129,6 +129,7 @@ pub(crate) struct RequestTracer {
     key_source: TraceKeySource,
     model: String,
     is_stream: bool,
+    conversation_id: Option<String>,
     started_at: Instant,
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
@@ -156,6 +157,7 @@ struct RequestTraceOptions {
     key_ctx: KeyContext,
     model: String,
     is_stream: bool,
+    conversation_id: Option<String>,
 }
 
 impl RequestTracer {
@@ -168,6 +170,7 @@ impl RequestTracer {
             key_source: options.key_ctx.key_source,
             model: options.model,
             is_stream: options.is_stream,
+            conversation_id: options.conversation_id,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
@@ -219,6 +222,7 @@ impl RequestTracer {
             cache_read_tokens: usage.cache_read_tokens,
             credits: usage.credits,
             first_token_ms,
+            conversation_id: self.conversation_id.clone(),
             attempts,
         };
         store.insert(&rec);
@@ -653,6 +657,9 @@ pub async fn post_messages(
         }
     };
 
+    // Codex thread id（从 metadata.user_id 提取的 conversationId）用于 trace 关联
+    let conversation_id_for_trace = conversion_result.conversation_state.conversation_id.clone();
+
     // Build the Kiro request. profile_arn is injected by the provider layer from the actual
     // credentials; additional_model_request_fields is already filtered by converter model support.
     let kiro_request = KiroRequest {
@@ -713,6 +720,7 @@ pub async fn post_messages(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: true,
+                conversation_id: Some(conversation_id_for_trace.clone()),
             },
         ));
         handle_stream_request(
@@ -738,6 +746,7 @@ pub async fn post_messages(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: false,
+                conversation_id: Some(conversation_id_for_trace.clone()),
             },
         ));
         handle_non_stream_request(
@@ -1407,6 +1416,9 @@ pub async fn post_messages_cc(
         }
     };
 
+    // Codex thread id（从 metadata.user_id 提取的 conversationId）用于 trace 关联
+    let conversation_id_for_trace = conversion_result.conversation_state.conversation_id.clone();
+
     // Build the Kiro request. profile_arn is injected by the provider layer from the actual
     // credentials; additional_model_request_fields is already filtered by converter model support.
     let kiro_request = KiroRequest {
@@ -1466,6 +1478,7 @@ pub async fn post_messages_cc(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: true,
+                conversation_id: Some(conversation_id_for_trace.clone()),
             },
         ));
         handle_stream_request_buffered(
@@ -1491,6 +1504,7 @@ pub async fn post_messages_cc(
                 key_ctx: key_ctx.clone(),
                 model: payload.model.clone(),
                 is_stream: false,
+                conversation_id: Some(conversation_id_for_trace.clone()),
             },
         ));
         handle_non_stream_request(
