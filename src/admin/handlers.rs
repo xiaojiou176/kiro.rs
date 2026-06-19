@@ -20,7 +20,8 @@ use super::{
         CreateClientKeyRequest, CreateClientKeyResponse, GlobalProxyResponse,
         SetAccountThrottleConfigRequest, SetDisabledRequest, SetGlobalProxyRequest,
         SetLoadBalancingModeRequest, SetLogGovernanceConfigRequest, SetPriorityRequest,
-        SetUpdateConfigRequest, StartIdcLoginRequest, StartSocialLoginRequest, SuccessResponse,
+        SetSessionPriorityRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
+        StartSocialLoginRequest, PinSessionRequest, UnpinSessionRequest, SuccessResponse,
         UpdateAdminKeyRequest, UpdateClientKeyRequest, UpdateCredentialRequest,
         UpdateRefreshTokenRequest,
     },
@@ -107,6 +108,61 @@ pub async fn set_credential_disabled(
         }
         Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
     }
+}
+
+/// GET /api/admin/observability
+/// 多号 affinity 观测面板快照
+pub async fn get_observability(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.observability_snapshot())
+}
+
+/// POST /api/admin/sessions/pin
+/// 将会话 pin 到指定凭据
+pub async fn pin_session_to_account(
+    State(state): State<AdminState>,
+    Json(payload): Json<PinSessionRequest>,
+) -> impl IntoResponse {
+    match state
+        .service
+        .pin_session(&payload.session_id, payload.credential_id)
+    {
+        Ok(_) => Json(SuccessResponse::new(format!(
+            "会话 {} 已 pin 到凭据 #{}",
+            payload.session_id, payload.credential_id
+        )))
+        .into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
+/// POST /api/admin/sessions/unpin
+/// 解除会话 pin
+pub async fn unpin_session(
+    State(state): State<AdminState>,
+    Json(payload): Json<UnpinSessionRequest>,
+) -> impl IntoResponse {
+    state.service.unpin_session(&payload.session_id);
+    Json(SuccessResponse::new(format!(
+        "会话 {} 已解除 pin",
+        payload.session_id
+    )))
+    .into_response()
+}
+
+/// POST /api/admin/sessions/priority
+/// 设置会话优先级
+pub async fn set_session_priority(
+    State(state): State<AdminState>,
+    Json(payload): Json<SetSessionPriorityRequest>,
+) -> impl IntoResponse {
+    state
+        .service
+        .set_session_priority(&payload.session_id, payload.priority);
+    Json(SuccessResponse::new(format!(
+        "会话 {} 优先级已设置为 {}",
+        payload.session_id, payload.priority
+    )))
+    .into_response()
 }
 
 /// POST /api/admin/credentials/:id/priority

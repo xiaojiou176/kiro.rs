@@ -283,6 +283,7 @@ async fn main() {
             loop {
                 tokio::time::sleep(interval).await;
                 tm.flush_affinity_if_dirty();
+                tm.flush_pins_if_dirty();
             }
         });
     }

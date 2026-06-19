@@ -100,6 +100,29 @@ pub struct SetPriorityRequest {
     pub priority: u32,
 }
 
+/// 将会话 pin 到指定凭据
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PinSessionRequest {
+    pub session_id: String,
+    pub credential_id: u64,
+}
+
+/// 解除会话 pin
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnpinSessionRequest {
+    pub session_id: String,
+}
+
+/// 设置会话优先级
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSessionPriorityRequest {
+    pub session_id: String,
+    pub priority: i32,
+}
+
 /// 添加凭据请求
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]

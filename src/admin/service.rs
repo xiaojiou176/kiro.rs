@@ -701,6 +701,35 @@ impl AdminService {
             .map_err(|e| self.classify_error(e, id))
     }
 
+    /// 观测面板快照（多号 affinity / 会话绑定 / pin / 优先级）
+    pub fn observability_snapshot(&self) -> crate::kiro::token_manager::ObservabilitySnapshot {
+        self.token_manager.observability_snapshot()
+    }
+
+    /// 将会话 pin 到指定凭据
+    pub fn pin_session(&self, session: &str, credential_id: u64) -> Result<(), AdminServiceError> {
+        let snapshot = self.token_manager.snapshot();
+        if !snapshot
+            .entries
+            .iter()
+            .any(|entry| entry.id == credential_id)
+        {
+            return Err(AdminServiceError::NotFound { id: credential_id });
+        }
+        self.token_manager.pin_session(session, credential_id);
+        Ok(())
+    }
+
+    /// 解除会话 pin
+    pub fn unpin_session(&self, session: &str) {
+        self.token_manager.unpin_session(session);
+    }
+
+    /// 设置会话优先级
+    pub fn set_session_priority(&self, session: &str, priority: i32) {
+        self.token_manager.set_session_priority(session, priority);
+    }
+
     /// 重置失败计数并重新启用
     pub fn reset_and_enable(&self, id: u64) -> Result<(), AdminServiceError> {
         self.token_manager

@@ -90,8 +90,13 @@ impl ClientCache {
 pub struct KiroCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,
-    /// 限速器在飞许可。持有到 `KiroCallResult` 被 drop（即 streaming 转发结束）才释放，
-    /// 保证 max_inflight 在整个响应生命周期内有效。`None` 表示未启用限速或 shadow 模式。
+    /// 限速器在飞许可（maxInflight 槽位）。
+    ///
+    /// - **非流式**：handler 取出 `response` 后读完 body，`KiroCallResult`（含本字段）在 handler
+    ///   返回前 drop → maxInflight 在 body 消费完毕后才释放。
+    /// - **流式**：handler 取出 `response`、构建 SSE `Body::from_stream` 后立即返回；
+    ///   `KiroCallResult` 随 handler 返回 drop → maxInflight 在 handler 返回时释放，
+    ///   而非客户端/SSE 流结束。`None` 表示未启用限速或 shadow 模式。
     #[allow(dead_code)]
     pub(crate) limiter_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
@@ -370,6 +375,71 @@ impl KiroProvider {
                 }
             }
 
+            // ===== 自适应限速发送前闸门（MCP / WebSearch 路径，与 call_api_with_retry 对齐）=====
+            let mut limiter_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
+            if self.limiters.enabled() {
+                let scope = ThrottleScope::UserCredential(ctx.id);
+                let limiter = self.limiters.for_scope(&scope);
+                let retry_only = self.limiter_enforce_scope == "retry_only";
+                let outcome = if retry_only && attempt == 0 {
+                    limiter.acquire_shadow()
+                } else {
+                    limiter.acquire().await
+                };
+                match outcome {
+                    AcquireOutcome::Proceed(permit) => {
+                        tracing::info!(
+                            event = "kiro_limiter_decision",
+                            credential_id = ctx.id,
+                            scope = "user",
+                            action = "acquire_proceed",
+                            current_rate_rps = limiter.current_rate_rps(),
+                            attempt = attempt,
+                            "limiter 放行 (MCP)"
+                        );
+                        limiter_permit = Some(permit);
+                    }
+                    AcquireOutcome::ShadowProceed {
+                        would_wait_ms,
+                        would_rps,
+                    } => {
+                        tracing::info!(
+                            event = "kiro_limiter_decision",
+                            credential_id = ctx.id,
+                            scope = "user",
+                            action = "shadow",
+                            would_wait_ms = would_wait_ms,
+                            would_rate_rps = would_rps,
+                            attempt = attempt,
+                            "limiter shadow（MCP，未拦截，仅记录）"
+                        );
+                    }
+                    AcquireOutcome::LocalThrottled {
+                        est_wait_ms,
+                        current_rps,
+                        reason,
+                    } => {
+                        tracing::warn!(
+                            event = "kiro_limiter_decision",
+                            credential_id = ctx.id,
+                            scope = "user",
+                            action = "acquire_timeout",
+                            est_wait_ms = est_wait_ms,
+                            current_rate_rps = current_rps,
+                            reason = reason,
+                            attempt = attempt,
+                            "Fail Aloud：本地限流，不发上游 MCP 请求"
+                        );
+                        anyhow::bail!(
+                            "MCP 本地限流（Fail Aloud）: kiro_local_throttled reason={} est_wait_ms={} rate_rps={:.3}",
+                            reason,
+                            est_wait_ms,
+                            current_rps
+                        );
+                    }
+                }
+            }
+
             let response = match request.send().await {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -389,14 +459,80 @@ impl KiroProvider {
 
             let status = response.status();
 
-            // 成功响应
+            // 429 响应头采样（读 body 前抓取，与主路径一致）
+            if status.as_u16() == 429 {
+                let hdrs = response.headers();
+                let retry_after = hdrs
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let amz_retry_after = hdrs
+                    .get("x-amz-retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let throttle_headers: Vec<String> = hdrs
+                    .iter()
+                    .filter(|(k, _)| {
+                        let k = k.as_str().to_ascii_lowercase();
+                        k.contains("retry") || k.contains("ratelimit") || k.starts_with("x-amz")
+                    })
+                    .map(|(k, v)| format!("{}={}", k.as_str(), v.to_str().unwrap_or("<bin>")))
+                    .collect();
+                tracing::warn!(
+                    cred_id = ctx.id,
+                    retry_after = ?retry_after,
+                    x_amz_retry_after = ?amz_retry_after,
+                    throttle_headers = ?throttle_headers,
+                    "AWS 429 响应头采样（MCP，用于确认上游是否返回 Retry-After / 限流头）"
+                );
+            }
+
+            // 成功响应：读完 body 后 drop permit（MCP 非流式，caller 需要完整 body）
             if status.is_success() {
                 self.token_manager.report_success(ctx.id);
+                if self.limiters.enabled() {
+                    let scope = ThrottleScope::UserCredential(ctx.id);
+                    self.limiters.for_scope(&scope).on_success().await;
+                }
+                let headers = response.headers().clone();
+                let body = response.text().await.unwrap_or_default();
+                drop(limiter_permit);
+                let mut builder = http::Response::builder().status(status);
+                for (name, value) in headers.iter() {
+                    if let Ok(v) = value.to_str() {
+                        builder = builder.header(name.as_str(), v);
+                    }
+                }
+                let response = reqwest::Response::from(
+                    builder
+                        .body(body)
+                        .expect("valid MCP response body"),
+                );
                 return Ok(response);
             }
 
             // 失败响应
             let body = response.text().await.unwrap_or_default();
+            drop(limiter_permit);
+
+            // 限速器 429 回写
+            if status.as_u16() == 429 && self.limiters.enabled() {
+                let reason = classify_throttle_reason(&body);
+                let scope = ThrottleScope::UserCredential(ctx.id);
+                self.limiters
+                    .for_scope(&scope)
+                    .on_throttle(reason, None)
+                    .await;
+                tracing::info!(
+                    event = "kiro_limiter_decision",
+                    credential_id = ctx.id,
+                    scope = "user",
+                    action = "on_throttle",
+                    throttle_reason = ?reason,
+                    upstream_status = 429u16,
+                    "limiter 减速回写 (MCP)"
+                );
+            }
 
             // 402 额度用尽
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {
@@ -616,7 +752,8 @@ impl KiroProvider {
             //   - enabled=false：完全跳过（行为等同改造前）。
             //   - enforce_scope=retry_only：attempt 0 走 shadow（只记录），attempt>0 真拦。
             //   - enforce_scope=all：所有 attempt 真拦。
-            // Proceed 持 permit 到响应结束（随 KiroCallResult drop）；LocalThrottled 本地失败不发请求。
+            // Proceed 持 permit 到响应结束（随 KiroCallResult drop，见 struct 字段注释）；
+            // LocalThrottled 本地失败不发请求。
             let mut limiter_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
             if self.limiters.enabled() {
                 let scope = ThrottleScope::UserCredential(ctx.id);
@@ -733,6 +870,8 @@ impl KiroProvider {
                     let scope = ThrottleScope::UserCredential(ctx.id);
                     self.limiters.for_scope(&scope).on_success().await;
                 }
+                // limiter_permit 随 KiroCallResult 交给 handler；非流式在 body 读完后 drop，
+                // 流式在 handler 返回时 drop（见 KiroCallResult::limiter_permit 注释）。
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,

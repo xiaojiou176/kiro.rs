@@ -14,15 +14,17 @@ use super::{
         delete_credential, delete_group, delete_proxy, disable_quota_exceeded, enable_overage_all,
         export_credentials, export_kam_credentials, force_refresh_token, get_account_throttle_config,
         get_all_credentials, get_credential_balance, get_credential_models, get_global_proxy,
-        get_load_balancing_mode, get_log_governance_config, get_proxy_pool, get_update_config,
-        list_client_keys, list_groups, list_traces, trace_failure_stats, poll_idc_login,
+        get_load_balancing_mode, get_log_governance_config, get_observability, get_proxy_pool,
+        get_update_config, list_client_keys, list_groups, list_traces, trace_failure_stats,
+        pin_session_to_account, poll_idc_login,
         poll_idc_relogin, poll_social_login,
         poll_social_relogin, pull_update_image, reset_all_success_count, reset_client_key_stats,
         reset_failure_count, reset_success_count, rollback_image_update, rotate_client_key,
         set_account_throttle_config, set_client_key_disabled, set_credential_disabled,
         set_credential_overage, set_credential_priority, set_global_proxy,
-        set_load_balancing_mode, set_log_governance_config, set_proxy_enabled, set_update_config,
-        start_idc_login, start_idc_relogin, start_social_login, start_social_relogin,
+        set_load_balancing_mode, set_log_governance_config, set_proxy_enabled,
+        set_session_priority, set_update_config, start_idc_login, start_idc_relogin,
+        start_social_login, start_social_relogin, unpin_session,
         stats_by_credential, stats_by_model, stats_overview, stats_timeseries,
         update_admin_key, update_client_key, update_credential, update_group, update_refresh_token,
     },
@@ -167,6 +169,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route("/stats/by-credential", get(stats_by_credential))
         .route("/traces/failure-stats", get(trace_failure_stats))
         .route("/traces", get(list_traces))
+        .route("/observability", get(get_observability))
+        .route("/sessions/pin", post(pin_session_to_account))
+        .route("/sessions/unpin", post(unpin_session))
+        .route("/sessions/priority", post(set_session_priority))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             admin_auth_middleware,

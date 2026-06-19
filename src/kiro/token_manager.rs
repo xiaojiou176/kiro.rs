@@ -797,6 +797,9 @@ struct AffinityBinding {
     /// 最近一次切号时间（用于切号防抖；从未切过为 None）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_switch_at: Option<DateTime<Utc>>,
+    /// 会话优先级（越高越重要；影响新绑 / 强制切号时的选号偏好）
+    #[serde(default)]
+    priority: i32,
 }
 
 /// 观测面板：单个号的运行态快照。
@@ -832,6 +835,10 @@ pub struct ObservabilitySnapshot {
     pub session_to_account: HashMap<String, u64>,
     /// 活跃会话总数（last_seen 在活跃窗口内）。
     pub active_session_total: usize,
+    /// 手动 pin：会话 id -> 强制使用的号 id。
+    pub pinned_sessions: HashMap<String, u64>,
+    /// 会话优先级（TTL 内绑定 + 尚未绑定的 pending；越高越重要）。
+    pub session_priority: HashMap<String, i32>,
 }
 
 // ============================================================================
@@ -950,6 +957,14 @@ pub struct MultiTokenManager {
     last_affinity_save_at: Mutex<Option<Instant>>,
     /// 亲和映射是否有未落盘更新
     affinity_dirty: AtomicBool,
+    /// 手动 pin：会话 id → 强制使用的凭据 id（持久化到 session_pins.json）。
+    pin_map: Mutex<HashMap<String, u64>>,
+    /// 最近一次 pin 映射落盘时间（用于 debounce）
+    last_pins_save_at: Mutex<Option<Instant>>,
+    /// pin 映射是否有未落盘更新
+    pins_dirty: AtomicBool,
+    /// 尚未建立 affinity 绑定的会话优先级（下次绑定时写入 AffinityBinding）。
+    pending_priority: Mutex<HashMap<String, i32>>,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -958,6 +973,8 @@ const MAX_FAILURES_PER_CREDENTIAL: u32 = 10;
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 /// 会话亲和映射持久化防抖间隔
 const AFFINITY_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+/// 会话 pin 映射持久化防抖间隔
+const PINS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
 /// RPM 负载窗口长度（统计近 N 秒内的请求数作为负载度量）
 const RPM_WINDOW: StdDuration = StdDuration::from_secs(60);
 
@@ -1113,6 +1130,10 @@ impl MultiTokenManager {
             affinity: Mutex::new(HashMap::new()),
             last_affinity_save_at: Mutex::new(None),
             affinity_dirty: AtomicBool::new(false),
+            pin_map: Mutex::new(HashMap::new()),
+            last_pins_save_at: Mutex::new(None),
+            pins_dirty: AtomicBool::new(false),
+            pending_priority: Mutex::new(HashMap::new()),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -1144,8 +1165,54 @@ impl MultiTokenManager {
         manager.load_stats();
         // 加载持久化的会话亲和映射（多号 + session affinity，重启后同会话仍黏同号）
         manager.load_affinity();
+        // 加载持久化的会话 pin 映射
+        manager.load_pins();
 
         Ok(manager)
+    }
+
+    /// 手动 pin：将会话强制绑定到指定凭据（选号时优先于 affinity）。
+    pub fn pin_session(&self, session: &str, credential_id: u64) {
+        if session.is_empty() {
+            return;
+        }
+        self.pin_map
+            .lock()
+            .insert(session.to_string(), credential_id);
+        self.save_pins_debounced();
+    }
+
+    /// 取消会话的手动 pin。
+    pub fn unpin_session(&self, session: &str) {
+        if session.is_empty() {
+            return;
+        }
+        self.pin_map.lock().remove(session);
+        self.save_pins_debounced();
+    }
+
+    /// 返回当前全部 pin 映射的克隆。
+    pub fn pinned_sessions(&self) -> HashMap<String, u64> {
+        self.pin_map.lock().clone()
+    }
+
+    /// 设置会话优先级（越高越重要）。已有 affinity 绑定时立即写入并持久化；
+    /// 否则存入 pending，下次绑定时应用。
+    pub fn set_session_priority(&self, session: &str, priority: i32) {
+        if session.is_empty() {
+            return;
+        }
+        let mut aff = self.affinity.lock();
+        if let Some(b) = aff.get_mut(session) {
+            b.priority = priority;
+            drop(aff);
+            self.save_affinity_debounced();
+        } else {
+            drop(aff);
+            self.pending_priority
+                .lock()
+                .insert(session.to_string(), priority);
+        }
     }
 
     /// 获取配置的引用
@@ -1179,6 +1246,7 @@ impl MultiTokenManager {
         let mut bound: HashMap<u64, Vec<String>> = HashMap::new();
         let mut active_counts: HashMap<u64, usize> = HashMap::new();
         let mut session_to_account: HashMap<String, u64> = HashMap::new();
+        let mut session_priority: HashMap<String, i32> = HashMap::new();
         let mut active_session_total = 0usize;
         {
             let aff = self.affinity.lock();
@@ -1188,10 +1256,20 @@ impl MultiTokenManager {
                 }
                 bound.entry(b.credential_id).or_default().push(sid.clone());
                 session_to_account.insert(sid.clone(), b.credential_id);
+                session_priority.insert(sid.clone(), b.priority);
                 if (now - b.last_seen) <= active_window {
                     *active_counts.entry(b.credential_id).or_default() += 1;
                     active_session_total += 1;
                 }
+            }
+        }
+
+        // 2b) pin 快照 + pending 优先级（不与 affinity 锁交叉）。
+        let pinned_sessions = self.pin_map.lock().clone();
+        {
+            let pending = self.pending_priority.lock();
+            for (sid, p) in pending.iter() {
+                session_priority.entry(sid.clone()).or_insert(*p);
             }
         }
 
@@ -1227,6 +1305,8 @@ impl MultiTokenManager {
             accounts,
             session_to_account,
             active_session_total,
+            pinned_sessions,
+            session_priority,
         }
     }
 
@@ -1415,15 +1495,62 @@ impl MultiTokenManager {
         available: &[(u64, KiroCredentials)],
         exclude: Option<u64>,
     ) -> Option<(u64, KiroCredentials)> {
+        self.lowest_load_prioritized(available, exclude, false)
+    }
+
+    /// 选号：默认最低 RPM；`prefer_healthy=true` 时优先最低冷却，再最低 RPM，再凭据 priority/id。
+    fn lowest_load_prioritized(
+        &self,
+        available: &[(u64, KiroCredentials)],
+        exclude: Option<u64>,
+        prefer_healthy: bool,
+    ) -> Option<(u64, KiroCredentials)> {
         available
             .iter()
             .filter(|(id, _)| Some(*id) != exclude)
-            .min_by_key(|(id, c)| (self.rpm(*id), c.priority, *id))
+            .min_by_key(|(id, c)| {
+                let cd_ms = if prefer_healthy {
+                    self.limiters
+                        .cooldown_remaining(&ThrottleScope::UserCredential(*id))
+                        .as_millis() as u64
+                } else {
+                    0
+                };
+                (cd_ms, self.rpm(*id), c.priority, *id)
+            })
             .map(|(id, c)| (*id, c.clone()))
     }
 
+    /// 读取会话优先级：pending 优先，否则已有绑定，默认 0。
+    fn session_priority_for(&self, key: &str, existing: Option<&AffinityBinding>) -> i32 {
+        if let Some(p) = self.pending_priority.lock().get(key) {
+            return *p;
+        }
+        existing.map(|b| b.priority).unwrap_or(0)
+    }
+
+    /// 取出并清除 pending 优先级（绑定时写入 AffinityBinding）。
+    fn take_pending_priority(&self, key: &str, existing: Option<&AffinityBinding>) -> i32 {
+        let from_pending = self.pending_priority.lock().remove(key);
+        from_pending.unwrap_or_else(|| existing.map(|b| b.priority).unwrap_or(0))
+    }
+
     /// 打一条选号决策日志（与 provider 的 `kiro_limiter_decision` 同事件名，scope=select）。
-    fn log_select(action: &'static str, credential_id: u64, rpm: usize, cooldown_remaining_ms: u64) {
+    fn log_select(
+        action: &'static str,
+        credential_id: u64,
+        rpm: usize,
+        cooldown_remaining_ms: u64,
+        session: Option<&str>,
+        priority: i32,
+    ) {
+        let session_short = session.map(|s| {
+            if s.len() > 8 {
+                &s[..8]
+            } else {
+                s
+            }
+        });
         tracing::info!(
             event = "kiro_limiter_decision",
             scope = "select",
@@ -1431,6 +1558,8 @@ impl MultiTokenManager {
             credential_id = credential_id,
             rpm = rpm,
             cooldown_remaining_ms = cooldown_remaining_ms,
+            session = session_short,
+            priority = priority,
             "多号选号决策"
         );
     }
@@ -1511,13 +1640,47 @@ impl MultiTokenManager {
             Some(k) if !k.is_empty() => k.to_string(),
             _ => {
                 let pick = self.lowest_load(&available, None)?;
-                Self::log_select("load_select", pick.0, self.rpm(pick.0), 0);
+                Self::log_select("load_select", pick.0, self.rpm(pick.0), 0, None, 0);
                 return Some(pick);
             }
         };
 
-        // 读现有绑定的只读快照（不在持 affinity 锁期间调用 rpm/limiters，避免锁交叉）。
+        // 读现有绑定的只读快照（pin / 选号共用；不在持 affinity 锁期间调用 rpm/limiters）。
         let existing = self.affinity.lock().get(&key).cloned();
+
+        // 手动 pin：优先于 affinity 决策（pin 不在 available 时 soft fallback）。
+        {
+            let pinned_id = self.pin_map.lock().get(&key).copied();
+            if let Some(pinned_id) = pinned_id {
+                if let Some(creds) = available
+                    .iter()
+                    .find(|(id, _)| *id == pinned_id)
+                    .map(|(_, c)| c.clone())
+                {
+                    let cd = self
+                        .limiters
+                        .cooldown_remaining(&ThrottleScope::UserCredential(pinned_id));
+                    let prio = self.session_priority_for(&key, existing.as_ref());
+                    Self::log_select(
+                        "affinity_pin",
+                        pinned_id,
+                        self.rpm(pinned_id),
+                        cd.as_millis() as u64,
+                        Some(&key),
+                        prio,
+                    );
+                    return Some((pinned_id, creds));
+                }
+                tracing::warn!(
+                    session = %key,
+                    pinned_id = pinned_id,
+                    "手动 pin 的目标号当前不可用，回退到正常 affinity 选号"
+                );
+            }
+        }
+
+        let session_prio = self.session_priority_for(&key, existing.as_ref());
+        let prefer_healthy = session_prio > 0;
 
         enum Act {
             Stick,
@@ -1570,17 +1733,19 @@ impl MultiTokenManager {
                         }
                     }
                 } else {
-                    // 原号已不可用 → 强制切到最低负载号。
-                    let pick = self.lowest_load(&available, None)?;
+                    // 原号已不可用 → 强制切号；高优先级会话偏好最健康号。
+                    let pick = self.lowest_load_prioritized(&available, None, prefer_healthy)?;
                     (Act::Switch, pick, 0)
                 }
             }
             // 无绑定或绑定已过 TTL → 新会话：最低负载落号并绑定。
             _ => {
-                let pick = self.lowest_load(&available, None)?;
+                let pick = self.lowest_load_prioritized(&available, None, prefer_healthy)?;
                 (Act::NewBind, pick, 0)
             }
         };
+
+        let bind_priority = self.take_pending_priority(&key, existing.as_ref());
 
         // 短暂写锁更新绑定。
         {
@@ -1589,6 +1754,7 @@ impl MultiTokenManager {
                 Act::Stick => {
                     if let Some(e) = aff.get_mut(&key) {
                         e.last_seen = now;
+                        e.priority = bind_priority;
                     } else {
                         // 期间被并发清理：重新建绑定（last-writer-wins，幂等）。
                         aff.insert(
@@ -1598,6 +1764,7 @@ impl MultiTokenManager {
                                 bound_at: now,
                                 last_seen: now,
                                 last_switch_at: None,
+                                priority: bind_priority,
                             },
                         );
                     }
@@ -1608,10 +1775,12 @@ impl MultiTokenManager {
                         bound_at: now,
                         last_seen: now,
                         last_switch_at: Some(now),
+                        priority: bind_priority,
                     });
                     e.credential_id = chosen.0;
                     e.last_switch_at = Some(now);
                     e.last_seen = now;
+                    e.priority = bind_priority;
                 }
                 Act::NewBind => {
                     aff.insert(
@@ -1621,6 +1790,7 @@ impl MultiTokenManager {
                             bound_at: now,
                             last_seen: now,
                             last_switch_at: None,
+                            priority: bind_priority,
                         },
                     );
                 }
@@ -1632,7 +1802,14 @@ impl MultiTokenManager {
             Act::Switch => "affinity_switch",
             Act::NewBind => "new_session_bind",
         };
-        Self::log_select(action_str, chosen.0, self.rpm(chosen.0), cd_ms);
+        Self::log_select(
+            action_str,
+            chosen.0,
+            self.rpm(chosen.0),
+            cd_ms,
+            Some(&key),
+            session_prio,
+        );
         self.save_affinity_debounced();
         Some(chosen)
     }
@@ -1726,6 +1903,88 @@ impl MultiTokenManager {
     pub fn flush_affinity_if_dirty(&self) {
         if self.affinity_dirty.load(Ordering::Relaxed) {
             self.save_affinity();
+        }
+    }
+
+    /// 会话 pin 映射文件路径（与 affinity 同目录）。
+    fn pins_path(&self) -> Option<PathBuf> {
+        self.cache_dir().map(|d| d.join("session_pins.json"))
+    }
+
+    /// 启动时从磁盘加载会话 pin 映射（过滤指向不存在凭据的条目）。
+    fn load_pins(&self) {
+        let path = match self.pins_path() {
+            Some(p) => p,
+            None => return,
+        };
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let map: HashMap<String, u64> = match serde_json::from_str(&content) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("解析会话 pin 缓存失败，将忽略: {}", e);
+                return;
+            }
+        };
+
+        let valid_ids: std::collections::HashSet<u64> =
+            self.entries.lock().iter().map(|e| e.id).collect();
+
+        let mut loaded = self.pin_map.lock();
+        let mut kept = 0usize;
+        for (k, id) in map {
+            if valid_ids.contains(&id) {
+                loaded.insert(k, id);
+                kept += 1;
+            }
+        }
+        drop(loaded);
+        *self.last_pins_save_at.lock() = Some(Instant::now());
+        self.pins_dirty.store(false, Ordering::Relaxed);
+        tracing::info!("已从缓存加载 {} 条会话 pin", kept);
+    }
+
+    /// 把会话 pin 映射落盘（原子写）。
+    fn save_pins(&self) {
+        let path = match self.pins_path() {
+            Some(p) => p,
+            None => return,
+        };
+        let map: HashMap<String, u64> = self.pin_map.lock().clone();
+        match serde_json::to_string_pretty(&map) {
+            Ok(json) => {
+                if let Err(e) = crate::observability::write_atomic(&path, json.as_bytes()) {
+                    tracing::warn!("保存会话 pin 缓存失败: {}", e);
+                } else {
+                    *self.last_pins_save_at.lock() = Some(Instant::now());
+                    self.pins_dirty.store(false, Ordering::Relaxed);
+                }
+            }
+            Err(e) => tracing::warn!("序列化会话 pin 数据失败: {}", e),
+        }
+    }
+
+    /// 标记 pin 映射已更新，按 debounce 决定是否立即落盘。
+    fn save_pins_debounced(&self) {
+        self.pins_dirty.store(true, Ordering::Relaxed);
+        let should_flush = {
+            let last = *self.last_pins_save_at.lock();
+            match last {
+                Some(t) => t.elapsed() >= PINS_SAVE_DEBOUNCE,
+                None => true,
+            }
+        };
+        if should_flush {
+            self.save_pins();
+        }
+    }
+
+    /// 周期性刷盘钩子：若 pin 映射有未落盘更新则立即写盘。
+    pub fn flush_pins_if_dirty(&self) {
+        if self.pins_dirty.load(Ordering::Relaxed) {
+            self.save_pins();
         }
     }
 
@@ -5021,6 +5280,7 @@ mod tests {
                     bound_at: Utc::now() - Duration::hours(2),
                     last_seen: Utc::now() - Duration::hours(2),
                     last_switch_at: None,
+                    priority: 0,
                 },
             );
         }
@@ -5049,5 +5309,54 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(c2.id, c1.id, "原号禁用后应强制切到另一个可用号");
+    }
+
+    // 手动 pin 覆盖 affinity 选号。
+    #[test]
+    fn test_pin_overrides_affinity_selection() {
+        let manager = affinity_manager(Config::default());
+        let natural = manager
+            .select_with_affinity(None, None, Some("sess-pin"))
+            .unwrap();
+        manager.pin_session("sess-pin", if natural.0 == 1 { 2 } else { 1 });
+        let pinned = manager
+            .select_with_affinity(None, None, Some("sess-pin"))
+            .unwrap();
+        assert_ne!(pinned.0, natural.0, "pin 应覆盖已有 affinity 绑定");
+        assert_eq!(
+            pinned.0,
+            if natural.0 == 1 { 2 } else { 1 },
+            "应返回 pin 指定的号"
+        );
+    }
+
+    // pin 目标不可用时 soft fallback 到正常 affinity。
+    #[tokio::test]
+    async fn test_pin_unavailable_falls_back_to_normal() {
+        let manager = affinity_manager(Config::default());
+        manager.pin_session("sess-fallback", 2);
+        manager.set_disabled(2, true).unwrap();
+        let pick = manager
+            .select_with_affinity(None, None, Some("sess-fallback"))
+            .unwrap();
+        assert_eq!(pick.0, 1, "pin 目标禁用后应回退到可用号");
+    }
+
+    // 高优先级新会话优先选无冷却号。
+    #[tokio::test]
+    async fn test_high_priority_new_session_prefers_healthy_account() {
+        let mut config = Config::default();
+        config.adaptive_limit.user_cooldown_base_secs = 30;
+        let manager = affinity_manager(config);
+        manager.set_session_priority("sess-vip", 10);
+        manager
+            .limiters()
+            .for_scope(&ThrottleScope::UserCredential(1))
+            .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None)
+            .await;
+        let pick = manager
+            .select_with_affinity(None, None, Some("sess-vip"))
+            .unwrap();
+        assert_eq!(pick.0, 2, "高优先级新会话应避开冷却中的号");
     }
 }

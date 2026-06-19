@@ -323,7 +323,10 @@ impl AdaptiveLimiter {
         );
         let cooldown = retry_after
             .map(|d| d.min(self.cfg.cooldown_cap))
-            .unwrap_or(local_cd);
+            .unwrap_or(local_cd)
+            // 应用层冷却不得超过 local_queue_timeout，否则下一次 acquire 会
+            // 因 est_wait > deadline 立即 Fail Aloud，尽管稍等即可通过。
+            .min(self.cfg.local_queue_timeout);
         let until = now + cooldown;
         st.cooldown_until = Some(match st.cooldown_until {
             Some(old) if old > until => old,
@@ -564,7 +567,40 @@ mod tests {
         assert!(Arc::ptr_eq(&a, &a2), "同号应复用同一 limiter");
     }
 
-    // 单测9：cooldown_remaining —— 撞 429 后剩余冷却 > 0；未撞则为 0。
+    // 单测9：应用冷却封顶 local_queue_timeout —— exp_cooldown 可超 queue timeout，
+    // 但写入 cooldown_until 的时长不得大于 local_queue_timeout。
+    #[tokio::test]
+    async fn test_on_throttle_clamps_cooldown_to_local_queue_timeout() {
+        let mut cfg = test_cfg();
+        cfg.cooldown_cap = Duration::from_secs(120);
+        cfg.local_queue_timeout = Duration::from_secs(90);
+        cfg.user_cooldown_base = Duration::from_secs(30);
+        let lim = AdaptiveLimiter::new(cfg);
+        let before = Instant::now();
+        for _ in 0..5 {
+            lim.on_throttle(ThrottleReason::UserRate, None).await;
+        }
+        let remaining = lim.cooldown_remaining();
+        assert!(
+            remaining <= Duration::from_secs(90) + Duration::from_millis(500),
+            "applied cooldown 应 ≤ local_queue_timeout，got {remaining:?}"
+        );
+        assert!(
+            remaining > Duration::ZERO,
+            "连撞后应仍有正冷却，got {remaining:?}"
+        );
+        let st = lim.state.lock();
+        let applied = st
+            .cooldown_until
+            .expect("应有 cooldown_until")
+            .duration_since(before);
+        assert!(
+            applied <= Duration::from_secs(90) + Duration::from_millis(500),
+            "cooldown_until 距 now 应 ≤ local_queue_timeout，got {applied:?}"
+        );
+    }
+
+    // 单测10：cooldown_remaining —— 撞 429 后剩余冷却 > 0；未撞则为 0。
     #[tokio::test]
     async fn test_cooldown_remaining_reports_after_throttle() {
         let lim = AdaptiveLimiter::new(test_cfg());
@@ -576,7 +612,7 @@ mod tests {
         );
     }
 
-    // 单测10：registry.cooldown_remaining —— 未出现过的 scope 视为无冷却，不创建 limiter。
+    // 单测11：registry.cooldown_remaining —— 未出现过的 scope 视为无冷却，不创建 limiter。
     #[test]
     fn test_registry_cooldown_remaining_absent_scope_is_zero() {
         let reg = LimiterRegistry::new(test_cfg());

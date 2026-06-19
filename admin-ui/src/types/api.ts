@@ -570,3 +570,31 @@ export interface UpdateGroupRequest {
   /** 新备注；空字符串清除；undefined 保留原值 */
   description?: string
 }
+
+// ============ 运行观测（多号 affinity）============
+
+export interface AccountObservability {
+  id: number
+  email: string | null
+  disabled: boolean
+  /** 最近 60s 请求数 */
+  rpm: number
+  /** 活跃窗口内绑定到该号的会话数 */
+  activeSessions: number
+  /** 当前绑定到该号的全部会话 id（TTL 内） */
+  boundSessions: string[]
+  /** 限速器当前速率（rps）；未出现过该号时为 null */
+  limiterRateRps: number | null
+  /** 限速器剩余冷却（毫秒）；0 表示无冷却 */
+  cooldownRemainingMs: number
+}
+
+export interface ObservabilitySnapshot {
+  multiAccountEnabled: boolean
+  activeWindowSecs: number
+  accounts: AccountObservability[]
+  sessionToAccount: Record<string, number>
+  activeSessionTotal: number
+  pinnedSessions: Record<string, number>
+  sessionPriority: Record<string, number>
+}
