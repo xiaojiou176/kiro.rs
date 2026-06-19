@@ -167,6 +167,28 @@ impl AdaptiveLimiter {
         self.state.lock().rate_rps
     }
 
+    /// 强制 shadow 语义：只计算"本应等多久 / 本应什么速率"，不阻塞、不占并发许可。
+    /// 用于灰度 retry_only 阶段对初始请求（attempt 0）的观测。
+    pub fn acquire_shadow(&self) -> AcquireOutcome {
+        let mut st = self.state.lock();
+        Self::refill_locked(&self.cfg, &mut st);
+        let now = Instant::now();
+        let cd = st
+            .cooldown_until
+            .filter(|t| *t > now)
+            .map(|t| (t - now).as_millis() as u64)
+            .unwrap_or(0);
+        let token_wait = if st.tokens >= 1.0 {
+            0
+        } else {
+            ((1.0 - st.tokens) / st.rate_rps.max(self.cfg.min_rate_rps) * 1000.0) as u64
+        };
+        AcquireOutcome::ShadowProceed {
+            would_wait_ms: cd.max(token_wait),
+            would_rps: st.rate_rps,
+        }
+    }
+
     /// 发送前闸门。返回 [`AcquireOutcome`]。
     ///
     /// - shadow（enforce=false）：永远 [`AcquireOutcome::ShadowProceed`]，不阻塞。
@@ -175,26 +197,7 @@ impl AdaptiveLimiter {
     pub async fn acquire(&self) -> AcquireOutcome {
         // shadow 模式：只算"本应等多久"，不阻塞、不占并发许可。
         if !self.cfg.enforce {
-            let (would_wait_ms, would_rps) = {
-                let mut st = self.state.lock();
-                Self::refill_locked(&self.cfg, &mut st);
-                let now = Instant::now();
-                let cd = st
-                    .cooldown_until
-                    .filter(|t| *t > now)
-                    .map(|t| (t - now).as_millis() as u64)
-                    .unwrap_or(0);
-                let token_wait = if st.tokens >= 1.0 {
-                    0
-                } else {
-                    ((1.0 - st.tokens) / st.rate_rps.max(self.cfg.min_rate_rps) * 1000.0) as u64
-                };
-                (cd.max(token_wait), st.rate_rps)
-            };
-            return AcquireOutcome::ShadowProceed {
-                would_wait_ms,
-                would_rps,
-            };
+            return self.acquire_shadow();
         }
 
         // enforce 模式：先占一个在飞许可（限制并发）。

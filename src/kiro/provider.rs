@@ -16,6 +16,9 @@ use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
+use crate::kiro::rate_limiter::{
+    AcquireOutcome, AdaptiveConfig, LimiterRegistry, ThrottleScope, classify_throttle_reason,
+};
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
 use crate::observability;
@@ -87,6 +90,10 @@ impl ClientCache {
 pub struct KiroCallResult {
     pub response: reqwest::Response,
     pub credential_id: u64,
+    /// 限速器在飞许可。持有到 `KiroCallResult` 被 drop（即 streaming 转发结束）才释放，
+    /// 保证 max_inflight 在整个响应生命周期内有效。`None` 表示未启用限速或 shadow 模式。
+    #[allow(dead_code)]
+    pub(crate) limiter_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 /// Kiro API Provider
@@ -114,6 +121,12 @@ pub struct KiroProvider {
     /// `ListAvailableProfiles`。命中真实 ARN 的账号会把 ARN 持久化进凭据，之后
     /// 通过 `streaming_profile_arn()` 直接命中，不再进入解析路径。
     profile_resolution_attempted: Mutex<HashSet<u64>>,
+    /// 自适应限速器容器（按 scope 多 limiter）。解决 AWS 429：
+    /// 发送前令牌桶闸门 + AIMD 调速 + 全局冷却 + Fail Aloud。
+    /// `enabled=false` 时完全不介入（行为等同改造前）。
+    limiters: Arc<LimiterRegistry>,
+    /// 灰度作用域："retry_only"（只拦 retry）/ "all"（初始+retry 全拦）。
+    limiter_enforce_scope: String,
 }
 
 impl KiroProvider {
@@ -141,6 +154,15 @@ impl KiroProvider {
             build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
         let client_cache = ClientCache::new(proxy.clone(), initial_client, CLIENT_CACHE_CAP);
 
+        // 自适应限速器：从 config.adaptive_limit 构建。
+        let adaptive_cfg = AdaptiveConfig::from_cfg(&token_manager.config().adaptive_limit);
+        let limiter_enforce_scope = token_manager
+            .config()
+            .adaptive_limit
+            .enforce_scope
+            .clone();
+        let limiters = Arc::new(LimiterRegistry::new(adaptive_cfg));
+
         Self {
             token_manager,
             global_proxy: proxy,
@@ -149,6 +171,8 @@ impl KiroProvider {
             endpoints,
             default_endpoint,
             profile_resolution_attempted: Mutex::new(HashSet::new()),
+            limiters,
+            limiter_enforce_scope,
         }
     }
 
@@ -568,6 +592,79 @@ impl KiroProvider {
                 );
             }
 
+            // ===== 自适应限速发送前闸门（解决 429）=====
+            // 每个 attempt（含 retry）发送前都过闸门。灰度：
+            //   - enabled=false：完全跳过（行为等同改造前）。
+            //   - enforce_scope=retry_only：attempt 0 走 shadow（只记录），attempt>0 真拦。
+            //   - enforce_scope=all：所有 attempt 真拦。
+            // Proceed 持 permit 到响应结束（随 KiroCallResult drop）；LocalThrottled 本地失败不发请求。
+            let mut limiter_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
+            if self.limiters.enabled() {
+                let scope = ThrottleScope::UserCredential(ctx.id);
+                let limiter = self.limiters.for_scope(&scope);
+                let retry_only = self.limiter_enforce_scope == "retry_only";
+                let outcome = if retry_only && attempt == 0 {
+                    // Phase B：初始请求只观测、不拦截。
+                    limiter.acquire_shadow()
+                } else {
+                    limiter.acquire().await
+                };
+                match outcome {
+                    AcquireOutcome::Proceed(permit) => {
+                        tracing::info!(
+                            event = "kiro_limiter_decision",
+                            credential_id = ctx.id,
+                            scope = "user",
+                            action = "acquire_proceed",
+                            current_rate_rps = limiter.current_rate_rps(),
+                            attempt = attempt,
+                            "limiter 放行"
+                        );
+                        limiter_permit = Some(permit);
+                    }
+                    AcquireOutcome::ShadowProceed {
+                        would_wait_ms,
+                        would_rps,
+                    } => {
+                        tracing::info!(
+                            event = "kiro_limiter_decision",
+                            credential_id = ctx.id,
+                            scope = "user",
+                            action = "shadow",
+                            would_wait_ms = would_wait_ms,
+                            would_rate_rps = would_rps,
+                            attempt = attempt,
+                            "limiter shadow（未拦截，仅记录）"
+                        );
+                    }
+                    AcquireOutcome::LocalThrottled {
+                        est_wait_ms,
+                        current_rps,
+                        reason,
+                    } => {
+                        tracing::warn!(
+                            event = "kiro_limiter_decision",
+                            credential_id = ctx.id,
+                            scope = "user",
+                            action = "acquire_timeout",
+                            est_wait_ms = est_wait_ms,
+                            current_rate_rps = current_rps,
+                            reason = reason,
+                            attempt = attempt,
+                            "Fail Aloud：本地限流，不发上游请求"
+                        );
+                        // Fail Aloud 🔴：本地直接失败（带可解释错误，由 handlers 映射成 429）。
+                        anyhow::bail!(
+                            "{} 本地限流（Fail Aloud）: kiro_local_throttled reason={} est_wait_ms={} rate_rps={:.3}",
+                            api_type,
+                            reason,
+                            est_wait_ms,
+                            current_rps
+                        );
+                    }
+                }
+            }
+
             let response = match self.client_for(&ctx.credentials)?.execute(request).await {
                 Ok(resp) => resp,
                 Err(e) => {
@@ -612,9 +709,15 @@ impl KiroProvider {
                     attempt_start,
                 );
                 self.token_manager.report_success(ctx.id);
+                // 限速器成功回写：慢加性增速。
+                if self.limiters.enabled() {
+                    let scope = ThrottleScope::UserCredential(ctx.id);
+                    self.limiters.for_scope(&scope).on_success().await;
+                }
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
+                    limiter_permit,
                 });
             }
 
@@ -650,6 +753,25 @@ impl KiroProvider {
                 );
             }
             let body = response.text().await.unwrap_or_default();
+
+            // 限速器 429 回写：乘性减速 + 冷却（AWS 实证不返回 Retry-After，故传 None）。
+            if status.as_u16() == 429 && self.limiters.enabled() {
+                let reason = classify_throttle_reason(&body);
+                let scope = ThrottleScope::UserCredential(ctx.id);
+                self.limiters
+                    .for_scope(&scope)
+                    .on_throttle(reason, None)
+                    .await;
+                tracing::info!(
+                    event = "kiro_limiter_decision",
+                    credential_id = ctx.id,
+                    scope = "user",
+                    action = "on_throttle",
+                    throttle_reason = ?reason,
+                    upstream_status = 429u16,
+                    "limiter 减速回写"
+                );
+            }
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移
             if status.as_u16() == 402 && endpoint.is_monthly_request_limit(&body) {

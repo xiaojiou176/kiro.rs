@@ -348,6 +348,51 @@ pub(super) fn map_provider_error(err: Error) -> Response {
             .into_response();
     }
 
+    // Fail Aloud 🔴：本地自适应限速器主动拒绝（排队预计过久 / 上游持续限流）。
+    // 不是上游错误，是我们本地"明确失败而非静默排队"。返回 429 + 可解释响应头。
+    // 形如：kiro_local_throttled reason=local_queue_timeout est_wait_ms=95000 rate_rps=0.100
+    if err_str.contains("kiro_local_throttled") {
+        let parse_kv = |key: &str| -> Option<String> {
+            err_str
+                .split_whitespace()
+                .find_map(|tok| tok.strip_prefix(key).map(|v| v.to_string()))
+        };
+        let reason = parse_kv("reason=").unwrap_or_else(|| "local_queue_timeout".to_string());
+        let est_wait_ms: u64 = parse_kv("est_wait_ms=")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let rate_rps = parse_kv("rate_rps=").unwrap_or_else(|| "0".to_string());
+        let retry_after_secs = est_wait_ms.div_ceil(1000).max(1);
+        tracing::warn!(
+            error = %err,
+            "Fail Aloud：本地限流，返回 429（不是上游故障）"
+        );
+        let mut resp = (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse::new(
+                "rate_limit_error",
+                "Locally throttled by adaptive rate limiter; reduce concurrency and retry."
+                    .to_string(),
+            )),
+        )
+            .into_response();
+        let h = resp.headers_mut();
+        if let Ok(v) = axum::http::HeaderValue::from_str(&retry_after_secs.to_string()) {
+            h.insert(axum::http::header::RETRY_AFTER, v);
+        }
+        h.insert(
+            "x-local-throttled",
+            axum::http::HeaderValue::from_static("true"),
+        );
+        if let Ok(v) = axum::http::HeaderValue::from_str(&rate_rps) {
+            h.insert("x-kiro-limiter-rate", v);
+        }
+        if let Ok(v) = axum::http::HeaderValue::from_str(&reason) {
+            h.insert("x-kiro-limiter-reason", v);
+        }
+        return resp;
+    }
+
     // Pure upstream rate limiting (ThrottlingException / SERVICE_REQUEST_RATE_EXCEEDED):
     // the request was simply too fast; the account quota is NOT exhausted and a short
     // backoff will succeed. If this falls through to the 502 bottom default, CPA treats
