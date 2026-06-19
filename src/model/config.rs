@@ -370,6 +370,127 @@ pub struct AdaptiveLimitConfig {
     /// 多账号留口。默认关闭。
     #[serde(default)]
     pub multi_account: MultiAccountConfig,
+    /// 账号熔断器（OPEN/HALF_OPEN 静养）。
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
+    /// 自适应并发（maxInflight 在线学习）。
+    #[serde(default)]
+    pub adaptive_concurrency: AdaptiveConcurrencyConfig,
+    /// 429 预算驱动的上探。
+    #[serde(default)]
+    pub probe: ProbeConfig,
+    /// 在线学习引擎。
+    #[serde(default)]
+    pub learning: LearningConfig,
+}
+
+/// 账号熔断器配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CircuitBreakerConfig {
+    #[serde(default = "default_circuit_breaker_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_open_429_threshold")]
+    pub open_429_threshold: u32,
+    #[serde(default = "default_half_open_success_target")]
+    pub half_open_success_target: u32,
+    #[serde(default = "default_initial_quarantine_secs")]
+    pub initial_quarantine_secs: u64,
+    #[serde(default = "default_min_quarantine_secs")]
+    pub min_quarantine_secs: u64,
+    #[serde(default = "default_max_quarantine_secs")]
+    pub max_quarantine_secs: u64,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_circuit_breaker_enabled(),
+            open_429_threshold: default_open_429_threshold(),
+            half_open_success_target: default_half_open_success_target(),
+            initial_quarantine_secs: default_initial_quarantine_secs(),
+            min_quarantine_secs: default_min_quarantine_secs(),
+            max_quarantine_secs: default_max_quarantine_secs(),
+        }
+    }
+}
+
+/// 自适应并发配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdaptiveConcurrencyConfig {
+    #[serde(default = "default_adaptive_concurrency_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_min_inflight")]
+    pub min_inflight: usize,
+    #[serde(default = "default_hard_max_inflight")]
+    pub hard_max_inflight: usize,
+    #[serde(default = "default_safety_factor")]
+    pub safety_factor: f64,
+    #[serde(default = "default_grow_factor_per_window")]
+    pub grow_factor_per_window: f64,
+    #[serde(default = "default_shrink_factor_on_429")]
+    pub shrink_factor_on_429: f64,
+    #[serde(default = "default_duration_quantile")]
+    pub duration_quantile: String,
+}
+
+impl Default for AdaptiveConcurrencyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_adaptive_concurrency_enabled(),
+            min_inflight: default_min_inflight(),
+            hard_max_inflight: default_hard_max_inflight(),
+            safety_factor: default_safety_factor(),
+            grow_factor_per_window: default_grow_factor_per_window(),
+            shrink_factor_on_429: default_shrink_factor_on_429(),
+            duration_quantile: default_duration_quantile(),
+        }
+    }
+}
+
+/// 429 预算上探配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbeConfig {
+    #[serde(default = "default_upstream_429_budget_low")]
+    pub upstream_429_budget_low: f64,
+    #[serde(default = "default_upstream_429_budget_high")]
+    pub upstream_429_budget_high: f64,
+    #[serde(default = "default_probe_window_secs")]
+    pub window_secs: u64,
+}
+
+impl Default for ProbeConfig {
+    fn default() -> Self {
+        Self {
+            upstream_429_budget_low: default_upstream_429_budget_low(),
+            upstream_429_budget_high: default_upstream_429_budget_high(),
+            window_secs: default_probe_window_secs(),
+        }
+    }
+}
+
+/// 在线学习配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LearningConfig {
+    #[serde(default = "default_learning_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_learning_persist_path")]
+    pub persist_path: String,
+    #[serde(default = "default_ewma_alpha")]
+    pub ewma_alpha: f64,
+}
+
+impl Default for LearningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_learning_enabled(),
+            persist_path: default_learning_persist_path(),
+            ewma_alpha: default_ewma_alpha(),
+        }
+    }
 }
 
 impl Default for AdaptiveLimitConfig {
@@ -393,6 +514,10 @@ impl Default for AdaptiveLimitConfig {
             fail_aloud: FailAloudConfig::default(),
             respect_retry_after: false,
             multi_account: MultiAccountConfig::default(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            adaptive_concurrency: AdaptiveConcurrencyConfig::default(),
+            probe: ProbeConfig::default(),
+            learning: LearningConfig::default(),
         }
     }
 }
@@ -465,6 +590,64 @@ fn default_rebalance_active_window_secs() -> u64 {
 }
 fn default_rebalance_min_gap() -> usize {
     2
+}
+
+fn default_circuit_breaker_enabled() -> bool {
+    true
+}
+fn default_open_429_threshold() -> u32 {
+    3
+}
+fn default_half_open_success_target() -> u32 {
+    2
+}
+fn default_initial_quarantine_secs() -> u64 {
+    30
+}
+fn default_min_quarantine_secs() -> u64 {
+    5
+}
+fn default_max_quarantine_secs() -> u64 {
+    1800
+}
+fn default_adaptive_concurrency_enabled() -> bool {
+    true
+}
+fn default_min_inflight() -> usize {
+    4
+}
+fn default_hard_max_inflight() -> usize {
+    32
+}
+fn default_safety_factor() -> f64 {
+    0.8
+}
+fn default_grow_factor_per_window() -> f64 {
+    1.25
+}
+fn default_shrink_factor_on_429() -> f64 {
+    0.5
+}
+fn default_duration_quantile() -> String {
+    "p80".to_string()
+}
+fn default_upstream_429_budget_low() -> f64 {
+    0.01
+}
+fn default_upstream_429_budget_high() -> f64 {
+    0.02
+}
+fn default_probe_window_secs() -> u64 {
+    300
+}
+fn default_learning_enabled() -> bool {
+    true
+}
+fn default_learning_persist_path() -> String {
+    "account_learning.json".to_string()
+}
+fn default_ewma_alpha() -> f64 {
+    0.2
 }
 
 impl Default for Config {

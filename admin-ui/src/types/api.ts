@@ -573,6 +573,12 @@ export interface UpdateGroupRequest {
 
 // ============ 运行观测（多号 affinity）============
 
+/** 账号熔断状态（后端 SCREAMING_SNAKE_CASE） */
+export type AccountState = 'HEALTHY' | 'OPEN' | 'HALF_OPEN' | 'DISABLED'
+
+/** 429 时优先收缩的旋钮维度（后端 PascalCase） */
+export type BottleneckDimension = 'Inflight' | 'SendRate' | 'Rpm' | 'Mixed'
+
 export interface AccountObservability {
   id: number
   email: string | null
@@ -587,6 +593,32 @@ export interface AccountObservability {
   limiterRateRps: number | null
   /** 限速器剩余冷却（毫秒）；0 表示无冷却 */
   cooldownRemainingMs: number
+  /** 熔断器状态（旧版后端可能缺失） */
+  state?: AccountState
+  /** 非 Healthy 时的原因说明 */
+  stateReason?: string
+  /** Open 状态下距离 HalfOpen 探针的剩余毫秒 */
+  reopenInMs?: number
+  /** 当前允许的最大并发 inflight */
+  currentMaxInflight?: number
+  /** 当前 inflight 占用 */
+  currentInflight?: number
+  /** 当前发送速率 (rps) */
+  currentRateRps?: number
+  /** 学习到的安全 rps 区间下界 */
+  learnedSafeRpsLo?: number
+  /** 学习到的安全 rps 区间上界 */
+  learnedSafeRpsHi?: number
+  /** p80 持有时间（毫秒） */
+  p80HeldMs?: number
+  /** 学习到的最优静养时长（秒） */
+  learnedOptimalTSecs?: number
+  /** 429 时优先收缩的维度 */
+  bottleneckDimension?: BottleneckDimension
+  /** 近 5 分钟上游 429 比率 */
+  upstream429Rate5m?: number
+  /** 连续被 throttle 次数 */
+  consecutiveThrottles?: number
 }
 
 export interface ObservabilitySnapshot {
@@ -597,4 +629,10 @@ export interface ObservabilitySnapshot {
   activeSessionTotal: number
   pinnedSessions: Record<string, number>
   sessionPriority: Record<string, number>
+  /** 全局近 5 分钟上游 429 比率（旧版可能缺失） */
+  globalUpstream429Rate5m?: number
+  /** 各 AccountState 计数（Debug 格式键，如 Healthy / Open） */
+  accountStateCounts?: Record<string, number>
+  /** 调度模式，如 multi_account_affinity / single_account */
+  schedulingMode?: string
 }

@@ -1,19 +1,22 @@
 import { useMemo, useState, useEffect } from 'react'
 import { toast } from 'sonner'
 import {
-  Gauge,
-  RefreshCw,
+  Activity,
+  ArrowRightLeft,
+  Circle,
+  HeartPulse,
   Pin,
   PinOff,
-  Users,
-  Clock,
-  Zap,
-  AlertTriangle,
+  RefreshCw,
+  ShieldAlert,
+  ShieldCheck,
+  Timer,
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
+import { Progress } from '@/components/ui/progress'
 import {
   Select,
   SelectContent,
@@ -22,13 +25,29 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
+import {
   useObservability,
   usePinSession,
   useUnpinSession,
   useSetSessionPriority,
 } from '@/hooks/use-observability'
+import { useObservabilityHistory } from '@/hooks/use-observability-history'
+import { ObservabilityTrendCharts } from '@/components/observability-charts'
+import {
+  bottleneckLabel,
+  hasSchedulerFields,
+  normalizeAccount,
+  normalizeSnapshot,
+  stateDotColor,
+} from '@/lib/observability-normalize'
 import { cn, extractErrorMessage } from '@/lib/utils'
-import type { AccountObservability } from '@/types/api'
+import type { AccountState } from '@/types/api'
+import type { NormalizedAccountObservability } from '@/lib/observability-normalize'
 
 function shortSessionId(id: string): string {
   if (id.length <= 12) return id
@@ -44,17 +63,94 @@ function formatCooldown(ms: number): string {
   return rem > 0 ? `${m}m ${rem}s` : `${m}m`
 }
 
+function formatRatePercent(rate: number): string {
+  if (rate <= 0) return '0%'
+  return `${(rate * 100).toFixed(1)}%`
+}
+
+function formatLastUpdated(ts: number | undefined): string {
+  if (!ts) return '—'
+  const d = new Date(ts)
+  return d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+
+function stateBadgeVariant(
+  state: AccountState,
+): 'success' | 'warning' | 'destructive' | 'secondary' {
+  switch (state) {
+    case 'HEALTHY':
+      return 'success'
+    case 'HALF_OPEN':
+      return 'warning'
+    case 'OPEN':
+      return 'destructive'
+    default:
+      return 'secondary'
+  }
+}
+
+function stateLabel(state: AccountState): string {
+  switch (state) {
+    case 'HEALTHY':
+      return 'Healthy'
+    case 'OPEN':
+      return 'Open'
+    case 'HALF_OPEN':
+      return 'Half Open'
+    case 'DISABLED':
+      return 'Disabled'
+    default:
+      return state
+  }
+}
+
+function StateIcon({ state }: { state: AccountState }) {
+  switch (state) {
+    case 'HEALTHY':
+      return <ShieldCheck className="h-4 w-4 text-emerald-500" />
+    case 'HALF_OPEN':
+      return <Activity className="h-4 w-4 text-amber-500" />
+    case 'OPEN':
+      return <ShieldAlert className="h-4 w-4 text-red-500" />
+    default:
+      return <Circle className="h-4 w-4 text-muted-foreground" />
+  }
+}
+
 function accountLabel(id: number, email: string | null | undefined): string {
   if (email) return `#${id} · ${email}`
   return `#${id}`
 }
 
+function useLiveCountdown(ms: number): number {
+  const [display, setDisplay] = useState(ms)
+  useEffect(() => {
+    setDisplay(ms)
+    if (ms <= 0) return
+    const iv = window.setInterval(() => {
+      setDisplay((d) => Math.max(0, d - 1000))
+    }, 1000)
+    return () => window.clearInterval(iv)
+  }, [ms])
+  return display
+}
+
 export function ObservabilityPage() {
-  const { data, isLoading, isFetching, refetch, error } = useObservability()
+  const { data: rawData, isLoading, isFetching, refetch, error, dataUpdatedAt } =
+    useObservability()
+
+  const data = useMemo(
+    () => (rawData ? normalizeSnapshot(rawData) : undefined),
+    [rawData],
+  )
+  const schedulerReady = rawData ? hasSchedulerFields(rawData) : false
+
+  const { history, stateMarkers, sessionMigrations, accountIds, lastUpdated } =
+    useObservabilityHistory(data, dataUpdatedAt)
 
   const accountMap = useMemo(() => {
-    const m = new Map<number, AccountObservability>()
-    for (const a of data?.accounts ?? []) m.set(a.id, a)
+    const m = new Map<number, NormalizedAccountObservability>()
+    for (const a of data?.accounts ?? []) m.set(a.id, normalizeAccount(a))
     return m
   }, [data?.accounts])
 
@@ -67,248 +163,338 @@ export function ObservabilityPage() {
     return Array.from(ids).sort()
   }, [data])
 
+  const stateCounts = useMemo(() => {
+    const counts = { healthy: 0, halfOpen: 0, open: 0, disabled: 0 }
+    for (const raw of data?.accounts ?? []) {
+      const a = normalizeAccount(raw)
+      switch (a.state) {
+        case 'HEALTHY':
+          counts.healthy++
+          break
+        case 'HALF_OPEN':
+          counts.halfOpen++
+          break
+        case 'OPEN':
+          counts.open++
+          break
+        default:
+          counts.disabled++
+      }
+    }
+    return counts
+  }, [data?.accounts])
+
+  const totalThroughput = useMemo(
+    () =>
+      (data?.accounts ?? [])
+        .filter((a) => !a.disabled && normalizeAccount(a).state !== 'DISABLED')
+        .reduce((s, a) => s + normalizeAccount(a).currentRateRps, 0),
+    [data?.accounts],
+  )
+
   return (
-    <div>
-      <PageHeader
-        isFetching={isFetching}
-        onRefresh={() => void refetch()}
-      />
+    <TooltipProvider delayDuration={200}>
+      <div>
+        <PageHeader
+          isFetching={isFetching}
+          onRefresh={() => void refetch()}
+          lastUpdated={lastUpdated ?? dataUpdatedAt}
+        />
 
-      {error && (
-        <div className="mb-4 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
-          加载失败：{extractErrorMessage(error)}
-        </div>
-      )}
-
-      <SummaryCards
-        multiAccountEnabled={data?.multiAccountEnabled ?? false}
-        activeSessionTotal={data?.activeSessionTotal ?? 0}
-        activeWindowSecs={data?.activeWindowSecs ?? 0}
-        accountCount={data?.accounts.length ?? 0}
-        isLoading={isLoading}
-      />
-
-      <section className="mb-8">
-        <h2 className="mb-3 text-sm font-medium text-muted-foreground">账号运行态</h2>
-        {isLoading ? (
-          <div className="text-sm text-muted-foreground">加载中…</div>
-        ) : (data?.accounts.length ?? 0) === 0 ? (
-          <Card>
-            <CardContent className="py-8 text-center text-sm text-muted-foreground">
-              暂无凭据账号
-            </CardContent>
-          </Card>
-        ) : (
-          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-            {data!.accounts.map((acc) => (
-              <AccountCard key={acc.id} account={acc} />
-            ))}
+        {error && (
+          <div className="mb-4 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+            加载失败：{extractErrorMessage(error)}
           </div>
         )}
-      </section>
 
-      <section>
-        <h2 className="mb-3 text-sm font-medium text-muted-foreground">
-          会话 (Thread) → 号
-        </h2>
-        <Card>
-          <CardContent className="p-0">
-            <div className="overflow-x-auto">
-              <table className="w-full min-w-[720px] text-left">
-                <thead>
-                  <tr className="border-b border-border/60 bg-secondary/30 text-[12px] text-muted-foreground">
-                    <th className="py-2.5 pl-4 pr-3 font-medium">会话 ID</th>
-                    <th className="py-2.5 pr-3 font-medium">当前账号</th>
-                    <th className="py-2.5 pr-3 font-medium">优先级</th>
-                    <th className="py-2.5 pr-3 font-medium">Pin 到账号</th>
-                    <th className="py-2.5 pr-4 font-medium">操作</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {isLoading ? (
-                    <tr>
-                      <td
-                        colSpan={5}
-                        className="py-8 text-center text-sm text-muted-foreground"
-                      >
-                        加载中…
-                      </td>
-                    </tr>
-                  ) : sessionRows.length === 0 ? (
-                    <tr>
-                      <td
-                        colSpan={5}
-                        className="py-8 text-center text-sm text-muted-foreground"
-                      >
-                        暂无活跃会话绑定
-                      </td>
-                    </tr>
-                  ) : (
-                    sessionRows.map((sessionId) => (
-                      <SessionRow
-                        key={sessionId}
-                        sessionId={sessionId}
-                        accountId={data?.sessionToAccount[sessionId]}
-                        pinnedAccountId={data?.pinnedSessions[sessionId]}
-                        priority={data?.sessionPriority[sessionId] ?? 0}
-                        accounts={data?.accounts ?? []}
-                        accountMap={accountMap}
-                      />
-                    ))
-                  )}
-                </tbody>
-              </table>
+        {!schedulerReady && !isLoading && rawData && (
+          <div className="mb-4 rounded-lg border border-amber-500/30 bg-amber-500/5 px-4 py-3 text-sm text-amber-700 dark:text-amber-400">
+            后端未返回调度器新字段，已降级显示基础观测数据。
+          </div>
+        )}
+
+        <GlobalHealthBar
+          stateCounts={stateCounts}
+          activeSessionTotal={data?.activeSessionTotal ?? 0}
+          global429={data?.globalUpstream429Rate5m ?? 0}
+          totalThroughput={totalThroughput}
+          isLoading={isLoading}
+        />
+
+        <section className="mb-8">
+          <h2 className="mb-3 text-sm font-medium text-muted-foreground">账号运行态</h2>
+          {isLoading ? (
+            <div className="text-sm text-muted-foreground">加载中…</div>
+          ) : (data?.accounts.length ?? 0) === 0 ? (
+            <Card>
+              <CardContent className="py-8 text-center text-sm text-muted-foreground">
+                暂无凭据账号
+              </CardContent>
+            </Card>
+          ) : (
+            <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+              {data!.accounts.map((acc) => (
+                <AccountCard key={acc.id} account={normalizeAccount(acc)} />
+              ))}
             </div>
-          </CardContent>
-        </Card>
-      </section>
-    </div>
+          )}
+        </section>
+
+        <ObservabilityTrendCharts
+          history={history}
+          accountIds={accountIds}
+          stateMarkers={stateMarkers}
+        />
+
+        <section>
+          <h2 className="mb-3 text-sm font-medium text-muted-foreground">
+            会话 (Thread) → 号
+          </h2>
+          <Card>
+            <CardContent className="p-0">
+              <div className="overflow-x-auto">
+                <table className="w-full min-w-[760px] text-left">
+                  <thead>
+                    <tr className="border-b border-border/60 bg-secondary/30 text-[12px] text-muted-foreground">
+                      <th className="py-2.5 pl-4 pr-3 font-medium">会话 ID</th>
+                      <th className="py-2.5 pr-3 font-medium">当前账号</th>
+                      <th className="py-2.5 pr-3 font-medium">优先级</th>
+                      <th className="py-2.5 pr-3 font-medium">Pin 到账号</th>
+                      <th className="py-2.5 pr-4 font-medium">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {isLoading ? (
+                      <tr>
+                        <td
+                          colSpan={5}
+                          className="py-8 text-center text-sm text-muted-foreground"
+                        >
+                          加载中…
+                        </td>
+                      </tr>
+                    ) : sessionRows.length === 0 ? (
+                      <tr>
+                        <td
+                          colSpan={5}
+                          className="py-8 text-center text-sm text-muted-foreground"
+                        >
+                          暂无活跃会话绑定
+                        </td>
+                      </tr>
+                    ) : (
+                      sessionRows.map((sessionId) => (
+                        <SessionRow
+                          key={sessionId}
+                          sessionId={sessionId}
+                          accountId={data?.sessionToAccount[sessionId]}
+                          pinnedAccountId={data?.pinnedSessions[sessionId]}
+                          priority={data?.sessionPriority[sessionId] ?? 0}
+                          accounts={(data?.accounts ?? []).map(normalizeAccount)}
+                          accountMap={accountMap}
+                          migration={sessionMigrations.get(sessionId)}
+                        />
+                      ))
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </CardContent>
+          </Card>
+        </section>
+      </div>
+    </TooltipProvider>
   )
 }
 
 function PageHeader({
   isFetching,
   onRefresh,
+  lastUpdated,
 }: {
   isFetching: boolean
   onRefresh: () => void
+  lastUpdated?: number
 }) {
   return (
-    <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+    <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
       <div>
         <h1 className="text-[28px] font-semibold tracking-tight leading-tight">
           运行观测
         </h1>
         <p className="mt-1 text-sm text-muted-foreground">
-          多号 affinity 实时状态：账号负载、会话绑定、Pin 与优先级
+          自适应调度器运维看板 · 5s 轮询 · 前端累积 15min 趋势
         </p>
       </div>
-      <Button
-        variant="outline"
-        size="sm"
-        onClick={onRefresh}
-        disabled={isFetching}
-        className="shrink-0"
-      >
-        <RefreshCw className={cn('mr-1.5 h-3.5 w-3.5', isFetching && 'animate-spin')} />
-        刷新
-      </Button>
+      <div className="flex shrink-0 items-center gap-3">
+        <span className="text-[11px] text-muted-foreground tabular-nums">
+          更新 {formatLastUpdated(lastUpdated)}
+        </span>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={onRefresh}
+          disabled={isFetching}
+        >
+          <RefreshCw className={cn('mr-1.5 h-3.5 w-3.5', isFetching && 'animate-spin')} />
+          刷新
+        </Button>
+      </div>
     </div>
   )
 }
 
-function SummaryCards({
-  multiAccountEnabled,
+function GlobalHealthBar({
+  stateCounts,
   activeSessionTotal,
-  activeWindowSecs,
-  accountCount,
+  global429,
+  totalThroughput,
   isLoading,
 }: {
-  multiAccountEnabled: boolean
+  stateCounts: { healthy: number; halfOpen: number; open: number; disabled: number }
   activeSessionTotal: number
-  activeWindowSecs: number
-  accountCount: number
+  global429: number
+  totalThroughput: number
   isLoading: boolean
 }) {
-  const cards = [
-    {
-      icon: <Gauge className="h-4 w-4" />,
-      label: '多号模式',
-      value: isLoading ? '—' : multiAccountEnabled ? '已开启' : '未开启',
-      badge: multiAccountEnabled ? (
-        <Badge variant="success">ON</Badge>
-      ) : (
-        <Badge variant="secondary">OFF</Badge>
-      ),
-    },
-    {
-      icon: <Users className="h-4 w-4" />,
-      label: '活跃会话',
-      value: isLoading ? '—' : String(activeSessionTotal),
-      meta: `活跃窗口 ${activeWindowSecs}s`,
-    },
-    {
-      icon: <Clock className="h-4 w-4" />,
-      label: '活跃窗口',
-      value: isLoading ? '—' : `${activeWindowSecs}s`,
-      meta: '再平衡判定窗口',
-    },
-    {
-      icon: <Zap className="h-4 w-4" />,
-      label: '账号数',
-      value: isLoading ? '—' : String(accountCount),
-      meta: '全部凭据',
-    },
-  ]
+  const overBudget = global429 > 0.02
+  const nearBudget = global429 > 0.01 && !overBudget
 
   return (
-    <div className="mb-6 grid grid-cols-2 gap-3 lg:grid-cols-4">
-      {cards.map((c) => (
-        <Card key={c.label}>
-          <CardContent className="p-4">
-            <div className="flex items-center gap-2 text-muted-foreground">
-              {c.icon}
-              <span className="text-[12px]">{c.label}</span>
-            </div>
-            <div className="mt-2 flex items-center gap-2">
-              <span className="text-xl font-semibold tabular-nums">{c.value}</span>
-              {c.badge}
-            </div>
-            {c.meta && (
-              <p className="mt-1 text-[11px] text-muted-foreground">{c.meta}</p>
+    <Card className="mb-6 border-border/80">
+      <CardContent className="flex flex-col gap-4 p-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex flex-wrap items-center gap-4">
+          <div className="flex items-center gap-2">
+            <HeartPulse className="h-5 w-5 text-muted-foreground" />
+            <span className="text-sm font-medium">全局健康</span>
+          </div>
+          <div className="flex items-center gap-3 text-sm">
+            <span className="flex items-center gap-1.5" title="Healthy">
+              <span className={cn('h-2.5 w-2.5 rounded-full', stateDotColor('HEALTHY'))} />
+              <span className="font-mono tabular-nums">{isLoading ? '—' : stateCounts.healthy}</span>
+            </span>
+            <span className="flex items-center gap-1.5" title="Half Open">
+              <span className={cn('h-2.5 w-2.5 rounded-full', stateDotColor('HALF_OPEN'))} />
+              <span className="font-mono tabular-nums">{isLoading ? '—' : stateCounts.halfOpen}</span>
+            </span>
+            <span className="flex items-center gap-1.5" title="Open">
+              <span className={cn('h-2.5 w-2.5 rounded-full', stateDotColor('OPEN'))} />
+              <span className="font-mono tabular-nums">{isLoading ? '—' : stateCounts.open}</span>
+            </span>
+          </div>
+          <div className="text-sm text-muted-foreground">
+            活跃会话{' '}
+            <span className="font-mono font-medium text-foreground tabular-nums">
+              {isLoading ? '—' : activeSessionTotal}
+            </span>
+          </div>
+          <div className="text-sm text-muted-foreground">
+            总吞吐{' '}
+            <span className="font-mono font-medium text-foreground tabular-nums">
+              {isLoading ? '—' : `${totalThroughput.toFixed(2)} rps`}
+            </span>
+          </div>
+        </div>
+        <div className="text-right">
+          <div className="text-[11px] text-muted-foreground">近 5min 上游 429</div>
+          <div
+            className={cn(
+              'text-2xl font-semibold font-mono tabular-nums',
+              overBudget && 'text-red-600 dark:text-red-400',
+              nearBudget && 'text-amber-600 dark:text-amber-400',
+              !overBudget && !nearBudget && 'text-emerald-600 dark:text-emerald-400',
             )}
-          </CardContent>
-        </Card>
-      ))}
-    </div>
+          >
+            {isLoading ? '—' : formatRatePercent(global429)}
+          </div>
+          <div className="text-[10px] text-muted-foreground">预算 1% / 2%</div>
+        </div>
+      </CardContent>
+    </Card>
   )
 }
 
-function AccountCard({ account }: { account: AccountObservability }) {
+function AccountCard({ account }: { account: NormalizedAccountObservability }) {
+  const isOpen = account.state === 'OPEN'
+  const isHalfOpen = account.state === 'HALF_OPEN'
+  const isHealthy = account.state === 'HEALTHY'
   const cooled = account.cooldownRemainingMs > 0
+  const reopenMs = useLiveCountdown(account.reopenInMs)
+  const safeRpsRange =
+    account.learnedSafeRpsLo > 0 || account.learnedSafeRpsHi > 0
+      ? `${account.learnedSafeRpsLo.toFixed(2)}–${account.learnedSafeRpsHi.toFixed(2)} rps`
+      : '—'
+  const high429 = account.upstream429Rate5m > 0.02
 
   return (
     <Card
       className={cn(
-        cooled && 'border-amber-500/40 bg-amber-500/5 dark:bg-amber-500/10',
+        'transition-colors',
+        isOpen && 'border-red-500/50 bg-red-500/5 dark:bg-red-500/10',
+        isHalfOpen && 'border-amber-500/50 bg-amber-500/5 dark:bg-amber-500/10',
+        isHealthy && !cooled && 'border-emerald-500/20',
+        !isOpen && !isHalfOpen && cooled && 'border-amber-500/40 bg-amber-500/5',
       )}
     >
       <CardHeader className="pb-2">
         <div className="flex items-start justify-between gap-2">
-          <CardTitle className="text-sm font-medium leading-snug">
-            {accountLabel(account.id, account.email)}
-          </CardTitle>
-          <div className="flex shrink-0 flex-wrap justify-end gap-1">
-            {account.disabled && (
-              <Badge variant="destructive">已禁用</Badge>
-            )}
-            {cooled && (
-              <Badge variant="warning">
-                <AlertTriangle className="mr-1 h-3 w-3" />
-                冷却中
-              </Badge>
-            )}
+          <div className="flex items-start gap-2">
+            <StateIcon state={account.state} />
+            <div>
+              <CardTitle className="text-sm font-medium leading-snug">
+                {accountLabel(account.id, account.email)}
+              </CardTitle>
+              {isOpen && reopenMs > 0 && (
+                <div className="mt-1 flex items-center gap-1 text-[12px] font-medium text-red-600 dark:text-red-400">
+                  <Timer className="h-3.5 w-3.5" />
+                  静养中，剩 {formatCooldown(reopenMs)}
+                </div>
+              )}
+            </div>
           </div>
+          <Badge variant={stateBadgeVariant(account.state)}>
+            {stateLabel(account.state)}
+          </Badge>
         </div>
+        {account.stateReason && (
+          <p className="mt-1.5 text-[11px] text-muted-foreground leading-snug">
+            {account.stateReason}
+          </p>
+        )}
       </CardHeader>
       <CardContent className="space-y-3 text-[13px]">
-        <div className="grid grid-cols-2 gap-x-3 gap-y-1.5">
-          <Metric label="RPM" value={String(account.rpm)} />
-          <Metric label="活跃会话" value={String(account.activeSessions)} />
+        <div>
+          <div className="mb-1 flex items-center justify-between text-[11px] text-muted-foreground">
+            <span>Inflight</span>
+            <span className="font-mono tabular-nums">
+              {account.currentInflight} / {account.currentMaxInflight}
+            </span>
+          </div>
+          <Progress value={account.currentInflight} max={Math.max(account.currentMaxInflight, 1)} />
+        </div>
+
+        <div className="grid grid-cols-2 gap-x-3 gap-y-2">
+          <Metric label="当前 rps" value={`${account.currentRateRps.toFixed(2)} rps`} />
+          <Metric label="Safe rps" value={safeRpsRange} />
+          <Metric label="RPM (60s)" value={String(account.rpm)} />
           <Metric
-            label="限速 (rps)"
-            value={
-              account.limiterRateRps != null
-                ? account.limiterRateRps.toFixed(2)
-                : '—'
-            }
-          />
-          <Metric
-            label="冷却剩余"
-            value={formatCooldown(account.cooldownRemainingMs)}
-            highlight={cooled}
+            label="429 率 (5m)"
+            value={formatRatePercent(account.upstream429Rate5m)}
+            danger={high429}
+            warn={account.upstream429Rate5m > 0.01 && !high429}
           />
         </div>
+
+        <div className="flex flex-wrap gap-1.5">
+          <LearningTag label="瓶颈" value={bottleneckLabel(account.bottleneckDimension)} />
+          {account.learnedOptimalTSecs > 0 && (
+            <LearningTag label="最优静养T" value={`${account.learnedOptimalTSecs}s`} />
+          )}
+          {account.p80HeldMs > 0 && (
+            <LearningTag label="p80占槽" value={formatCooldown(account.p80HeldMs)} />
+          )}
+        </div>
+
         <div>
           <div className="mb-1 text-[11px] text-muted-foreground">
             绑定会话 ({account.boundSessions.length})
@@ -330,22 +516,34 @@ function AccountCard({ account }: { account: AccountObservability }) {
   )
 }
 
+function LearningTag({ label, value }: { label: string; value: string }) {
+  return (
+    <Badge variant="outline" className="text-[10px] font-normal">
+      <span className="text-muted-foreground">{label}:</span>{' '}
+      <span className="font-mono">{value}</span>
+    </Badge>
+  )
+}
+
 function Metric({
   label,
   value,
-  highlight,
+  danger,
+  warn,
 }: {
   label: string
   value: string
-  highlight?: boolean
+  danger?: boolean
+  warn?: boolean
 }) {
   return (
     <div>
       <div className="text-[11px] text-muted-foreground">{label}</div>
       <div
         className={cn(
-          'font-mono tabular-nums',
-          highlight && 'font-medium text-amber-600 dark:text-amber-400',
+          'font-mono tabular-nums text-[13px]',
+          danger && 'font-medium text-red-600 dark:text-red-400',
+          warn && !danger && 'font-medium text-amber-600 dark:text-amber-400',
         )}
       >
         {value}
@@ -361,13 +559,15 @@ function SessionRow({
   priority,
   accounts,
   accountMap,
+  migration,
 }: {
   sessionId: string
   accountId: number | undefined
   pinnedAccountId: number | undefined
   priority: number
-  accounts: AccountObservability[]
-  accountMap: Map<number, AccountObservability>
+  accounts: NormalizedAccountObservability[]
+  accountMap: Map<number, NormalizedAccountObservability>
+  migration?: { fromAccountId: number; toAccountId: number; reason: string }
 }) {
   const pinSession = usePinSession()
   const unpinSession = useUnpinSession()
@@ -423,12 +623,26 @@ function SessionRow({
       className={cn(
         'border-b border-border/40 text-[13px]',
         isPinned && 'bg-primary/5 dark:bg-primary/10',
+        migration && 'bg-amber-500/5 dark:bg-amber-500/10',
       )}
     >
       <td className="py-2.5 pl-4 pr-3">
         <div className="flex items-center gap-1.5">
           {isPinned && (
             <Pin className="h-3.5 w-3.5 shrink-0 text-primary" aria-label="已 Pin" />
+          )}
+          {migration && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <ArrowRightLeft
+                  className="h-3.5 w-3.5 shrink-0 text-amber-600 dark:text-amber-400"
+                  aria-label="forced switch"
+                />
+              </TooltipTrigger>
+              <TooltipContent>
+                原号 #{migration.fromAccountId} 静养中，已迁至 #{migration.toAccountId}
+              </TooltipContent>
+            </Tooltip>
           )}
           <span className="font-mono text-[12px]" title={sessionId}>
             {shortSessionId(sessionId)}
@@ -437,7 +651,14 @@ function SessionRow({
       </td>
       <td className="py-2.5 pr-3">
         {accountId != null ? (
-          <span>{accountLabel(accountId, currentAcc?.email ?? null)}</span>
+          <div className="flex items-center gap-1.5">
+            {currentAcc && (
+              <span
+                className={cn('h-2 w-2 shrink-0 rounded-full', stateDotColor(currentAcc.state))}
+              />
+            )}
+            <span>{accountLabel(accountId, currentAcc?.email ?? null)}</span>
+          </div>
         ) : (
           <span className="text-muted-foreground">未绑定</span>
         )}

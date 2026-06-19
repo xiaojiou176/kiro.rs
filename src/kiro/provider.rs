@@ -419,6 +419,20 @@ impl KiroProvider {
                         current_rps,
                         reason,
                     } => {
+                        if reason == "account_open" {
+                            tracing::warn!(
+                                event = "kiro_limiter_decision",
+                                credential_id = ctx.id,
+                                scope = "user",
+                                action = "account_open_skip",
+                                est_wait_ms = est_wait_ms,
+                                current_rate_rps = current_rps,
+                                reason = reason,
+                                attempt = attempt,
+                                "account 处于 open 状态，跳过并换号重试 (MCP)"
+                            );
+                            continue;
+                        }
                         tracing::warn!(
                             event = "kiro_limiter_decision",
                             credential_id = ctx.id,
@@ -492,7 +506,10 @@ impl KiroProvider {
                 self.token_manager.report_success(ctx.id);
                 if self.limiters.enabled() {
                     let scope = ThrottleScope::UserCredential(ctx.id);
-                    self.limiters.for_scope(&scope).on_success().await;
+                    self.limiters
+                        .for_scope(&scope)
+                        .on_success(self.token_manager.account_rpm(ctx.id))
+                        .await;
                 }
                 let headers = response.headers().clone();
                 let body = response.text().await.unwrap_or_default();
@@ -521,7 +538,7 @@ impl KiroProvider {
                 let scope = ThrottleScope::UserCredential(ctx.id);
                 self.limiters
                     .for_scope(&scope)
-                    .on_throttle(reason, None)
+                    .on_throttle(reason, None, self.token_manager.account_rpm(ctx.id))
                     .await;
                 tracing::info!(
                     event = "kiro_limiter_decision",
@@ -798,6 +815,20 @@ impl KiroProvider {
                         current_rps,
                         reason,
                     } => {
+                        if reason == "account_open" {
+                            tracing::warn!(
+                                event = "kiro_limiter_decision",
+                                credential_id = ctx.id,
+                                scope = "user",
+                                action = "account_open_skip",
+                                est_wait_ms = est_wait_ms,
+                                current_rate_rps = current_rps,
+                                reason = reason,
+                                attempt = attempt,
+                                "account 处于 open 状态，跳过并换号重试"
+                            );
+                            continue;
+                        }
                         tracing::warn!(
                             event = "kiro_limiter_decision",
                             credential_id = ctx.id,
@@ -868,7 +899,10 @@ impl KiroProvider {
                 // 限速器成功回写：慢加性增速。
                 if self.limiters.enabled() {
                     let scope = ThrottleScope::UserCredential(ctx.id);
-                    self.limiters.for_scope(&scope).on_success().await;
+                    self.limiters
+                        .for_scope(&scope)
+                        .on_success(self.token_manager.account_rpm(ctx.id))
+                        .await;
                 }
                 // limiter_permit 随 KiroCallResult 交给 handler；非流式在 body 读完后 drop，
                 // 流式在 handler 返回时 drop（见 KiroCallResult::limiter_permit 注释）。
@@ -918,7 +952,7 @@ impl KiroProvider {
                 let scope = ThrottleScope::UserCredential(ctx.id);
                 self.limiters
                     .for_scope(&scope)
-                    .on_throttle(reason, None)
+                    .on_throttle(reason, None, self.token_manager.account_rpm(ctx.id))
                     .await;
                 tracing::info!(
                     event = "kiro_limiter_decision",

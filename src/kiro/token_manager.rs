@@ -20,7 +20,8 @@ use std::time::{Duration as StdDuration, Instant};
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
-use crate::kiro::rate_limiter::{AdaptiveConfig, LimiterRegistry, ThrottleScope};
+use crate::kiro::account_learning::LearningStore;
+use crate::kiro::rate_limiter::{AdaptiveConfig, AccountState, LimiterRegistry, ThrottleScope};
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -809,36 +810,39 @@ pub struct AccountObservability {
     pub id: u64,
     pub email: Option<String>,
     pub disabled: bool,
-    /// 最近 60s 请求数（RPM 负载窗口）。
     pub rpm: usize,
-    /// 当前绑定到该号、且活跃（last_seen 在再平衡活跃窗口内）的会话数。
     pub active_sessions: usize,
-    /// 当前绑定到该号的全部会话 id（不限活跃窗口；TTL 内）。
     pub bound_sessions: Vec<String>,
-    /// 限速器当前速率（rps）。limiter 未出现过该号时为 None。
     pub limiter_rate_rps: Option<f64>,
-    /// 限速器剩余冷却（毫秒）。0 表示无冷却。
     pub cooldown_remaining_ms: u64,
+    pub state: AccountState,
+    pub state_reason: String,
+    pub reopen_in_ms: u64,
+    pub current_max_inflight: usize,
+    pub current_inflight: usize,
+    pub current_rate_rps: f64,
+    pub learned_safe_rps_lo: f64,
+    pub learned_safe_rps_hi: f64,
+    pub p80_held_ms: u64,
+    pub learned_optimal_t_secs: u64,
+    pub bottleneck_dimension: crate::kiro::account_learning::BottleneckDimension,
+    pub upstream429_rate5m: f64,
+    pub consecutive_throttles: u32,
 }
 
-/// 观测面板：整体快照（号视角 + 反向 会话→号 映射）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObservabilitySnapshot {
-    /// 多号 + affinity 是否开启。
     pub multi_account_enabled: bool,
-    /// 再平衡「活跃会话」窗口（秒）。
     pub active_window_secs: u64,
-    /// 每个号的运行态。
     pub accounts: Vec<AccountObservability>,
-    /// 反向映射：会话 id -> 绑定的号 id（TTL 内的全部绑定）。
     pub session_to_account: HashMap<String, u64>,
-    /// 活跃会话总数（last_seen 在活跃窗口内）。
     pub active_session_total: usize,
-    /// 手动 pin：会话 id -> 强制使用的号 id。
     pub pinned_sessions: HashMap<String, u64>,
-    /// 会话优先级（TTL 内绑定 + 尚未绑定的 pending；越高越重要）。
     pub session_priority: HashMap<String, i32>,
+    pub global_upstream429_rate5m: f64,
+    pub account_state_counts: HashMap<String, usize>,
+    pub scheduling_mode: String,
 }
 
 // ============================================================================
@@ -1109,9 +1113,28 @@ impl MultiTokenManager {
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
         // 自适应限速器：多号共享一个 registry（provider 通过 limiters() 复用同一实例，
         // 这样 selection 查到的「剩余冷却」与 provider 实际闸门是同一份状态）。
-        let limiters = Arc::new(LimiterRegistry::new(AdaptiveConfig::from_cfg(
-            &config.adaptive_limit,
-        )));
+        let learning_path = credentials_path.as_ref().and_then(|p| {
+            p.parent().map(|d| {
+                let base = if d.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    d.to_path_buf()
+                };
+                base.join(&config.adaptive_limit.learning.persist_path)
+            })
+        });
+        let learning = if config.adaptive_limit.learning.enabled {
+            Some(LearningStore::new(
+                config.adaptive_limit.learning.clone(),
+                learning_path,
+            ))
+        } else {
+            None
+        };
+        let limiters = Arc::new(LimiterRegistry::new(
+            AdaptiveConfig::from_cfg(&config.adaptive_limit),
+            learning,
+        ));
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
@@ -1277,15 +1300,19 @@ impl MultiTokenManager {
         let accounts = accounts_base
             .into_iter()
             .map(|(id, email, disabled)| {
-                let (rate, cd) = match self
-                    .limiters
-                    .observe(&ThrottleScope::UserCredential(id))
-                {
+                let scope = ThrottleScope::UserCredential(id);
+                let obs = self.limiters.observe_full(&scope);
+                let (rate, cd) = match self.limiters.observe(&scope) {
                     Some((r, c)) => (Some(r), c.as_millis() as u64),
                     None => (None, 0),
                 };
                 let mut sessions = bound.remove(&id).unwrap_or_default();
                 sessions.sort();
+                let state = if disabled {
+                    AccountState::Disabled
+                } else {
+                    obs.as_ref().map(|o| o.state).unwrap_or(AccountState::Healthy)
+                };
                 AccountObservability {
                     id,
                     email,
@@ -1295,9 +1322,34 @@ impl MultiTokenManager {
                     bound_sessions: sessions,
                     limiter_rate_rps: rate,
                     cooldown_remaining_ms: cd,
+                    state,
+                    state_reason: obs.as_ref().map(|o| o.state_reason.clone()).unwrap_or_default(),
+                    reopen_in_ms: obs.as_ref().map(|o| o.reopen_in_ms).unwrap_or(0),
+                    current_max_inflight: obs.as_ref().map(|o| o.current_max_inflight).unwrap_or(0),
+                    current_inflight: obs.as_ref().map(|o| o.current_inflight).unwrap_or(0),
+                    current_rate_rps: obs.as_ref().map(|o| o.current_rate_rps).unwrap_or(0.0),
+                    learned_safe_rps_lo: obs.as_ref().map(|o| o.learned_safe_rps_lo).unwrap_or(0.5),
+                    learned_safe_rps_hi: obs.as_ref().map(|o| o.learned_safe_rps_hi).unwrap_or(1.0),
+                    p80_held_ms: obs.as_ref().map(|o| o.p80_held_ms).unwrap_or(0),
+                    learned_optimal_t_secs: obs
+                        .as_ref()
+                        .map(|o| o.learned_optimal_t_secs)
+                        .unwrap_or(30),
+                    bottleneck_dimension: obs
+                        .as_ref()
+                        .map(|o| o.bottleneck_dimension)
+                        .unwrap_or_default(),
+                    upstream429_rate5m: obs.as_ref().map(|o| o.upstream_429_rate_5m).unwrap_or(0.0),
+                    consecutive_throttles: obs.as_ref().map(|o| o.consecutive_throttles).unwrap_or(0),
                 }
             })
             .collect();
+
+        let scheduling_mode = if ma.enabled {
+            "multi_account_affinity".to_string()
+        } else {
+            "single_account".to_string()
+        };
 
         ObservabilitySnapshot {
             multi_account_enabled: ma.enabled,
@@ -1307,6 +1359,14 @@ impl MultiTokenManager {
             active_session_total,
             pinned_sessions,
             session_priority,
+            global_upstream429_rate5m: self.limiters.global_upstream_429_rate(),
+            account_state_counts: self
+                .limiters
+                .account_state_counts()
+                .into_iter()
+                .map(|(s, c)| (format!("{s:?}"), c))
+                .collect(),
+            scheduling_mode,
         }
     }
 
@@ -1470,6 +1530,21 @@ impl MultiTokenManager {
     }
 
     /// 某凭据近 [`RPM_WINDOW`] 内的请求数（负载度量）。读时顺手修剪过期项。
+    pub fn account_rpm(&self, id: u64) -> usize {
+        self.rpm(id)
+    }
+
+    pub fn flush_learning_if_dirty(&self) {
+        if let Some(store) = self.limiters.learning() {
+            store.flush_if_dirty();
+        }
+    }
+
+    fn is_account_open(&self, id: u64) -> bool {
+        self.limiters
+            .is_account_open(&ThrottleScope::UserCredential(id))
+    }
+
     fn rpm(&self, id: u64) -> usize {
         let now = Instant::now();
         let mut win = self.request_window.lock();
@@ -1508,6 +1583,7 @@ impl MultiTokenManager {
         available
             .iter()
             .filter(|(id, _)| Some(*id) != exclude)
+            .filter(|(id, _)| !self.is_account_open(*id))
             .min_by_key(|(id, c)| {
                 let cd_ms = if prefer_healthy {
                     self.limiters
@@ -1516,7 +1592,16 @@ impl MultiTokenManager {
                 } else {
                     0
                 };
-                (cd_ms, self.rpm(*id), c.priority, *id)
+                let headroom = if prefer_healthy {
+                    let limiter = self
+                        .limiters
+                        .for_scope(&ThrottleScope::UserCredential(*id));
+                    let h = limiter.headroom();
+                    (-h).clamp(0, isize::MAX as isize) as u64
+                } else {
+                    0
+                };
+                (headroom, cd_ms, self.rpm(*id), c.priority, *id)
             })
             .map(|(id, c)| (*id, c.clone()))
     }
@@ -1624,10 +1709,20 @@ impl MultiTokenManager {
         group: Option<&str>,
         session_key: Option<&str>,
     ) -> Option<(u64, KiroCredentials)> {
-        let available = self.available_credentials(model, group);
-        if available.is_empty() {
+        let all_available = self.available_credentials(model, group);
+        if all_available.is_empty() {
             return None;
         }
+        let healthy_available: Vec<(u64, KiroCredentials)> = all_available
+            .iter()
+            .filter(|(id, _)| !self.is_account_open(*id))
+            .map(|(id, c)| (*id, c.clone()))
+            .collect();
+        let pick_pool = if healthy_available.is_empty() {
+            &all_available
+        } else {
+            &healthy_available
+        };
 
         let ma = &self.config.adaptive_limit.multi_account;
         let ttl = Duration::seconds(ma.affinity_ttl_secs as i64);
@@ -1639,7 +1734,9 @@ impl MultiTokenManager {
         let key = match session_key {
             Some(k) if !k.is_empty() => k.to_string(),
             _ => {
-                let pick = self.lowest_load(&available, None)?;
+                let pick = self.lowest_load(pick_pool, None).or_else(|| {
+                    self.lowest_load(&all_available, None)
+                })?;
                 Self::log_select("load_select", pick.0, self.rpm(pick.0), 0, None, 0);
                 return Some(pick);
             }
@@ -1652,11 +1749,12 @@ impl MultiTokenManager {
         {
             let pinned_id = self.pin_map.lock().get(&key).copied();
             if let Some(pinned_id) = pinned_id {
-                if let Some(creds) = available
+                if let Some(creds) = all_available
                     .iter()
                     .find(|(id, _)| *id == pinned_id)
                     .map(|(_, c)| c.clone())
                 {
+                    if !self.is_account_open(pinned_id) {
                     let cd = self
                         .limiters
                         .cooldown_remaining(&ThrottleScope::UserCredential(pinned_id));
@@ -1670,6 +1768,7 @@ impl MultiTokenManager {
                         prio,
                     );
                     return Some((pinned_id, creds));
+                    }
                 }
                 tracing::warn!(
                     session = %key,
@@ -1688,9 +1787,17 @@ impl MultiTokenManager {
             NewBind,
         }
 
+        let pick_from_pool = |exclude: Option<u64>| {
+            self.lowest_load_prioritized(pick_pool, exclude, prefer_healthy)
+                .or_else(|| self.lowest_load_prioritized(&all_available, exclude, prefer_healthy))
+        };
+
         let (act, chosen, cd_ms) = match &existing {
             Some(b) if (now - b.last_seen) <= ttl => {
-                let bound_available = available.iter().any(|(id, _)| *id == b.credential_id);
+                let bound_in_pool = all_available
+                    .iter()
+                    .any(|(id, _)| *id == b.credential_id);
+                let bound_available = bound_in_pool && !self.is_account_open(b.credential_id);
                 if bound_available {
                     let cd = self
                         .limiters
@@ -1701,10 +1808,13 @@ impl MultiTokenManager {
                         .unwrap_or(false);
                     if cd > switch_threshold && !in_debounce {
                         // 原号卡太久 → 切到别的最低负载号（排除原号）。没有别的号则只能黏着。
-                        match self.lowest_load(&available, Some(b.credential_id)) {
+                        match self
+                            .lowest_load(pick_pool, Some(b.credential_id))
+                            .or_else(|| self.lowest_load(&all_available, Some(b.credential_id)))
+                        {
                             Some(pick) => (Act::Switch, pick, cd.as_millis() as u64),
                             None => {
-                                let creds = available
+                                let creds = all_available
                                     .iter()
                                     .find(|(id, _)| *id == b.credential_id)
                                     .map(|(_, c)| c.clone())?;
@@ -1717,14 +1827,14 @@ impl MultiTokenManager {
                         // 且再平衡未关闭（min_gap>0）时，把当前会话迁到最空号。迁移复用切号路径
                         // （写 last_switch_at + 防抖 + 不黏回），滞后阈值(≥2)保证迁完两边不会立刻反向触发。
                         let rebalanced = if ma.rebalance_min_gap > 0 && !in_debounce {
-                            self.rebalance_target(&available, b.credential_id, ma)
+                            self.rebalance_target(pick_pool, b.credential_id, ma)
                         } else {
                             None
                         };
                         match rebalanced {
                             Some(pick) => (Act::Switch, pick, cd.as_millis() as u64),
                             None => {
-                                let creds = available
+                                let creds = all_available
                                     .iter()
                                     .find(|(id, _)| *id == b.credential_id)
                                     .map(|(_, c)| c.clone())?;
@@ -1733,14 +1843,21 @@ impl MultiTokenManager {
                         }
                     }
                 } else {
-                    // 原号已不可用 → 强制切号；高优先级会话偏好最健康号。
-                    let pick = self.lowest_load_prioritized(&available, None, prefer_healthy)?;
+                    if bound_in_pool && self.is_account_open(b.credential_id) {
+                        tracing::info!(
+                            session = %key,
+                            credential_id = b.credential_id,
+                            "绑定号处于 OPEN 风控窗口，强制切号"
+                        );
+                    }
+                    // 原号已不可用（禁用/OPEN/分组等）→ 强制切号；高优先级会话偏好最健康号。
+                    let pick = pick_from_pool(None)?;
                     (Act::Switch, pick, 0)
                 }
             }
             // 无绑定或绑定已过 TTL → 新会话：最低负载落号并绑定。
             _ => {
-                let pick = self.lowest_load_prioritized(&available, None, prefer_healthy)?;
+                let pick = pick_from_pool(None)?;
                 (Act::NewBind, pick, 0)
             }
         };
@@ -5200,7 +5317,7 @@ mod tests {
         manager
             .limiters()
             .for_scope(&ThrottleScope::UserCredential(c1.id))
-            .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None)
+            .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None, 0)
             .await;
         let c2 = manager
             .acquire_context(None, None, Some("sess-A"))
@@ -5224,7 +5341,7 @@ mod tests {
         manager
             .limiters()
             .for_scope(&ThrottleScope::UserCredential(c1.id))
-            .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None)
+            .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None, 0)
             .await;
         let c2 = manager
             .acquire_context(None, None, Some("sess-A"))
@@ -5248,7 +5365,7 @@ mod tests {
         manager
             .limiters()
             .for_scope(&ThrottleScope::UserCredential(c1.id))
-            .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None)
+            .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None, 0)
             .await;
         // 模拟「刚切过号」：last_switch_at = now，落在防抖窗口内。
         {
@@ -5352,7 +5469,7 @@ mod tests {
         manager
             .limiters()
             .for_scope(&ThrottleScope::UserCredential(1))
-            .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None)
+            .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None, 0)
             .await;
         let pick = manager
             .select_with_affinity(None, None, Some("sess-vip"))
