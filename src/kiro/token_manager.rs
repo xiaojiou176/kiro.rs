@@ -10,15 +10,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex as TokioMutex;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration as StdDuration, Instant};
 
 use crate::http_client::{ProxyConfig, build_client};
 use crate::kiro::kiro_version::USAGE_API_KIRO_VERSION;
 use crate::kiro::machine_id;
+use crate::kiro::rate_limiter::{AdaptiveConfig, LimiterRegistry, ThrottleScope};
 use crate::kiro::model::available_models::ListAvailableModelsResponse;
 use crate::kiro::model::available_profiles::ListAvailableProfilesResponse;
 use crate::kiro::model::credentials::KiroCredentials;
@@ -781,6 +783,57 @@ struct StatsEntry {
     last_used_at: Option<String>,
 }
 
+/// 会话亲和绑定条目（多号 + 强制 session affinity 的核心状态，持久化到 `session_affinity.json`）。
+///
+/// 时间用 RFC3339（wall-clock）存储：既便于人工观测，也能跨重启正确判断 TTL / 切号防抖。
+#[derive(Clone, Serialize, Deserialize)]
+struct AffinityBinding {
+    /// 当前黏定的凭据 id
+    credential_id: u64,
+    /// 首次绑定时间
+    bound_at: DateTime<Utc>,
+    /// 最近一次活动时间（用于 TTL 释放）
+    last_seen: DateTime<Utc>,
+    /// 最近一次切号时间（用于切号防抖；从未切过为 None）
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_switch_at: Option<DateTime<Utc>>,
+}
+
+/// 观测面板：单个号的运行态快照。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountObservability {
+    pub id: u64,
+    pub email: Option<String>,
+    pub disabled: bool,
+    /// 最近 60s 请求数（RPM 负载窗口）。
+    pub rpm: usize,
+    /// 当前绑定到该号、且活跃（last_seen 在再平衡活跃窗口内）的会话数。
+    pub active_sessions: usize,
+    /// 当前绑定到该号的全部会话 id（不限活跃窗口；TTL 内）。
+    pub bound_sessions: Vec<String>,
+    /// 限速器当前速率（rps）。limiter 未出现过该号时为 None。
+    pub limiter_rate_rps: Option<f64>,
+    /// 限速器剩余冷却（毫秒）。0 表示无冷却。
+    pub cooldown_remaining_ms: u64,
+}
+
+/// 观测面板：整体快照（号视角 + 反向 会话→号 映射）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObservabilitySnapshot {
+    /// 多号 + affinity 是否开启。
+    pub multi_account_enabled: bool,
+    /// 再平衡「活跃会话」窗口（秒）。
+    pub active_window_secs: u64,
+    /// 每个号的运行态。
+    pub accounts: Vec<AccountObservability>,
+    /// 反向映射：会话 id -> 绑定的号 id（TTL 内的全部绑定）。
+    pub session_to_account: HashMap<String, u64>,
+    /// 活跃会话总数（last_seen 在活跃窗口内）。
+    pub active_session_total: usize,
+}
+
 // ============================================================================
 // Admin API 公开结构
 // ============================================================================
@@ -885,12 +938,28 @@ pub struct MultiTokenManager {
     last_stats_save_at: Mutex<Option<Instant>>,
     /// 统计数据是否有未落盘更新
     stats_dirty: AtomicBool,
+    /// 自适应限速器容器（多号共享一个实例）。
+    /// selection 据此查询各号「剩余冷却」做切号判定；provider 复用同一实例做发送前闸门。
+    /// `enabled=false` 时仍可安全持有（完全不介入）。
+    limiters: Arc<LimiterRegistry>,
+    /// 每个凭据近 `RPM_WINDOW` 内的请求时间戳窗口（用于「最低负载选号」=最低 RPM）。
+    request_window: Mutex<HashMap<u64, VecDeque<Instant>>>,
+    /// 会话亲和映射：conversation_id → 绑定信息（多号 + 强制 session affinity 的核心状态）。
+    affinity: Mutex<HashMap<String, AffinityBinding>>,
+    /// 最近一次亲和映射落盘时间（用于 debounce）
+    last_affinity_save_at: Mutex<Option<Instant>>,
+    /// 亲和映射是否有未落盘更新
+    affinity_dirty: AtomicBool,
 }
 
 /// 每个凭据最大 API 调用失败次数
 const MAX_FAILURES_PER_CREDENTIAL: u32 = 10;
 /// 统计数据持久化防抖间隔
 const STATS_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+/// 会话亲和映射持久化防抖间隔
+const AFFINITY_SAVE_DEBOUNCE: StdDuration = StdDuration::from_secs(30);
+/// RPM 负载窗口长度（统计近 N 秒内的请求数作为负载度量）
+const RPM_WINDOW: StdDuration = StdDuration::from_secs(60);
 
 /// API 调用上下文
 ///
@@ -1021,6 +1090,11 @@ impl MultiTokenManager {
         let load_balancing_mode = config.load_balancing_mode.clone();
         let throttle_failover = config.account_throttle_failover;
         let throttle_cooldown_secs = config.account_throttle_cooldown_secs;
+        // 自适应限速器：多号共享一个 registry（provider 通过 limiters() 复用同一实例，
+        // 这样 selection 查到的「剩余冷却」与 provider 实际闸门是同一份状态）。
+        let limiters = Arc::new(LimiterRegistry::new(AdaptiveConfig::from_cfg(
+            &config.adaptive_limit,
+        )));
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
@@ -1034,6 +1108,11 @@ impl MultiTokenManager {
             account_throttle_cooldown_secs: AtomicU64::new(throttle_cooldown_secs),
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
+            limiters,
+            request_window: Mutex::new(HashMap::new()),
+            affinity: Mutex::new(HashMap::new()),
+            last_affinity_save_at: Mutex::new(None),
+            affinity_dirty: AtomicBool::new(false),
         };
 
         // 单凭据格式自动迁移：升级为数组格式，确保 token rotation 能写盘
@@ -1063,6 +1142,8 @@ impl MultiTokenManager {
 
         // 加载持久化的统计数据（success_count, last_used_at）
         manager.load_stats();
+        // 加载持久化的会话亲和映射（多号 + session affinity，重启后同会话仍黏同号）
+        manager.load_affinity();
 
         Ok(manager)
     }
@@ -1070,6 +1151,83 @@ impl MultiTokenManager {
     /// 获取配置的引用
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// 获取自适应限速器容器（供 provider 复用同一实例做发送前闸门）。
+    pub fn limiters(&self) -> Arc<LimiterRegistry> {
+        self.limiters.clone()
+    }
+
+    /// 观测面板快照：聚合每个号的 RPM / 活跃会话数 / 绑定会话列表 / 限速器速率与冷却，
+    /// 以及反向 会话→号 映射。只读，按「先取各资源快照再聚合」的顺序避免锁交叉。
+    pub fn observability_snapshot(&self) -> ObservabilitySnapshot {
+        let ma = &self.config.adaptive_limit.multi_account;
+        let active_window = Duration::seconds(ma.rebalance_active_window_secs as i64);
+        let ttl = Duration::seconds(ma.affinity_ttl_secs as i64);
+        let now = Utc::now();
+
+        // 1) 号基础信息快照（释放 entries 锁后再做其余）。
+        let accounts_base: Vec<(u64, Option<String>, bool)> = {
+            let entries = self.entries.lock();
+            entries
+                .iter()
+                .map(|e| (e.id, e.credentials.email.clone(), e.disabled))
+                .collect()
+        };
+
+        // 2) affinity 快照：统计每个号的绑定会话（TTL 内）+ 活跃会话（active_window 内）+ 反向映射。
+        let mut bound: HashMap<u64, Vec<String>> = HashMap::new();
+        let mut active_counts: HashMap<u64, usize> = HashMap::new();
+        let mut session_to_account: HashMap<String, u64> = HashMap::new();
+        let mut active_session_total = 0usize;
+        {
+            let aff = self.affinity.lock();
+            for (sid, b) in aff.iter() {
+                if (now - b.last_seen) > ttl {
+                    continue;
+                }
+                bound.entry(b.credential_id).or_default().push(sid.clone());
+                session_to_account.insert(sid.clone(), b.credential_id);
+                if (now - b.last_seen) <= active_window {
+                    *active_counts.entry(b.credential_id).or_default() += 1;
+                    active_session_total += 1;
+                }
+            }
+        }
+
+        // 3) 逐号聚合 RPM + limiter（不在持 affinity 锁期间调用）。
+        let accounts = accounts_base
+            .into_iter()
+            .map(|(id, email, disabled)| {
+                let (rate, cd) = match self
+                    .limiters
+                    .observe(&ThrottleScope::UserCredential(id))
+                {
+                    Some((r, c)) => (Some(r), c.as_millis() as u64),
+                    None => (None, 0),
+                };
+                let mut sessions = bound.remove(&id).unwrap_or_default();
+                sessions.sort();
+                AccountObservability {
+                    id,
+                    email,
+                    disabled,
+                    rpm: self.rpm(id),
+                    active_sessions: *active_counts.get(&id).unwrap_or(&0),
+                    bound_sessions: sessions,
+                    limiter_rate_rps: rate,
+                    cooldown_remaining_ms: cd,
+                }
+            })
+            .collect();
+
+        ObservabilitySnapshot {
+            multi_account_enabled: ma.enabled,
+            active_window_secs: ma.rebalance_active_window_secs,
+            accounts,
+            session_to_account,
+            active_session_total,
+        }
     }
 
     /// 获取全局代理配置的克隆（可安全跨锁使用）
@@ -1115,7 +1273,17 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    fn select_next_credential(&self, model: Option<&str>, group: Option<&str>) -> Option<(u64, KiroCredentials)> {
+    fn select_next_credential(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        session_key: Option<&str>,
+    ) -> Option<(u64, KiroCredentials)> {
+        // 多号 + 强制 session affinity：整条选号逻辑交给 affinity（黏定 / 切号 / 最低负载新绑）。
+        if self.config.adaptive_limit.multi_account.enabled {
+            return self.select_with_affinity(model, group, session_key);
+        }
+
         let entries = self.entries.lock();
         let now = Instant::now();
 
@@ -1156,11 +1324,11 @@ impl MultiTokenManager {
 
         match mode {
             "balanced" => {
-                // Least-Used 策略：选择成功次数最少的凭据
-                // 平局时按优先级排序（数字越小优先级越高）
+                // 最低负载策略：选近 60s 请求数（RPM）最少的号；
+                // 平局按优先级（数字越小越高）、再按 id（稳定）。
                 let entry = available
                     .iter()
-                    .min_by_key(|e| (e.success_count, e.credentials.priority))?;
+                    .min_by_key(|e| (self.rpm(e.id), e.credentials.priority, e.id))?;
 
                 Some((entry.id, entry.credentials.clone()))
             }
@@ -1169,6 +1337,395 @@ impl MultiTokenManager {
                 let entry = available.iter().min_by_key(|e| e.credentials.priority)?;
                 Some((entry.id, entry.credentials.clone()))
             }
+        }
+    }
+
+    /// 构造「当前可用」凭据列表（与 [`Self::select_next_credential`] 同口径：未禁用 /
+    /// 未账号级冷却 / opus 订阅匹配 / 分组匹配）。返回 `(id, credentials)` 克隆，
+    /// 调用方拿到后不再持 `entries` 锁，避免与 `request_window` / `affinity` 锁交叉。
+    fn available_credentials(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+    ) -> Vec<(u64, KiroCredentials)> {
+        let entries = self.entries.lock();
+        let now = Instant::now();
+        let is_opus = model
+            .map(|m| m.to_lowercase().contains("opus"))
+            .unwrap_or(false);
+        entries
+            .iter()
+            .filter(|e| {
+                if e.disabled {
+                    return false;
+                }
+                if e.throttled_until.map(|t| t > now).unwrap_or(false) {
+                    return false;
+                }
+                if is_opus && !e.credentials.supports_opus() {
+                    return false;
+                }
+                if !group_matches(&e.credentials.groups, group) {
+                    return false;
+                }
+                true
+            })
+            .map(|e| (e.id, e.credentials.clone()))
+            .collect()
+    }
+
+    /// 记录一次对某凭据的请求（RPM 负载窗口）。在选号后调用，供后续请求的最低负载比较。
+    fn note_request(&self, id: u64) {
+        let now = Instant::now();
+        let mut win = self.request_window.lock();
+        let dq = win.entry(id).or_default();
+        dq.push_back(now);
+        while let Some(front) = dq.front() {
+            if now.duration_since(*front) > RPM_WINDOW {
+                dq.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// 某凭据近 [`RPM_WINDOW`] 内的请求数（负载度量）。读时顺手修剪过期项。
+    fn rpm(&self, id: u64) -> usize {
+        let now = Instant::now();
+        let mut win = self.request_window.lock();
+        match win.get_mut(&id) {
+            Some(dq) => {
+                while let Some(front) = dq.front() {
+                    if now.duration_since(*front) > RPM_WINDOW {
+                        dq.pop_front();
+                    } else {
+                        break;
+                    }
+                }
+                dq.len()
+            }
+            None => 0,
+        }
+    }
+
+    /// 在 `available` 中挑「最低负载」（最低 RPM）的号；平局按 priority、再按 id（稳定）。
+    /// `exclude` 用于切号时排除原号。无候选返回 None。
+    fn lowest_load(
+        &self,
+        available: &[(u64, KiroCredentials)],
+        exclude: Option<u64>,
+    ) -> Option<(u64, KiroCredentials)> {
+        available
+            .iter()
+            .filter(|(id, _)| Some(*id) != exclude)
+            .min_by_key(|(id, c)| (self.rpm(*id), c.priority, *id))
+            .map(|(id, c)| (*id, c.clone()))
+    }
+
+    /// 打一条选号决策日志（与 provider 的 `kiro_limiter_decision` 同事件名，scope=select）。
+    fn log_select(action: &'static str, credential_id: u64, rpm: usize, cooldown_remaining_ms: u64) {
+        tracing::info!(
+            event = "kiro_limiter_decision",
+            scope = "select",
+            action = action,
+            credential_id = credential_id,
+            rpm = rpm,
+            cooldown_remaining_ms = cooldown_remaining_ms,
+            "多号选号决策"
+        );
+    }
+
+    /// 统计各号「活跃会话数」：affinity map 中 `last_seen` 在 `active_window` 内、且绑到 `available` 内号的会话。
+    /// 只读 affinity 快照，不调 rpm/limiters（避免锁交叉）。返回 `id -> 活跃会话数`（available 中的号至少为 0）。
+    fn active_session_counts(
+        &self,
+        available: &[(u64, KiroCredentials)],
+        active_window: Duration,
+    ) -> HashMap<u64, usize> {
+        let now = Utc::now();
+        let mut counts: HashMap<u64, usize> = available.iter().map(|(id, _)| (*id, 0)).collect();
+        let aff = self.affinity.lock();
+        for b in aff.values() {
+            if (now - b.last_seen) <= active_window {
+                if let Some(c) = counts.get_mut(&b.credential_id) {
+                    *c += 1;
+                }
+            }
+        }
+        counts
+    }
+
+    /// 被动负载再平衡：若 `current` 号的活跃会话数比最空号多 ≥ `rebalance_min_gap`，
+    /// 返回应迁往的最空号（排除 `current`）；否则 `None`（不迁，保持黏定）。
+    /// 滞后阈值(≥2)+ 调用方的防抖保证迁移后不会 A↔B 反复横跳。
+    fn rebalance_target(
+        &self,
+        available: &[(u64, KiroCredentials)],
+        current: u64,
+        ma: &crate::model::config::MultiAccountConfig,
+    ) -> Option<(u64, KiroCredentials)> {
+        if ma.rebalance_min_gap == 0 || available.len() < 2 {
+            return None;
+        }
+        let window = Duration::seconds(ma.rebalance_active_window_secs as i64);
+        let counts = self.active_session_counts(available, window);
+        let current_load = *counts.get(&current).unwrap_or(&0);
+        // 找活跃会话数最少的「别的号」（平局按 priority、再按 id 稳定）。
+        let target = available
+            .iter()
+            .filter(|(id, _)| *id != current)
+            .min_by_key(|(id, c)| (*counts.get(id).unwrap_or(&0), c.priority, *id))?;
+        let target_load = *counts.get(&target.0).unwrap_or(&0);
+        if current_load >= target_load + ma.rebalance_min_gap {
+            Some((target.0, target.1.clone()))
+        } else {
+            None
+        }
+    }
+
+    /// 多号 + 强制 session affinity 的选号核心。
+    ///
+    /// - `session_key = Some(非空)`：同一会话黏定同一号；原号「剩余冷却 > 阈值且不在切号防抖窗口」
+    ///   才切到最低负载的别的号（切号后写 `last_switch_at`，不再自动黏回旧号）；原号已不可用
+    ///   （禁用/账号级风控/分组/opus）则强制切；新会话按最低负载落号并绑定。
+    /// - `session_key = None/空`：无稳定会话可黏，直接按最低负载选号、不绑定。
+    fn select_with_affinity(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        session_key: Option<&str>,
+    ) -> Option<(u64, KiroCredentials)> {
+        let available = self.available_credentials(model, group);
+        if available.is_empty() {
+            return None;
+        }
+
+        let ma = &self.config.adaptive_limit.multi_account;
+        let ttl = Duration::seconds(ma.affinity_ttl_secs as i64);
+        let switch_threshold = StdDuration::from_secs(ma.switch_threshold_secs);
+        let debounce = Duration::seconds(ma.switch_debounce_secs as i64);
+        let now = Utc::now();
+
+        // 无稳定会话：纯最低负载选号，不绑定。
+        let key = match session_key {
+            Some(k) if !k.is_empty() => k.to_string(),
+            _ => {
+                let pick = self.lowest_load(&available, None)?;
+                Self::log_select("load_select", pick.0, self.rpm(pick.0), 0);
+                return Some(pick);
+            }
+        };
+
+        // 读现有绑定的只读快照（不在持 affinity 锁期间调用 rpm/limiters，避免锁交叉）。
+        let existing = self.affinity.lock().get(&key).cloned();
+
+        enum Act {
+            Stick,
+            Switch,
+            NewBind,
+        }
+
+        let (act, chosen, cd_ms) = match &existing {
+            Some(b) if (now - b.last_seen) <= ttl => {
+                let bound_available = available.iter().any(|(id, _)| *id == b.credential_id);
+                if bound_available {
+                    let cd = self
+                        .limiters
+                        .cooldown_remaining(&ThrottleScope::UserCredential(b.credential_id));
+                    let in_debounce = b
+                        .last_switch_at
+                        .map(|t| (now - t) < debounce)
+                        .unwrap_or(false);
+                    if cd > switch_threshold && !in_debounce {
+                        // 原号卡太久 → 切到别的最低负载号（排除原号）。没有别的号则只能黏着。
+                        match self.lowest_load(&available, Some(b.credential_id)) {
+                            Some(pick) => (Act::Switch, pick, cd.as_millis() as u64),
+                            None => {
+                                let creds = available
+                                    .iter()
+                                    .find(|(id, _)| *id == b.credential_id)
+                                    .map(|(_, c)| c.clone())?;
+                                (Act::Stick, (b.credential_id, creds), cd.as_millis() as u64)
+                            }
+                        }
+                    } else {
+                        // 原号健康（不到切号阈值）。先看是否该「被动负载再平衡」：
+                        // 当原号活跃会话数明显多于最空号（差距 ≥ rebalance_min_gap）、且不在切号防抖窗口、
+                        // 且再平衡未关闭（min_gap>0）时，把当前会话迁到最空号。迁移复用切号路径
+                        // （写 last_switch_at + 防抖 + 不黏回），滞后阈值(≥2)保证迁完两边不会立刻反向触发。
+                        let rebalanced = if ma.rebalance_min_gap > 0 && !in_debounce {
+                            self.rebalance_target(&available, b.credential_id, ma)
+                        } else {
+                            None
+                        };
+                        match rebalanced {
+                            Some(pick) => (Act::Switch, pick, cd.as_millis() as u64),
+                            None => {
+                                let creds = available
+                                    .iter()
+                                    .find(|(id, _)| *id == b.credential_id)
+                                    .map(|(_, c)| c.clone())?;
+                                (Act::Stick, (b.credential_id, creds), cd.as_millis() as u64)
+                            }
+                        }
+                    }
+                } else {
+                    // 原号已不可用 → 强制切到最低负载号。
+                    let pick = self.lowest_load(&available, None)?;
+                    (Act::Switch, pick, 0)
+                }
+            }
+            // 无绑定或绑定已过 TTL → 新会话：最低负载落号并绑定。
+            _ => {
+                let pick = self.lowest_load(&available, None)?;
+                (Act::NewBind, pick, 0)
+            }
+        };
+
+        // 短暂写锁更新绑定。
+        {
+            let mut aff = self.affinity.lock();
+            match act {
+                Act::Stick => {
+                    if let Some(e) = aff.get_mut(&key) {
+                        e.last_seen = now;
+                    } else {
+                        // 期间被并发清理：重新建绑定（last-writer-wins，幂等）。
+                        aff.insert(
+                            key.clone(),
+                            AffinityBinding {
+                                credential_id: chosen.0,
+                                bound_at: now,
+                                last_seen: now,
+                                last_switch_at: None,
+                            },
+                        );
+                    }
+                }
+                Act::Switch => {
+                    let e = aff.entry(key.clone()).or_insert_with(|| AffinityBinding {
+                        credential_id: chosen.0,
+                        bound_at: now,
+                        last_seen: now,
+                        last_switch_at: Some(now),
+                    });
+                    e.credential_id = chosen.0;
+                    e.last_switch_at = Some(now);
+                    e.last_seen = now;
+                }
+                Act::NewBind => {
+                    aff.insert(
+                        key.clone(),
+                        AffinityBinding {
+                            credential_id: chosen.0,
+                            bound_at: now,
+                            last_seen: now,
+                            last_switch_at: None,
+                        },
+                    );
+                }
+            }
+        }
+
+        let action_str = match act {
+            Act::Stick => "affinity_stick",
+            Act::Switch => "affinity_switch",
+            Act::NewBind => "new_session_bind",
+        };
+        Self::log_select(action_str, chosen.0, self.rpm(chosen.0), cd_ms);
+        self.save_affinity_debounced();
+        Some(chosen)
+    }
+
+    /// 会话亲和映射文件路径（与凭据文件同目录）。
+    fn affinity_path(&self) -> Option<PathBuf> {
+        self.cache_dir().map(|d| d.join("session_affinity.json"))
+    }
+
+    /// 启动时从磁盘加载会话亲和映射（过滤过期项 + 指向不存在凭据的死绑定）。
+    fn load_affinity(&self) {
+        let path = match self.affinity_path() {
+            Some(p) => p,
+            None => return,
+        };
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return, // 首次运行时文件不存在
+        };
+        let map: HashMap<String, AffinityBinding> = match serde_json::from_str(&content) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!("解析会话亲和缓存失败，将忽略: {}", e);
+                return;
+            }
+        };
+
+        let now = Utc::now();
+        let ttl = Duration::seconds(self.config.adaptive_limit.multi_account.affinity_ttl_secs as i64);
+        let valid_ids: std::collections::HashSet<u64> =
+            self.entries.lock().iter().map(|e| e.id).collect();
+
+        let mut loaded = self.affinity.lock();
+        let mut kept = 0usize;
+        for (k, b) in map {
+            if (now - b.last_seen) <= ttl && valid_ids.contains(&b.credential_id) {
+                loaded.insert(k, b);
+                kept += 1;
+            }
+        }
+        drop(loaded);
+        *self.last_affinity_save_at.lock() = Some(Instant::now());
+        self.affinity_dirty.store(false, Ordering::Relaxed);
+        tracing::info!("已从缓存加载 {} 条会话亲和绑定", kept);
+    }
+
+    /// 把会话亲和映射落盘（原子写）。落盘前顺手清理过期项，避免文件无限增长。
+    fn save_affinity(&self) {
+        let path = match self.affinity_path() {
+            Some(p) => p,
+            None => return,
+        };
+        let now = Utc::now();
+        let ttl = Duration::seconds(self.config.adaptive_limit.multi_account.affinity_ttl_secs as i64);
+        let map: HashMap<String, AffinityBinding> = {
+            let mut aff = self.affinity.lock();
+            aff.retain(|_, b| (now - b.last_seen) <= ttl);
+            aff.clone()
+        };
+        match serde_json::to_string_pretty(&map) {
+            Ok(json) => {
+                if let Err(e) = crate::observability::write_atomic(&path, json.as_bytes()) {
+                    tracing::warn!("保存会话亲和缓存失败: {}", e);
+                } else {
+                    *self.last_affinity_save_at.lock() = Some(Instant::now());
+                    self.affinity_dirty.store(false, Ordering::Relaxed);
+                }
+            }
+            Err(e) => tracing::warn!("序列化会话亲和数据失败: {}", e),
+        }
+    }
+
+    /// 标记亲和映射已更新，按 debounce 决定是否立即落盘。
+    fn save_affinity_debounced(&self) {
+        self.affinity_dirty.store(true, Ordering::Relaxed);
+        let should_flush = {
+            let last = *self.last_affinity_save_at.lock();
+            match last {
+                Some(t) => t.elapsed() >= AFFINITY_SAVE_DEBOUNCE,
+                None => true,
+            }
+        };
+        if should_flush {
+            self.save_affinity();
+        }
+    }
+
+    /// 周期性刷盘钩子（绕过 debounce）：若亲和映射有未落盘更新则立即写盘。
+    /// 由后台任务每 ~30s 调用一次，把 debounce 窗口内积累的新绑定兜底落盘，
+    /// 保证「重启后同会话仍黏同号」的最长丢失窗口 ≤ 刷盘间隔。
+    pub fn flush_affinity_if_dirty(&self) {
+        if self.affinity_dirty.load(Ordering::Relaxed) {
+            self.save_affinity();
         }
     }
 
@@ -1182,7 +1739,12 @@ impl MultiTokenManager {
     ///
     /// # 参数
     /// - `model`: 可选的模型名称，用于过滤支持该模型的凭据（如 opus 模型需要付费订阅）
-    pub async fn acquire_context(&self, model: Option<&str>, group: Option<&str>) -> anyhow::Result<CallContext> {
+    pub async fn acquire_context(
+        &self,
+        model: Option<&str>,
+        group: Option<&str>,
+        session_key: Option<&str>,
+    ) -> anyhow::Result<CallContext> {
         let total = self.total_count_in_group(group);
         let max_attempts = (total * MAX_FAILURES_PER_CREDENTIAL as usize).max(1);
         let mut attempt_count = 0;
@@ -1197,11 +1759,11 @@ impl MultiTokenManager {
             }
 
             let (id, credentials) = {
-                let is_balanced = self.load_balancing_mode.lock().as_str() == "balanced";
-
-                // balanced 模式：每次请求都重新均衡选择，不固定 current_id
-                // priority 模式：优先使用 current_id 指向的凭据
-                let current_hit = if is_balanced {
+                // balanced 或多号 affinity：每次请求都重新选号，不固定 current_id。
+                // priority 模式：优先复用 current_id 指向的凭据。
+                let skip_sticky = self.load_balancing_mode.lock().as_str() == "balanced"
+                    || self.config.adaptive_limit.multi_account.enabled;
+                let current_hit = if skip_sticky {
                     None
                 } else {
                     let entries = self.entries.lock();
@@ -1221,8 +1783,8 @@ impl MultiTokenManager {
                 if let Some(hit) = current_hit {
                     hit
                 } else {
-                    // 当前凭据不可用或 balanced 模式，根据负载均衡策略选择
-                    let mut best = self.select_next_credential(model, group);
+                    // 当前凭据不可用 / balanced / 多号 affinity：按选号策略重新选择
+                    let mut best = self.select_next_credential(model, group, session_key);
 
                     // 没有可用凭据：如果是"自动禁用导致全灭"，做一次类似重启的自愈
                     if best.is_none() {
@@ -1241,7 +1803,7 @@ impl MultiTokenManager {
                                 }
                             }
                             drop(entries);
-                            best = self.select_next_credential(model, group);
+                            best = self.select_next_credential(model, group, session_key);
                         }
                     }
 
@@ -1260,6 +1822,9 @@ impl MultiTokenManager {
                     }
                 }
             };
+
+            // 记录一次对该号的请求（RPM 负载窗口，供后续请求的最低负载选号）。
+            self.note_request(id);
 
             // 尝试获取/刷新 Token
             match self.try_ensure_token(id, &credentials).await {
@@ -3598,7 +4163,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         // 应触发自愈：重置失败计数并重新启用，避免必须重启进程
-        let ctx = manager.acquire_context(None, None).await.unwrap();
+        let ctx = manager.acquire_context(None, None, None).await.unwrap();
         assert!(ctx.token == "t1" || ctx.token == "t2");
         assert_eq!(manager.available_count(), 2);
     }
@@ -3621,7 +4186,7 @@ mod tests {
         let manager =
             MultiTokenManager::new(config, vec![bad_cred, good_cred], None, None, false).unwrap();
 
-        let ctx = manager.acquire_context(None, None).await.unwrap();
+        let ctx = manager.acquire_context(None, None, None).await.unwrap();
         assert_eq!(ctx.id, 2);
         assert_eq!(ctx.token, "good-token");
     }
@@ -3667,7 +4232,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         let err = manager
-            .acquire_context(None, None)
+            .acquire_context(None, None, None)
             .await
             .err()
             .unwrap()
@@ -3712,7 +4277,7 @@ mod tests {
         assert_eq!(manager.available_count(), 0);
 
         let err = manager
-            .acquire_context(None, None)
+            .acquire_context(None, None, None)
             .await
             .err()
             .unwrap()
@@ -4189,15 +4754,15 @@ mod tests {
         .unwrap();
 
         // g1 只能选到 A(id=1)
-        let g1 = manager.select_next_credential(None, Some("g1"));
+        let g1 = manager.select_next_credential(None, Some("g1"), None);
         assert_eq!(g1.map(|(id, _)| id), Some(1));
         // g2 只能选到 B(id=2)
-        let g2 = manager.select_next_credential(None, Some("g2"));
+        let g2 = manager.select_next_credential(None, Some("g2"), None);
         assert_eq!(g2.map(|(id, _)| id), Some(2));
         // 不存在的分组 → 无可用账号
-        assert!(manager.select_next_credential(None, Some("nope")).is_none());
+        assert!(manager.select_next_credential(None, Some("nope"), None).is_none());
         // 未绑定分组(None) → 可选到账号
-        assert!(manager.select_next_credential(None, None).is_some());
+        assert!(manager.select_next_credential(None, None, None).is_some());
     }
 
     #[test]
@@ -4239,13 +4804,13 @@ mod tests {
         )
         .unwrap();
 
-        // 让 A(id1) 成功若干次 → balanced 应转向 success_count 更小的 B(id2)
-        manager.report_success(1);
-        manager.report_success(1);
-        let pick = manager.select_next_credential(None, Some("g1"));
-        assert_eq!(pick.map(|(id, _)| id), Some(2), "balanced 应在 g1 内选 success_count 最小的 B");
-        // g2 不受 g1 计数影响，仍只会选到 C(id3)
-        let pick_g2 = manager.select_next_credential(None, Some("g2"));
+        // 让 A(id1) 承载较多请求（RPM 升高）→ balanced 应转向负载更低的 B(id2)
+        manager.note_request(1);
+        manager.note_request(1);
+        let pick = manager.select_next_credential(None, Some("g1"), None);
+        assert_eq!(pick.map(|(id, _)| id), Some(2), "balanced 应在 g1 内选 RPM 最低的 B");
+        // g2 不受 g1 负载影响，仍只会选到 C(id3)
+        let pick_g2 = manager.select_next_credential(None, Some("g2"), None);
         assert_eq!(pick_g2.map(|(id, _)| id), Some(3));
     }
 
@@ -4266,16 +4831,223 @@ mod tests {
         .unwrap();
 
         // 正常情况下 g1 能拿到 context
-        assert!(manager.acquire_context(None, Some("g1")).await.is_ok());
+        assert!(manager.acquire_context(None, Some("g1"), None).await.is_ok());
 
         // 手动禁用 g1 内唯一账号 A(id1)
         manager.set_disabled(1, true).unwrap();
 
         // 严格隔离：g1 无可用账号 → Err，且不会选到 B/C
-        let res = manager.acquire_context(None, Some("g1")).await;
+        let res = manager.acquire_context(None, Some("g1"), None).await;
         assert!(res.is_err(), "g1 内全部账号禁用后应失败，不回退到其他分组");
 
         // 但 g2 仍可用
-        assert!(manager.acquire_context(None, Some("g2")).await.is_ok());
+        assert!(manager.acquire_context(None, Some("g2"), None).await.is_ok());
+    }
+
+    // ===== 多号 + session affinity 单测 =====
+
+    /// 构造一个开启多号 affinity 的双号 manager（两个直连号，无分组）。
+    fn affinity_manager(mut config: Config) -> MultiTokenManager {
+        config.adaptive_limit.multi_account.enabled = true;
+        MultiTokenManager::new(
+            config,
+            vec![grouped_cred("t1", &[]), grouped_cred("t2", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap()
+    }
+
+    // RPM 计数器：累计 + 按号隔离 + 未知号为 0。
+    #[test]
+    fn test_rpm_counter_counts_and_isolates() {
+        let manager = affinity_manager(Config::default());
+        assert_eq!(manager.rpm(1), 0);
+        manager.note_request(1);
+        manager.note_request(1);
+        manager.note_request(2);
+        assert_eq!(manager.rpm(1), 2);
+        assert_eq!(manager.rpm(2), 1);
+        assert_eq!(manager.rpm(999), 0, "未知号 RPM 应为 0");
+    }
+
+    // 无 session_key（None / 空串）：不绑定，直接选号，且不写 affinity 映射。
+    #[test]
+    fn test_affinity_no_session_key_load_select() {
+        let manager = affinity_manager(Config::default());
+        let p = manager.select_with_affinity(None, None, None).unwrap();
+        assert!(p.0 == 1 || p.0 == 2);
+        assert!(
+            manager.affinity.lock().is_empty(),
+            "无 session 不应建立绑定"
+        );
+        let p_empty = manager.select_with_affinity(None, None, Some("")).unwrap();
+        assert!(p_empty.0 == 1 || p_empty.0 == 2);
+        assert!(
+            manager.affinity.lock().is_empty(),
+            "空 session 不应建立绑定"
+        );
+    }
+
+    // 新会话落号后黏定：同一 session 反复选号都黏同一个号。
+    #[test]
+    fn test_affinity_new_session_binds_and_sticks() {
+        let manager = affinity_manager(Config::default());
+        let p1 = manager
+            .select_with_affinity(None, None, Some("sess-A"))
+            .unwrap();
+        let p2 = manager
+            .select_with_affinity(None, None, Some("sess-A"))
+            .unwrap();
+        assert_eq!(p1.0, p2.0, "同一会话应黏定同一号");
+        assert_eq!(
+            manager.affinity.lock().get("sess-A").map(|b| b.credential_id),
+            Some(p1.0)
+        );
+    }
+
+    // 两个不同新会话按最低负载分流到不同号；同会话再来仍黏原号。
+    #[tokio::test]
+    async fn test_affinity_new_sessions_distribute_by_load() {
+        let manager = affinity_manager(Config::default());
+        let c1 = manager
+            .acquire_context(None, None, Some("sess-A"))
+            .await
+            .unwrap();
+        let c2 = manager
+            .acquire_context(None, None, Some("sess-B"))
+            .await
+            .unwrap();
+        assert_ne!(c1.id, c2.id, "两个新会话应按最低负载分到不同号");
+        let c1b = manager
+            .acquire_context(None, None, Some("sess-A"))
+            .await
+            .unwrap();
+        assert_eq!(c1b.id, c1.id, "同一会话应黏回原号");
+    }
+
+    // 原号冷却短于阈值：继续黏原号（由 limiter 自行等待，不切号）。
+    #[tokio::test]
+    async fn test_affinity_sticks_when_cooldown_short() {
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.switch_threshold_secs = 100; // 阈值很大
+        config.adaptive_limit.user_cooldown_base_secs = 2; // 冷却 ~2s << 100s
+        let manager = affinity_manager(config);
+        let c1 = manager
+            .acquire_context(None, None, Some("sess-A"))
+            .await
+            .unwrap();
+        manager
+            .limiters()
+            .for_scope(&ThrottleScope::UserCredential(c1.id))
+            .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None)
+            .await;
+        let c2 = manager
+            .acquire_context(None, None, Some("sess-A"))
+            .await
+            .unwrap();
+        assert_eq!(c2.id, c1.id, "冷却短于阈值应继续黏原号");
+    }
+
+    // 原号冷却久于阈值且不在防抖窗口：切到另一个号。
+    #[tokio::test]
+    async fn test_affinity_switches_when_bound_account_deeply_cooled() {
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.switch_threshold_secs = 1; // 冷却 >1s 即切
+        config.adaptive_limit.multi_account.switch_debounce_secs = 0; // 不防抖
+        config.adaptive_limit.user_cooldown_base_secs = 10; // 撞一次冷却 ~10s
+        let manager = affinity_manager(config);
+        let c1 = manager
+            .acquire_context(None, None, Some("sess-A"))
+            .await
+            .unwrap();
+        manager
+            .limiters()
+            .for_scope(&ThrottleScope::UserCredential(c1.id))
+            .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None)
+            .await;
+        let c2 = manager
+            .acquire_context(None, None, Some("sess-A"))
+            .await
+            .unwrap();
+        assert_ne!(c2.id, c1.id, "原号冷却过久应切到另一个号");
+    }
+
+    // 切号防抖：冷却虽久，但仍在 switch_debounce 窗口内 → 不切号。
+    #[tokio::test]
+    async fn test_affinity_switch_debounced() {
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.switch_threshold_secs = 1;
+        config.adaptive_limit.multi_account.switch_debounce_secs = 3600; // 长防抖
+        config.adaptive_limit.user_cooldown_base_secs = 10;
+        let manager = affinity_manager(config);
+        let c1 = manager
+            .acquire_context(None, None, Some("sess-A"))
+            .await
+            .unwrap();
+        manager
+            .limiters()
+            .for_scope(&ThrottleScope::UserCredential(c1.id))
+            .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None)
+            .await;
+        // 模拟「刚切过号」：last_switch_at = now，落在防抖窗口内。
+        {
+            let mut aff = manager.affinity.lock();
+            if let Some(b) = aff.get_mut("sess-A") {
+                b.last_switch_at = Some(Utc::now());
+            }
+        }
+        let c2 = manager
+            .acquire_context(None, None, Some("sess-A"))
+            .await
+            .unwrap();
+        assert_eq!(c2.id, c1.id, "防抖窗口内即便冷却过久也不应切号");
+    }
+
+    // TTL 过期：陈旧绑定被当作新会话重新落号（不黏旧号）。
+    #[test]
+    fn test_affinity_ttl_expired_rebinds() {
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.affinity_ttl_secs = 60;
+        let manager = affinity_manager(config);
+        // 手动插入一条 2 小时前的过期绑定，指向 id2。
+        {
+            let mut aff = manager.affinity.lock();
+            aff.insert(
+                "sess-old".to_string(),
+                AffinityBinding {
+                    credential_id: 2,
+                    bound_at: Utc::now() - Duration::hours(2),
+                    last_seen: Utc::now() - Duration::hours(2),
+                    last_switch_at: None,
+                },
+            );
+        }
+        // 过期 → 视为新会话 → 落最低负载（两号 RPM 均 0 → 平局取 id1）。
+        let pick = manager
+            .select_with_affinity(None, None, Some("sess-old"))
+            .unwrap();
+        assert_eq!(pick.0, 1, "过期绑定应被当作新会话重新落号");
+        // 绑定被刷新为新号，last_seen 也被刷新。
+        let b = manager.affinity.lock().get("sess-old").cloned().unwrap();
+        assert_eq!(b.credential_id, 1);
+        assert!((Utc::now() - b.last_seen) < Duration::minutes(1));
+    }
+
+    // 原号被禁用（不可用）→ 强制切到可用号。
+    #[tokio::test]
+    async fn test_affinity_force_switch_when_bound_disabled() {
+        let manager = affinity_manager(Config::default());
+        let c1 = manager
+            .acquire_context(None, None, Some("sess-A"))
+            .await
+            .unwrap();
+        manager.set_disabled(c1.id, true).unwrap();
+        let c2 = manager
+            .acquire_context(None, None, Some("sess-A"))
+            .await
+            .unwrap();
+        assert_ne!(c2.id, c1.id, "原号禁用后应强制切到另一个可用号");
     }
 }

@@ -286,6 +286,9 @@ pub struct ConversionResult {
     /// Additional model request fields (including `output_config.effort`), translated from the
     /// `output_config` field of the client's Anthropic request. Not sent when empty.
     pub additional_model_request_fields: Option<AdditionalModelRequestFields>,
+    /// 从 `metadata.user_id` 提取到的**真实** session UUID（用于多号 session affinity 的黏定锚点）。
+    /// `None` 表示客户端未提供可解析的 session（此时 conversation_id 是随机兜底 UUID，不应据此黏号）。
+    pub affinity_session_id: Option<String>,
 }
 
 /// 转换错误
@@ -339,6 +342,17 @@ fn extract_session_id(user_id: &str) -> Option<String> {
 /// 简单验证 UUID 格式（36 字符，包含 4 个连字符）
 fn is_valid_uuid(s: &str) -> bool {
     s.len() == 36 && s.chars().filter(|c| *c == '-').count() == 4
+}
+
+/// 从请求的 `metadata.user_id` 提取真实 session id（与 [`convert_request`] 同口径）。
+/// 供 web_search 等「在 convert_request 之前 / 之外就需要 session 锚点」的路径复用，
+/// 确保同一会话的对话轮 + 内部 web_search 轮 + MCP 搜索都黏在同一个号上。
+/// `None` 表示无可解析 session（不应据此做 affinity 黏定）。
+pub(crate) fn extract_affinity_session_id(req: &MessagesRequest) -> Option<String> {
+    req.metadata
+        .as_ref()
+        .and_then(|m| m.user_id.as_ref())
+        .and_then(|user_id| extract_session_id(user_id))
 }
 
 /// 收集历史消息中使用的所有工具名称
@@ -404,12 +418,15 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
     };
 
     // 3. 生成会话 ID 和代理 ID
-    // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId
-    let conversation_id = req
+    // 优先从 metadata.user_id 中提取 session UUID 作为 conversationId。
+    // 同时保留「提取到的真实 session id」（兜底前的值）用于多号 session affinity 黏定。
+    let affinity_session_id = req
         .metadata
         .as_ref()
         .and_then(|m| m.user_id.as_ref())
-        .and_then(|user_id| extract_session_id(user_id))
+        .and_then(|user_id| extract_session_id(user_id));
+    let conversation_id = affinity_session_id
+        .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let agent_continuation_id = Uuid::new_v4().to_string();
 
@@ -512,6 +529,7 @@ pub fn convert_request(req: &MessagesRequest) -> Result<ConversionResult, Conver
         tool_name_map,
         known_tool_names,
         additional_model_request_fields,
+        affinity_session_id,
     })
 }
 

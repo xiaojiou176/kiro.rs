@@ -274,6 +274,19 @@ async fn main() {
         });
     }
 
+    // 周期性兜底刷盘会话亲和映射：debounce 窗口内积累的新绑定每 30s 落一次盘，
+    // 把「重启后同会话黏号」的最长丢失窗口压到刷盘间隔内。
+    {
+        let tm = token_manager.clone();
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(30);
+            loop {
+                tokio::time::sleep(interval).await;
+                tm.flush_affinity_if_dirty();
+            }
+        });
+    }
+
     // 每次启动幂等确保 config.apiKey 对应的系统 Key 存在（不可删除 / 不可轮换）。
     // 老部署升级时会把已有的 apiKey 补成系统 Key，保证根密钥始终可用于 /v1 流量。
     if let Some(initial_key) = bootstrap_key.as_ref() {

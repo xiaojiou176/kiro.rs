@@ -240,7 +240,13 @@ async fn run_round(
         }
     };
 
-    let call_result = match provider.call_api_stream(&request_body, None, group).await {
+    // 同一会话的 web_search 回灌轮次必须黏在同一个号上（与外层对话一致）：
+    // 否则单个会话会被拆到多个号 = 同机跨号同会话，触发风控。用真实 session id 做锚点。
+    let session_key = conversion.affinity_session_id.clone();
+    let call_result = match provider
+        .call_api_stream(&request_body, None, group, session_key.as_deref())
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");
@@ -533,6 +539,10 @@ pub(super) async fn run_web_search_loop(
         payload.tools.clone(),
     ) as i32;
 
+    // 会话亲和锚点：本会话所有 web_search MCP 搜索都黏到该会话的号（与对话轮一致），
+    // 避免单会话的对话与搜索分散到不同号 = 同机跨号同会话风控。
+    let session_key = super::converter::extract_affinity_session_id(&payload);
+
     let mut presentation: Vec<Value> = Vec::new();
     let mut last_credential_id: u64 = 0;
     let mut last_context_input: Option<i32> = None;
@@ -553,7 +563,7 @@ pub(super) async fn run_web_search_loop(
             let mut searched: Vec<Option<WebSearchResults>> = Vec::with_capacity(round.tool_uses.len());
             for tu in &round.tool_uses {
                 let (_id, mcp_request) = websearch::create_mcp_request(&tu.query());
-                match websearch::call_mcp_api(&provider, &mcp_request).await {
+                match websearch::call_mcp_api(&provider, &mcp_request, session_key.as_deref()).await {
                     Ok(resp) => searched.push(websearch::parse_search_results(&resp)),
                     Err(e) => {
                         tracing::warn!("web_search MCP call failed: {}", e);
@@ -592,7 +602,7 @@ pub(super) async fn run_web_search_loop(
         for tu in &round.tool_uses {
             if tu.name == "web_search" {
                 let (_id, mcp_request) = websearch::create_mcp_request(&tu.query());
-                match websearch::call_mcp_api(&provider, &mcp_request).await {
+                match websearch::call_mcp_api(&provider, &mcp_request, session_key.as_deref()).await {
                     Ok(resp) => searched.push(websearch::parse_search_results(&resp)),
                     Err(e) => {
                         // Same pass-through discipline as the continue branch: a failed

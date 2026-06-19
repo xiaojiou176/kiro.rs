@@ -780,6 +780,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            conversion_result.affinity_session_id.clone(),
         )
         .await
     } else {
@@ -806,6 +807,7 @@ pub async fn post_messages(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            conversion_result.affinity_session_id.clone(),
         )
         .await
     }
@@ -824,9 +826,18 @@ async fn handle_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    session_key: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider
+        .call_api_stream(
+            request_body,
+            Some(tracer.as_ref()),
+            group.as_deref(),
+            session_key.as_deref(),
+        )
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
@@ -1023,9 +1034,18 @@ async fn handle_non_stream_request(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    session_key: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider
+        .call_api(
+            request_body,
+            Some(tracer.as_ref()),
+            group.as_deref(),
+            session_key.as_deref(),
+        )
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, input_tokens, 0, 0, 0, 0.0, "error");
@@ -1538,6 +1558,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            conversion_result.affinity_session_id.clone(),
         )
         .await
     } else {
@@ -1564,6 +1585,7 @@ pub async fn post_messages_cc(
             cache_usage,
             tracer,
             key_ctx.group.clone(),
+            conversion_result.affinity_session_id.clone(),
         )
         .await
     }
@@ -1585,9 +1607,18 @@ async fn handle_stream_request_buffered(
     cache_usage: super::cache_metering::CacheUsage,
     tracer: std::sync::Arc<RequestTracer>,
     group: Option<String>,
+    session_key: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider.call_api_stream(request_body, Some(tracer.as_ref()), group.as_deref()).await {
+    let call_result = match provider
+        .call_api_stream(
+            request_body,
+            Some(tracer.as_ref()),
+            group.as_deref(),
+            session_key.as_deref(),
+        )
+        .await
+    {
         Ok(resp) => resp,
         Err(e) => {
             hook.record(0, fallback_input_tokens, 0, 0, 0, 0.0, "error");

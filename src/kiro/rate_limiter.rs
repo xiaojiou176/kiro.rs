@@ -167,6 +167,23 @@ impl AdaptiveLimiter {
         self.state.lock().rate_rps
     }
 
+    /// 当前剩余冷却时长（供多号 session affinity 的「冷却过久就切号」判定使用）。
+    /// 无冷却或已到期时返回 [`Duration::ZERO`]。
+    pub fn cooldown_remaining(&self) -> Duration {
+        let st = self.state.lock();
+        match st.cooldown_until {
+            Some(until) => {
+                let now = Instant::now();
+                if until > now {
+                    until - now
+                } else {
+                    Duration::ZERO
+                }
+            }
+            None => Duration::ZERO,
+        }
+    }
+
     /// 强制 shadow 语义：只计算"本应等多久 / 本应什么速率"，不阻塞、不占并发许可。
     /// 用于灰度 retry_only 阶段对初始请求（attempt 0）的观测。
     pub fn acquire_shadow(&self) -> AcquireOutcome {
@@ -374,6 +391,27 @@ impl LimiterRegistry {
         map.insert(key, limiter.clone());
         limiter
     }
+
+    /// 查询某 scope 的剩余冷却时长（供选号阶段判断「该号是否卡得太久」）。
+    /// 用 `get` 而非 `for_scope`：尚未出现过的号视为无冷却（[`Duration::ZERO`]），
+    /// 避免在选号只读路径上为其凭空创建 limiter。
+    pub fn cooldown_remaining(&self, scope: &ThrottleScope) -> Duration {
+        let key = scope.key();
+        let map = self.map.lock();
+        match map.get(&key) {
+            Some(l) => l.cooldown_remaining(),
+            None => Duration::ZERO,
+        }
+    }
+
+    /// 只读观测快照：返回某 scope 当前 limiter 的 `(rate_rps, cooldown_remaining)`。
+    /// 尚未出现过的 scope 返回 `None`（不创建 limiter），供观测面板展示。
+    pub fn observe(&self, scope: &ThrottleScope) -> Option<(f64, Duration)> {
+        let key = scope.key();
+        let map = self.map.lock();
+        map.get(&key)
+            .map(|l| (l.current_rate_rps(), l.cooldown_remaining()))
+    }
 }
 
 #[cfg(test)]
@@ -524,5 +562,25 @@ mod tests {
         let a2 = reg.for_scope(&ThrottleScope::UserCredential(17));
         assert!(!Arc::ptr_eq(&a, &b), "不同号应是不同 limiter");
         assert!(Arc::ptr_eq(&a, &a2), "同号应复用同一 limiter");
+    }
+
+    // 单测9：cooldown_remaining —— 撞 429 后剩余冷却 > 0；未撞则为 0。
+    #[tokio::test]
+    async fn test_cooldown_remaining_reports_after_throttle() {
+        let lim = AdaptiveLimiter::new(test_cfg());
+        assert_eq!(lim.cooldown_remaining(), Duration::ZERO, "未限流应无冷却");
+        lim.on_throttle(ThrottleReason::UserRate, None).await;
+        assert!(
+            lim.cooldown_remaining() > Duration::ZERO,
+            "429 后应进入正剩余冷却"
+        );
+    }
+
+    // 单测10：registry.cooldown_remaining —— 未出现过的 scope 视为无冷却，不创建 limiter。
+    #[test]
+    fn test_registry_cooldown_remaining_absent_scope_is_zero() {
+        let reg = LimiterRegistry::new(test_cfg());
+        let cd = reg.cooldown_remaining(&ThrottleScope::UserCredential(999));
+        assert_eq!(cd, Duration::ZERO, "未知号应返回 0 且不创建 limiter");
     }
 }

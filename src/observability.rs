@@ -240,7 +240,7 @@ pub fn capture_outbound(
     }
 }
 
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;

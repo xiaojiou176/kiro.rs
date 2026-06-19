@@ -279,11 +279,36 @@ pub struct MultiAccountConfig {
     /// 是否开启多账号并发分流。默认 false（Owner 红线：同机多号被 AWS 当“一人多开”全封）。
     #[serde(default)]
     pub enabled: bool,
+    /// session affinity：黏定的号若处于冷却且剩余 > 此秒数，则切换到负载最低的号（不再黏回旧号）。
+    /// 默认 15 秒（实测正常 429 冷却仅几秒，15s 只在真卡很久时触发切号，避免反复横跳）。
+    #[serde(default = "default_switch_threshold_secs")]
+    pub switch_threshold_secs: u64,
+    /// 会话绑定的存活时长（秒）。超过此时长未活动则释放绑定。默认 3600（1 小时）。
+    #[serde(default = "default_affinity_ttl_secs")]
+    pub affinity_ttl_secs: u64,
+    /// 切号后的防抖窗口（秒）：同一会话切号后此窗口内不再切，防止反复横跳。默认 30。
+    #[serde(default = "default_switch_debounce_secs")]
+    pub switch_debounce_secs: u64,
+    /// 负载再平衡的「活跃会话」窗口（秒）：只统计 `last_seen` 在此窗口内的会话作为各号活跃负载。
+    /// 默认 300（5 分钟）——比 affinity TTL 短，反映「当前真正在用」的会话。
+    #[serde(default = "default_rebalance_active_window_secs")]
+    pub rebalance_active_window_secs: u64,
+    /// 负载再平衡触发的活跃会话数差距阈值（滞后/防横跳）：仅当「原号活跃会话数 − 最空号活跃会话数 ≥ 此值」
+    /// 才把当前会话迁到最空号。默认 2（≥2 保证迁移后两边不会立刻反向触发）。0 表示关闭被动再平衡。
+    #[serde(default = "default_rebalance_min_gap")]
+    pub rebalance_min_gap: usize,
 }
 
 impl Default for MultiAccountConfig {
     fn default() -> Self {
-        Self { enabled: false }
+        Self {
+            enabled: false,
+            switch_threshold_secs: default_switch_threshold_secs(),
+            affinity_ttl_secs: default_affinity_ttl_secs(),
+            switch_debounce_secs: default_switch_debounce_secs(),
+            rebalance_active_window_secs: default_rebalance_active_window_secs(),
+            rebalance_min_gap: default_rebalance_min_gap(),
+        }
     }
 }
 
@@ -425,6 +450,21 @@ fn default_degraded_429_rate() -> f64 {
 }
 fn default_degraded_duration_secs() -> u64 {
     180
+}
+fn default_switch_threshold_secs() -> u64 {
+    15
+}
+fn default_affinity_ttl_secs() -> u64 {
+    3600
+}
+fn default_switch_debounce_secs() -> u64 {
+    30
+}
+fn default_rebalance_active_window_secs() -> u64 {
+    300
+}
+fn default_rebalance_min_gap() -> usize {
+    2
 }
 
 impl Default for Config {

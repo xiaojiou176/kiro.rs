@@ -514,8 +514,9 @@ pub async fn handle_websearch_request(
     // 2. 创建 MCP 请求
     let (tool_use_id, mcp_request) = create_mcp_request(&query);
 
-    // 3. 调用 Kiro MCP API
-    let search_results = match call_mcp_api(&provider, &mcp_request).await {
+    // 3. 调用 Kiro MCP API（带会话亲和锚点，单查询搜索也黏定到该会话的号）
+    let session_key = super::converter::extract_affinity_session_id(payload);
+    let search_results = match call_mcp_api(&provider, &mcp_request, session_key.as_deref()).await {
         Ok(response) => parse_search_results(&response),
         Err(e) => {
             tracing::warn!("MCP API 调用失败: {}", e);
@@ -541,12 +542,13 @@ pub async fn handle_websearch_request(
 pub(crate) async fn call_mcp_api(
     provider: &crate::kiro::provider::KiroProvider,
     request: &McpRequest,
+    session_key: Option<&str>,
 ) -> anyhow::Result<McpResponse> {
     let request_body = serde_json::to_string(request)?;
 
     tracing::debug!("MCP request: {}", request_body);
 
-    let response = provider.call_mcp(&request_body).await?;
+    let response = provider.call_mcp(&request_body, session_key).await?;
 
     let body = response.text().await?;
     tracing::debug!("MCP response: {}", body);

@@ -17,7 +17,7 @@ use crate::kiro::endpoint::{KiroEndpoint, RequestContext};
 use crate::kiro::machine_id;
 use crate::kiro::model::credentials::KiroCredentials;
 use crate::kiro::rate_limiter::{
-    AcquireOutcome, AdaptiveConfig, LimiterRegistry, ThrottleScope, classify_throttle_reason,
+    AcquireOutcome, LimiterRegistry, ThrottleScope, classify_throttle_reason,
 };
 use crate::kiro::token_manager::MultiTokenManager;
 use crate::model::config::TlsBackend;
@@ -154,14 +154,14 @@ impl KiroProvider {
             build_client(proxy.as_ref(), 720, tls_backend).expect("创建 HTTP 客户端失败");
         let client_cache = ClientCache::new(proxy.clone(), initial_client, CLIENT_CACHE_CAP);
 
-        // 自适应限速器：从 config.adaptive_limit 构建。
-        let adaptive_cfg = AdaptiveConfig::from_cfg(&token_manager.config().adaptive_limit);
+        // 自适应限速器：复用 token_manager 内的同一实例，确保 selection 查询到的「剩余冷却」
+        // 与此处发送前闸门是同一份状态（多号 session affinity 的切号判定依赖这一点）。
         let limiter_enforce_scope = token_manager
             .config()
             .adaptive_limit
             .enforce_scope
             .clone();
-        let limiters = Arc::new(LimiterRegistry::new(adaptive_cfg));
+        let limiters = token_manager.limiters();
 
         Self {
             token_manager,
@@ -258,8 +258,10 @@ impl KiroProvider {
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        session_key: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, false, sink, group).await
+        self.call_api_with_retry(request_body, false, sink, group, session_key)
+            .await
     }
 
     /// 发送流式 API 请求
@@ -268,25 +270,37 @@ impl KiroProvider {
         request_body: &str,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        session_key: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
-        self.call_api_with_retry(request_body, true, sink, group).await
+        self.call_api_with_retry(request_body, true, sink, group, session_key)
+            .await
     }
 
-    /// 发送 MCP API 请求（WebSearch 等工具调用）
-    pub async fn call_mcp(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
-        self.call_mcp_with_retry(request_body).await
+    /// 发送 MCP API 请求（WebSearch 等工具调用）。
+    /// `session_key`：会话亲和锚点——让同一会话的 MCP 搜索与其对话轮黏在同一个号上。
+    pub async fn call_mcp(
+        &self,
+        request_body: &str,
+        session_key: Option<&str>,
+    ) -> anyhow::Result<reqwest::Response> {
+        self.call_mcp_with_retry(request_body, session_key).await
     }
 
     /// 内部方法：带重试逻辑的 MCP API 调用
-    async fn call_mcp_with_retry(&self, request_body: &str) -> anyhow::Result<reqwest::Response> {
+    async fn call_mcp_with_retry(
+        &self,
+        request_body: &str,
+        session_key: Option<&str>,
+    ) -> anyhow::Result<reqwest::Response> {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
-            // MCP 调用（WebSearch 等工具）不涉及模型选择，也不参与分组隔离
-            let ctx = match self.token_manager.acquire_context(None, None).await {
+            // MCP 调用（WebSearch 等工具）不涉及模型选择，也不参与分组隔离；
+            // 但带上 session_key 做会话亲和：同一会话的搜索黏在它的对话号上，避免跨号。
+            let ctx = match self.token_manager.acquire_context(None, None, session_key).await {
                 Ok(c) => c,
                 Err(e) => {
                     last_error = Some(e);
@@ -476,6 +490,7 @@ impl KiroProvider {
         is_stream: bool,
         sink: Option<&dyn TraceSink>,
         group: Option<&str>,
+        session_key: Option<&str>,
     ) -> anyhow::Result<KiroCallResult> {
         // 重试预算按当前请求所属分组的账号数计算，避免小分组按全局账号数获得过多无效重试
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
@@ -490,7 +505,11 @@ impl KiroProvider {
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
-            let mut ctx = match self.token_manager.acquire_context(model.as_deref(), group).await {
+            let mut ctx = match self
+                .token_manager
+                .acquire_context(model.as_deref(), group, session_key)
+                .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     Self::emit_attempt(
