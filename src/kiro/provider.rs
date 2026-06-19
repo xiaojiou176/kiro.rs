@@ -619,6 +619,36 @@ impl KiroProvider {
             }
 
             // 失败响应：读取 body 用于日志/错误信息
+            // 采样上游限流响应头（仅 429）：response.text() 会消费 response，
+            // headers 之后不可访问，故必须在读 body 之前抓取。
+            // 目的：确认 AWS 上游 429 是否返回 Retry-After / x-amz-retry-after / x-ratelimit-*，
+            // 为后续自适应限速的「优先信任上游退避时长」决策提供 runtime 证据。零额外请求、零配额。
+            if status.as_u16() == 429 {
+                let hdrs = response.headers();
+                let retry_after = hdrs
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let amz_retry_after = hdrs
+                    .get("x-amz-retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let throttle_headers: Vec<String> = hdrs
+                    .iter()
+                    .filter(|(k, _)| {
+                        let k = k.as_str().to_ascii_lowercase();
+                        k.contains("retry") || k.contains("ratelimit") || k.starts_with("x-amz")
+                    })
+                    .map(|(k, v)| format!("{}={}", k.as_str(), v.to_str().unwrap_or("<bin>")))
+                    .collect();
+                tracing::warn!(
+                    cred_id = ctx.id,
+                    retry_after = ?retry_after,
+                    x_amz_retry_after = ?amz_retry_after,
+                    throttle_headers = ?throttle_headers,
+                    "AWS 429 响应头采样（用于确认上游是否返回 Retry-After / 限流头）"
+                );
+            }
             let body = response.text().await.unwrap_or_default();
 
             // 402 Payment Required 且额度用尽：禁用凭据并故障转移

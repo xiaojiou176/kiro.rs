@@ -161,6 +161,13 @@ pub struct Config {
     #[serde(default)]
     pub endpoints: HashMap<String, serde_json::Value>,
 
+    /// 自适应限速配置（解决 429）。缺省时使用保守默认值（见 [`AdaptiveLimitConfig`]）。
+    ///
+    /// 设计：user-scope 发送前令牌桶闸门 + AIMD 自适应调速 + 全局 429 冷却 + Fail Aloud。
+    /// 详见 `docs/superpowers/plans/2026-06-19-kiro-adaptive-ratelimit.md`。
+    #[serde(default)]
+    pub adaptive_limit: AdaptiveLimitConfig,
+
     /// 配置文件路径（运行时元数据，不写入 JSON）
     #[serde(skip)]
     config_path: Option<PathBuf>,
@@ -234,6 +241,192 @@ fn default_usage_log_retention_days() -> u32 {
     31
 }
 
+// ===== 自适应限速配置（解决 429） =====
+
+/// Fail Aloud 三档阈值子配置。只报警不熔断；🔴 档=本地返回 429 ≠ 停服。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FailAloudConfig {
+    /// 🟡 Soft Warn：limiter 速率低于此值（rps）持续 `soft_warn_duration_secs` → WARN 日志。
+    #[serde(default = "default_soft_warn_rate_rps")]
+    pub soft_warn_rate_rps: f64,
+    /// 🟡 Soft Warn 持续时长阈值（秒）。
+    #[serde(default = "default_soft_warn_duration_secs")]
+    pub soft_warn_duration_secs: u64,
+    /// 🟠 Degraded：429 率高于此值持续 `degraded_duration_secs` → 响应加 `X-Local-Throttled`。
+    #[serde(default = "default_degraded_429_rate")]
+    pub degraded_429_rate: f64,
+    /// 🟠 Degraded 持续时长阈值（秒）。
+    #[serde(default = "default_degraded_duration_secs")]
+    pub degraded_duration_secs: u64,
+}
+
+impl Default for FailAloudConfig {
+    fn default() -> Self {
+        Self {
+            soft_warn_rate_rps: default_soft_warn_rate_rps(),
+            soft_warn_duration_secs: default_soft_warn_duration_secs(),
+            degraded_429_rate: default_degraded_429_rate(),
+            degraded_duration_secs: default_degraded_duration_secs(),
+        }
+    }
+}
+
+/// 多账号留口子配置。第一版默认关闭（单号优先，不靠多号硬分流）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiAccountConfig {
+    /// 是否开启多账号并发分流。默认 false（Owner 红线：同机多号被 AWS 当“一人多开”全封）。
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Default for MultiAccountConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
+/// 自适应限速主配置。全部带默认值，旧 config 无 `adaptiveLimit` 时零改动即保守默认。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdaptiveLimitConfig {
+    /// 总开关。false 时 limiter 完全不介入，行为等同改造前。
+    #[serde(default = "default_adaptive_enabled")]
+    pub enabled: bool,
+    /// 灰度：false=shadow（只计算决策不拦截）/ true=真拦截。
+    #[serde(default)]
+    pub enforce: bool,
+    /// 灰度作用域："retry_only"（只拦 retry）/ "all"（初始+retry 全拦）。
+    #[serde(default = "default_enforce_scope")]
+    pub enforce_scope: String,
+    /// 初始发送速率（rps）。低于实测安全值 1，避免冷启动撞墙。
+    #[serde(default = "default_initial_rate_rps")]
+    pub initial_rate_rps: f64,
+    /// 最低速率（rps），防止退到 0 死锁。
+    #[serde(default = "default_min_rate_rps")]
+    pub min_rate_rps: f64,
+    /// 最高速率（rps）。先不超过已知会高 429 的 2 rps。
+    #[serde(default = "default_max_rate_rps")]
+    pub max_rate_rps: f64,
+    /// 令牌桶容量（突发）。实测 burst 很小，先禁止瞬时双发。
+    #[serde(default = "default_burst")]
+    pub burst: f64,
+    /// 每个 scope 的最大在飞请求数。第一版 1（毫秒分析：在飞>1.5 升 429）。
+    #[serde(default = "default_max_inflight_per_scope")]
+    pub max_inflight_per_scope: usize,
+    /// AIMD 加性增步长（rps）。
+    #[serde(default = "default_additive_step_rps")]
+    pub additive_step_rps: f64,
+    /// 两次加速之间的最小间隔（秒）。
+    #[serde(default = "default_increase_interval_secs")]
+    pub increase_interval_secs: u64,
+    /// 触发一次加速所需的累计成功数。
+    #[serde(default = "default_successes_per_increase")]
+    pub successes_per_increase: u64,
+    /// 撞 429 时的乘性减速系数（rate *= beta）。
+    #[serde(default = "default_beta_user")]
+    pub beta_user: f64,
+    /// 普通速率限流的基础冷却时长（秒）。
+    #[serde(default = "default_user_cooldown_base_secs")]
+    pub user_cooldown_base_secs: u64,
+    /// 冷却时长封顶（秒）。
+    #[serde(default = "default_cooldown_cap_secs")]
+    pub cooldown_cap_secs: u64,
+    /// Fail Aloud 🔴：acquire 排队预计超此值（秒）→ 本地返回 429，不再压队列。
+    #[serde(default = "default_local_queue_timeout_secs")]
+    pub local_queue_timeout_secs: u64,
+    /// Fail Aloud 三档阈值。
+    #[serde(default)]
+    pub fail_aloud: FailAloudConfig,
+    /// 是否信任上游 Retry-After 头。AWS 实证不返回此头，默认关；逻辑预留。
+    #[serde(default)]
+    pub respect_retry_after: bool,
+    /// 多账号留口。默认关闭。
+    #[serde(default)]
+    pub multi_account: MultiAccountConfig,
+}
+
+impl Default for AdaptiveLimitConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_adaptive_enabled(),
+            enforce: false,
+            enforce_scope: default_enforce_scope(),
+            initial_rate_rps: default_initial_rate_rps(),
+            min_rate_rps: default_min_rate_rps(),
+            max_rate_rps: default_max_rate_rps(),
+            burst: default_burst(),
+            max_inflight_per_scope: default_max_inflight_per_scope(),
+            additive_step_rps: default_additive_step_rps(),
+            increase_interval_secs: default_increase_interval_secs(),
+            successes_per_increase: default_successes_per_increase(),
+            beta_user: default_beta_user(),
+            user_cooldown_base_secs: default_user_cooldown_base_secs(),
+            cooldown_cap_secs: default_cooldown_cap_secs(),
+            local_queue_timeout_secs: default_local_queue_timeout_secs(),
+            fail_aloud: FailAloudConfig::default(),
+            respect_retry_after: false,
+            multi_account: MultiAccountConfig::default(),
+        }
+    }
+}
+
+fn default_adaptive_enabled() -> bool {
+    true
+}
+fn default_enforce_scope() -> String {
+    "retry_only".to_string()
+}
+fn default_initial_rate_rps() -> f64 {
+    0.8
+}
+fn default_min_rate_rps() -> f64 {
+    0.1
+}
+fn default_max_rate_rps() -> f64 {
+    2.0
+}
+fn default_burst() -> f64 {
+    1.0
+}
+fn default_max_inflight_per_scope() -> usize {
+    1
+}
+fn default_additive_step_rps() -> f64 {
+    0.05
+}
+fn default_increase_interval_secs() -> u64 {
+    30
+}
+fn default_successes_per_increase() -> u64 {
+    20
+}
+fn default_beta_user() -> f64 {
+    0.5
+}
+fn default_user_cooldown_base_secs() -> u64 {
+    5
+}
+fn default_cooldown_cap_secs() -> u64 {
+    120
+}
+fn default_local_queue_timeout_secs() -> u64 {
+    90
+}
+fn default_soft_warn_rate_rps() -> f64 {
+    0.3
+}
+fn default_soft_warn_duration_secs() -> u64 {
+    180
+}
+fn default_degraded_429_rate() -> f64 {
+    0.2
+}
+fn default_degraded_duration_secs() -> u64 {
+    180
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -269,6 +462,7 @@ impl Default for Config {
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
             endpoints: HashMap::new(),
+            adaptive_limit: AdaptiveLimitConfig::default(),
             config_path: None,
         }
     }
@@ -332,5 +526,44 @@ impl Config {
         fs::write(path, content)
             .with_context(|| format!("写入配置文件失败: {}", path.display()))?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod adaptive_limit_tests {
+    use super::*;
+
+    #[test]
+    fn adaptive_limit_defaults_are_conservative() {
+        let c = AdaptiveLimitConfig::default();
+        assert!(c.enabled, "默认应启用（但 enforce=false 走 shadow）");
+        assert!(!c.enforce, "默认 shadow，不真拦截");
+        assert_eq!(c.enforce_scope, "retry_only");
+        assert_eq!(c.initial_rate_rps, 0.8);
+        assert_eq!(c.min_rate_rps, 0.1);
+        assert_eq!(c.max_rate_rps, 2.0);
+        assert_eq!(c.burst, 1.0);
+        assert_eq!(c.max_inflight_per_scope, 1, "第一版必须为 1");
+        assert_eq!(c.beta_user, 0.5);
+        assert_eq!(c.local_queue_timeout_secs, 90);
+        assert!(!c.respect_retry_after, "AWS 不返回 Retry-After，默认关");
+        assert!(!c.multi_account.enabled, "多号留口默认关");
+    }
+
+    #[test]
+    fn config_without_adaptive_limit_uses_defaults() {
+        // 旧 config（无 adaptiveLimit 字段）反序列化后应回落到保守默认。
+        let json = r#"{"host":"127.0.0.1","port":8318}"#;
+        let c: Config = serde_json::from_str(json).expect("应能反序列化旧 config");
+        assert!(c.adaptive_limit.enabled);
+        assert_eq!(c.adaptive_limit.max_inflight_per_scope, 1);
+        assert!(!c.adaptive_limit.enforce);
+    }
+
+    #[test]
+    fn fail_aloud_defaults() {
+        let f = FailAloudConfig::default();
+        assert_eq!(f.degraded_429_rate, 0.2);
+        assert_eq!(f.soft_warn_rate_rps, 0.3);
     }
 }
