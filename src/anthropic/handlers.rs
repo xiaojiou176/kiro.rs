@@ -348,9 +348,9 @@ pub(super) fn map_provider_error(err: Error) -> Response {
             .into_response();
     }
 
-    // Fail Aloud 🔴：本地自适应限速器主动拒绝（排队预计过久 / 上游持续限流）。
-    // 不是上游错误，是我们本地"明确失败而非静默排队"。返回 429 + 可解释响应头。
-    // 形如：kiro_local_throttled reason=local_queue_timeout est_wait_ms=95000 rate_rps=0.100
+    // Fail Aloud（历史）：本地 adaptive limiter 主动拒绝。
+    // Absorb-First 后 provider 不再 bail kiro_local_throttled；此分支仅兜底上游路径残留。
+    // 形如：kiro_local_throttled reason=absorb_timeout est_wait_ms=95000 rate_rps=0.100
     if err_str.contains("kiro_local_throttled") {
         let parse_kv = |key: &str| -> Option<String> {
             err_str

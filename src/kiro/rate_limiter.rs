@@ -62,6 +62,15 @@ pub fn classify_throttle_reason(body: &str) -> ThrottleReason {
     }
 }
 
+/// EWMA 偶发 lo>hi 时规范化，避免 f64::clamp panic。
+fn normalize_learned_bounds((lo, hi): (f64, f64)) -> (f64, f64) {
+    if lo <= hi {
+        (lo, hi)
+    } else {
+        (hi, lo)
+    }
+}
+
 /// 账号熔断状态（对外观测）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -91,6 +100,10 @@ pub struct AdaptiveConfig {
     pub enforce: bool,
     pub initial_rate_rps: f64,
     pub min_rate_rps: f64,
+    pub absolute_min_rate_rps: f64,
+    pub learned_floor_factor: f64,
+    pub learning_min_samples_for_floor: u64,
+    pub max_absorb_wait: Duration,
     pub max_rate_rps: f64,
     pub burst: f64,
     pub hard_max_inflight: usize,
@@ -131,6 +144,10 @@ impl AdaptiveConfig {
             enforce: c.enforce,
             initial_rate_rps: initial,
             min_rate_rps: min_rate,
+            absolute_min_rate_rps: c.absolute_min_rate_rps.max(0.001),
+            learned_floor_factor: c.learned_floor_factor.clamp(0.1, 1.0),
+            learning_min_samples_for_floor: c.learning_min_samples_for_floor.max(1),
+            max_absorb_wait: Duration::from_secs(c.max_absorb_wait_secs.max(1)),
             max_rate_rps: max_rate,
             burst: c.burst.max(1.0),
             hard_max_inflight: ac.hard_max_inflight.max(ac.min_inflight).max(1),
@@ -210,8 +227,12 @@ impl AdaptiveLimiter {
         let effective = cfg.min_inflight.min(hard);
         let inflight = Arc::new(Semaphore::new(hard));
         let initial_rate = if let (Some(id), Some(store)) = (credential_id, &learning) {
-            let (lo, hi) = store.learned_safe_rps(id);
-            cfg.initial_rate_rps.clamp(lo, hi)
+            if store.learning_is_mature(id, cfg.learning_min_samples_for_floor) {
+                let (lo, hi) = normalize_learned_bounds(store.learned_safe_rps(id));
+                cfg.initial_rate_rps.clamp(lo, hi)
+            } else {
+                cfg.initial_rate_rps
+            }
         } else {
             cfg.initial_rate_rps
         };
@@ -244,27 +265,49 @@ impl AdaptiveLimiter {
         Self::new_with_context(cfg, None, None)
     }
 
+    fn learned_bounds_if_mature(&self) -> Option<(f64, f64)> {
+        let id = self.credential_id?;
+        let store = self.learning.as_ref()?;
+        if !store.learning_is_mature(id, self.cfg.learning_min_samples_for_floor) {
+            return None;
+        }
+        Some(normalize_learned_bounds(store.learned_safe_rps(id)))
+    }
+
+    fn effective_rate_floor(&self) -> f64 {
+        let absolute = self.cfg.absolute_min_rate_rps.max(0.001);
+        if let Some((lo, _)) = self.learned_bounds_if_mature() {
+            return (lo * self.cfg.learned_floor_factor).max(absolute);
+        }
+        self.cfg.min_rate_rps
+    }
+
+    fn learned_probe_cap(&self) -> f64 {
+        if let Some((_, hi)) = self.learned_bounds_if_mature() {
+            hi.min(self.cfg.max_rate_rps)
+        } else {
+            self.cfg.max_rate_rps
+        }
+    }
+
     pub fn current_rate_rps(&self) -> f64 {
         self.state.lock().rate_rps
     }
 
     pub fn cooldown_remaining(&self) -> Duration {
-        let st = self.state.lock();
+        Self::cooldown_remaining_from_state(&self.state.lock())
+    }
+
+    fn cooldown_remaining_from_state(st: &State) -> Duration {
+        let now = Instant::now();
         match st.cooldown_until {
-            Some(until) => {
-                let now = Instant::now();
-                if until > now {
-                    until - now
-                } else {
-                    Duration::ZERO
-                }
-            }
-            None => Duration::ZERO,
+            Some(until) if until > now => until - now,
+            _ => Duration::ZERO,
         }
     }
 
-    pub fn account_state(&self) -> (AccountState, String, u64) {
-        let st = self.state.lock();
+    fn circuit_snapshot(st: &mut State) -> (AccountState, String, u64) {
+        Self::maybe_advance_circuit(st);
         let now = Instant::now();
         match &st.circuit {
             CircuitState::Healthy => (AccountState::Healthy, String::new(), 0),
@@ -278,6 +321,11 @@ impl AdaptiveLimiter {
             }
             CircuitState::HalfOpen { .. } => (AccountState::HalfOpen, "canary_probe".into(), 0),
         }
+    }
+
+    pub fn account_state(&self) -> (AccountState, String, u64) {
+        let mut st = self.state.lock();
+        Self::circuit_snapshot(&mut st)
     }
 
     pub fn is_open(&self) -> bool {
@@ -301,11 +349,15 @@ impl AdaptiveLimiter {
     }
 
     pub fn observe_full(&self) -> LimiterObservation {
-        let st = self.state.lock();
-        let (state, reason, reopen_ms) = self.account_state_from_circuit(&st.circuit);
+        let mut st = self.state.lock();
+        let (state, reason, reopen_ms) = Self::circuit_snapshot(&mut st);
         let (safe_lo, safe_hi) = self
             .credential_id
-            .and_then(|id| self.learning.as_ref().map(|s| s.learned_safe_rps(id)))
+            .and_then(|id| {
+                self.learning
+                    .as_ref()
+                    .map(|s| normalize_learned_bounds(s.learned_safe_rps(id)))
+            })
             .unwrap_or((0.5, 1.0));
         let p80 = self
             .credential_id
@@ -331,6 +383,7 @@ impl AdaptiveLimiter {
             current_max_inflight: st.effective_max_inflight,
             current_inflight: self.cfg.hard_max_inflight - self.inflight.available_permits(),
             current_rate_rps: st.rate_rps,
+            effective_rate_floor_rps: self.effective_rate_floor(),
             learned_safe_rps_lo: safe_lo,
             learned_safe_rps_hi: safe_hi,
             p80_held_ms: p80,
@@ -338,7 +391,7 @@ impl AdaptiveLimiter {
             bottleneck_dimension: bottleneck,
             upstream_429_rate_5m: rate_429_locked(&st.upstream_events, self.cfg.probe_window),
             consecutive_throttles: st.consecutive_throttles,
-            cooldown_remaining_ms: self.cooldown_remaining().as_millis() as u64,
+            cooldown_remaining_ms: Self::cooldown_remaining_from_state(&st).as_millis() as u64,
         }
     }
 
@@ -417,7 +470,7 @@ impl AdaptiveLimiter {
         let token_wait = if st.tokens >= 1.0 {
             0
         } else {
-            ((1.0 - st.tokens) / st.rate_rps.max(self.cfg.min_rate_rps) * 1000.0) as u64
+            ((1.0 - st.tokens) / st.rate_rps.max(self.cfg.absolute_min_rate_rps) * 1000.0) as u64
         };
         AcquireOutcome::ShadowProceed {
             would_wait_ms: cd.max(token_wait),
@@ -453,7 +506,8 @@ impl AdaptiveLimiter {
             .await
             .expect("semaphore never closed");
 
-        let deadline = Instant::now() + self.cfg.local_queue_timeout;
+        let absorb_deadline = Instant::now() + self.cfg.max_absorb_wait;
+        let mut slice_deadline = Instant::now() + self.cfg.local_queue_timeout;
         loop {
             let wait = {
                 let mut st = self.state.lock();
@@ -473,7 +527,8 @@ impl AdaptiveLimiter {
                     return AcquireOutcome::Proceed(permit);
                 } else {
                     let missing = 1.0 - st.tokens;
-                    let secs = missing / st.rate_rps.max(self.cfg.min_rate_rps);
+                    let secs = missing
+                        / st.rate_rps.max(self.cfg.absolute_min_rate_rps);
                     Some((Duration::from_secs_f64(secs), st.rate_rps))
                 }
             };
@@ -484,17 +539,31 @@ impl AdaptiveLimiter {
             };
 
             let now = Instant::now();
-            if now + wait_dur > deadline {
+            if now + wait_dur > slice_deadline {
+                if now < absorb_deadline {
+                    let capped = wait_dur.min(absorb_deadline.saturating_duration_since(now));
+                    let wait_dur = add_small_jitter(capped);
+                    tokio::select! {
+                        _ = sleep(wait_dur) => {}
+                        _ = self.notify.notified() => {}
+                    }
+                    slice_deadline = Instant::now() + self.cfg.local_queue_timeout;
+                    continue;
+                }
+                let at_effective_floor =
+                    current_rps <= self.effective_rate_floor() + f64::EPSILON;
+                let upstream_hot =
+                    self.upstream_429_rate() > self.cfg.probe_budget_high;
                 let est_wait_ms = wait_dur.as_millis() as u64;
                 drop(permit);
                 self.clear_half_open_canary();
                 return AcquireOutcome::LocalThrottled {
                     est_wait_ms,
                     current_rps,
-                    reason: if current_rps <= self.cfg.min_rate_rps + f64::EPSILON {
+                    reason: if at_effective_floor && upstream_hot {
                         "upstream_throttle_storm"
                     } else {
-                        "local_queue_timeout"
+                        "absorb_timeout"
                     },
                 };
             }
@@ -520,7 +589,8 @@ impl AdaptiveLimiter {
                 }));
             }
         }
-        if let CircuitState::HalfOpen { canary_in_flight, .. } = &mut st.circuit {
+        let half_open_needs_canary = matches!(st.circuit, CircuitState::HalfOpen { .. });
+        if let CircuitState::HalfOpen { canary_in_flight, .. } = &st.circuit {
             if *canary_in_flight {
                 return Some(AcquireDecision::Return(AcquireOutcome::LocalThrottled {
                     est_wait_ms: 500,
@@ -528,14 +598,17 @@ impl AdaptiveLimiter {
                     reason: "account_open",
                 }));
             }
-            *canary_in_flight = true;
         }
         let in_flight = self.cfg.hard_max_inflight - self.inflight.available_permits();
         if in_flight >= st.effective_max_inflight {
-            Some(AcquireDecision::WaitInflight)
-        } else {
-            Some(AcquireDecision::ProceedToPermit)
+            return Some(AcquireDecision::WaitInflight);
         }
+        if half_open_needs_canary {
+            if let CircuitState::HalfOpen { canary_in_flight, .. } = &mut st.circuit {
+                *canary_in_flight = true;
+            }
+        }
+        Some(AcquireDecision::ProceedToPermit)
     }
 
     fn clear_half_open_canary(&self) {
@@ -543,6 +616,11 @@ impl AdaptiveLimiter {
         if let CircuitState::HalfOpen { canary_in_flight, .. } = &mut st.circuit {
             *canary_in_flight = false;
         }
+    }
+
+    /// Permit 释放且未走 on_success/on_throttle（网络错误、5xx 等）时清 HALF_OPEN canary。
+    pub fn on_acquire_aborted(&self) {
+        self.clear_half_open_canary();
     }
 
     fn note_send(&self) {
@@ -611,16 +689,12 @@ impl AdaptiveLimiter {
                 0.0
             };
             if probe_step > 0.0 {
-                let cap = self
-                    .credential_id
-                    .and_then(|id| self.learning.as_ref().map(|s| s.learned_safe_rps(id).1))
-                    .unwrap_or(self.cfg.max_rate_rps);
-                st.rate_rps = (st.rate_rps + probe_step).min(cap.max(self.cfg.max_rate_rps));
+                let cap = self.learned_probe_cap();
+                st.rate_rps = (st.rate_rps + probe_step).min(cap);
             } else if probe_step < 0.0 {
-                st.rate_rps = (st.rate_rps + probe_step).max(self.cfg.min_rate_rps);
+                st.rate_rps = (st.rate_rps + probe_step).max(self.effective_rate_floor());
             } else {
-                st.rate_rps =
-                    (st.rate_rps + self.cfg.additive_step_rps).min(self.cfg.max_rate_rps);
+                st.rate_rps = (st.rate_rps + self.cfg.additive_step_rps).min(self.learned_probe_cap());
             }
             st.successes_since_increase = 0;
             st.last_increase = now;
@@ -653,7 +727,7 @@ impl AdaptiveLimiter {
             was_429: true,
         });
 
-        let at_min = st.rate_rps <= self.cfg.min_rate_rps + f64::EPSILON;
+        let at_min = st.rate_rps <= self.effective_rate_floor() + f64::EPSILON;
         let should_open = self.cfg.circuit_breaker_enabled
             && (matches!(reason, ThrottleReason::Suspicious)
                 || (at_min && matches!(reason, ThrottleReason::UserRate | ThrottleReason::ServiceRate | ThrottleReason::Unknown))
@@ -673,7 +747,7 @@ impl AdaptiveLimiter {
                 "circuit_open",
             );
             st.tokens = 0.0;
-            st.rate_rps = self.cfg.min_rate_rps;
+            st.rate_rps = self.effective_rate_floor();
             self.notify.notify_waiters();
             return;
         }
@@ -702,7 +776,7 @@ impl AdaptiveLimiter {
             ThrottleReason::Suspicious => 0.1,
             _ => self.cfg.beta_user,
         };
-        st.rate_rps = (st.rate_rps * beta).max(self.cfg.min_rate_rps);
+        st.rate_rps = (st.rate_rps * beta).max(self.effective_rate_floor());
 
         if self.cfg.adaptive_concurrency_enabled {
             let new_eff = ((st.effective_max_inflight as f64) * self.cfg.shrink_factor)
@@ -747,7 +821,15 @@ impl AdaptiveLimiter {
         }
         let (safe_rps, _) = self
             .credential_id
-            .and_then(|id| self.learning.as_ref().map(|s| s.learned_safe_rps(id)))
+            .and_then(|id| {
+                self.learning.as_ref().and_then(|s| {
+                    if !s.learning_is_mature(id, self.cfg.learning_min_samples_for_floor) {
+                        return None;
+                    }
+                    let (lo, hi) = normalize_learned_bounds(s.learned_safe_rps(id));
+                    Some(((lo + hi) / 2.0, hi))
+                })
+            })
             .unwrap_or((st.rate_rps, st.rate_rps));
         let p80_ms = self
             .credential_id
@@ -812,6 +894,7 @@ pub struct LimiterObservation {
     pub current_max_inflight: usize,
     pub current_inflight: usize,
     pub current_rate_rps: f64,
+    pub effective_rate_floor_rps: f64,
     pub learned_safe_rps_lo: f64,
     pub learned_safe_rps_hi: f64,
     pub p80_held_ms: u64,
@@ -964,6 +1047,10 @@ mod tests {
             enforce: true,
             initial_rate_rps: 1.0,
             min_rate_rps: 0.1,
+            absolute_min_rate_rps: 0.02,
+            learned_floor_factor: 0.8,
+            learning_min_samples_for_floor: 20,
+            max_absorb_wait: Duration::from_secs(120),
             max_rate_rps: 2.0,
             burst: 1.0,
             hard_max_inflight: 8,
@@ -1093,10 +1180,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_fail_aloud_local_throttled() {
+    async fn test_absorb_timeout_after_max_wait() {
         let mut cfg = test_cfg();
-        cfg.local_queue_timeout = Duration::from_millis(100);
-        cfg.initial_rate_rps = 0.1;
+        cfg.local_queue_timeout = Duration::from_millis(50);
+        cfg.max_absorb_wait = Duration::from_millis(120);
         cfg.open_429_threshold = 100;
         let lim = AdaptiveLimiter::new(cfg);
         match lim.acquire().await {
@@ -1105,10 +1192,103 @@ mod tests {
         }
         match lim.acquire().await {
             AcquireOutcome::LocalThrottled { reason, .. } => {
+                assert_eq!(reason, "absorb_timeout");
+            }
+            other => panic!("应 LocalThrottled absorb_timeout, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_single_429_does_not_activate_learned_floor() {
+        use crate::kiro::account_learning::{LearningStore, SendContextSample};
+        use crate::model::config::LearningConfig;
+
+        let learning = LearningStore::new(LearningConfig::default(), None);
+        learning.record_sample(
+            99,
+            SendContextSample {
+                inflight: 1,
+                sends_last_1s: 1,
+                rpm_last_60s: 1,
+                send_rate_rps: 0.1,
+                was_429: true,
+            },
+        );
+        let mut cfg = test_cfg();
+        cfg.min_rate_rps = 0.1;
+        cfg.learning_min_samples_for_floor = 20;
+        let lim = AdaptiveLimiter::new_with_context(cfg, Some(99), Some(learning));
+        let floor = lim.observe_full().effective_rate_floor_rps;
+        assert!(
+            (floor - 0.1).abs() < 1e-9,
+            "single 429 must not drop floor below min_rate_rps, got {floor}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_immature_learning_falls_back_to_min_rate_floor() {
+        let mut cfg = test_cfg();
+        cfg.min_rate_rps = 0.1;
+        cfg.learning_min_samples_for_floor = 20;
+        let learning = learning_store_with(66, 0.5, 1.0);
+        let lim = AdaptiveLimiter::new_with_context(cfg, Some(66), Some(learning));
+        let floor = lim.observe_full().effective_rate_floor_rps;
+        assert!((floor - 0.1).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_fail_aloud_storm_when_at_floor_with_upstream_429() {
+        let mut cfg = test_cfg();
+        cfg.local_queue_timeout = Duration::from_millis(50);
+        cfg.max_absorb_wait = Duration::from_millis(120);
+        cfg.initial_rate_rps = 0.1;
+        cfg.open_429_threshold = 100;
+        cfg.circuit_breaker_enabled = false;
+        let lim = AdaptiveLimiter::new(cfg);
+        {
+            let mut st = lim.state.lock();
+            st.rate_rps = 0.2;
+        }
+        lim.on_throttle(ThrottleReason::UserRate, None, 0).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        {
+            let mut st = lim.state.lock();
+            st.tokens = 1.0;
+            st.cooldown_until = None;
+        }
+        match lim.acquire().await {
+            AcquireOutcome::Proceed(_) => {}
+            other => panic!("第1个应 Proceed, got {other:?}"),
+        }
+        match lim.acquire().await {
+            AcquireOutcome::LocalThrottled { reason, .. } => {
                 assert_eq!(reason, "upstream_throttle_storm");
             }
-            other => panic!("应 LocalThrottled, got {other:?}"),
+            other => panic!("应 LocalThrottled storm, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_learned_floor_waits_instead_of_fail_aloud() {
+        let mut cfg = test_cfg();
+        cfg.local_queue_timeout = Duration::from_millis(80);
+        cfg.max_absorb_wait = Duration::from_secs(2);
+        cfg.open_429_threshold = 100;
+        cfg.min_rate_rps = 0.1;
+        cfg.absolute_min_rate_rps = 0.02;
+        cfg.learned_floor_factor = 0.8;
+        let learning = learning_store_with(88, 0.05, 0.06);
+        let lim = AdaptiveLimiter::new_with_context(cfg, Some(88), Some(learning));
+        {
+            let mut st = lim.state.lock();
+            st.rate_rps = 0.04;
+        }
+        match lim.acquire().await {
+            AcquireOutcome::Proceed(_) => {}
+            other => panic!("第1个应 Proceed, got {other:?}"),
+        }
+        let r = tokio::time::timeout(Duration::from_millis(500), lim.acquire()).await;
+        assert!(r.is_err(), "墙下慢速无上游429时应继续等 token，不 Fail Aloud");
     }
 
     #[tokio::test]
@@ -1142,11 +1322,246 @@ mod tests {
         .unwrap();
     }
 
+    #[tokio::test]
+    async fn test_observe_full_under_cooldown_does_not_deadlock() {
+        let lim = AdaptiveLimiter::new(test_cfg());
+        lim.on_throttle(ThrottleReason::UserRate, None, 0).await;
+        let obs = lim.observe_full();
+        assert!(obs.cooldown_remaining_ms > 0 || obs.consecutive_throttles > 0);
+    }
+
+    #[test]
+    fn test_observe_full_concurrent_no_deadlock() {
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration as StdDuration;
+
+        let lim = Arc::new(AdaptiveLimiter::new(test_cfg()));
+        let start = Instant::now();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let lim = lim.clone();
+                thread::spawn(move || {
+                    for _ in 0..20 {
+                        let _ = lim.observe_full();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("observe_full must not deadlock");
+        }
+        assert!(start.elapsed() < StdDuration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn test_half_open_does_not_set_canary_when_inflight_full() {
+        let mut cfg = test_cfg();
+        cfg.hard_max_inflight = 1;
+        cfg.min_inflight = 1;
+        let lim = AdaptiveLimiter::new(cfg);
+        let _held = match lim.acquire().await {
+            AcquireOutcome::Proceed(p) => p,
+            other => panic!("expected Proceed, got {other:?}"),
+        };
+        {
+            let mut st = lim.state.lock();
+            st.circuit = CircuitState::HalfOpen {
+                canary_in_flight: false,
+                successes: 0,
+            };
+        }
+        let r = tokio::time::timeout(Duration::from_millis(100), lim.acquire()).await;
+        assert!(r.is_err(), "inflight full should wait, not return immediately");
+        let st = lim.state.lock();
+        match &st.circuit {
+            CircuitState::HalfOpen { canary_in_flight, .. } => {
+                assert!(!canary_in_flight, "canary must not be claimed while waiting on inflight");
+            }
+            other => panic!("expected HalfOpen, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_expired_open_advances_to_half_open_on_read() {
+        let mut cfg = test_cfg();
+        cfg.initial_quarantine = Duration::from_millis(50);
+        cfg.min_quarantine = Duration::from_millis(50);
+        let lim = AdaptiveLimiter::new(cfg);
+        for _ in 0..3 {
+            lim.on_throttle(ThrottleReason::UserRate, None, 0).await;
+        }
+        assert_eq!(lim.account_state().0, AccountState::Open);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(!lim.is_open(), "expired OPEN must not block selection as OPEN");
+        assert_eq!(lim.account_state().0, AccountState::HalfOpen);
+    }
+
+    #[tokio::test]
+    async fn test_on_acquire_aborted_clears_half_open_canary() {
+        let lim = AdaptiveLimiter::new(test_cfg());
+        {
+            let mut st = lim.state.lock();
+            st.circuit = CircuitState::HalfOpen {
+                canary_in_flight: true,
+                successes: 0,
+            };
+        }
+        lim.on_acquire_aborted();
+        match &lim.state.lock().circuit {
+            CircuitState::HalfOpen { canary_in_flight, .. } => {
+                assert!(!canary_in_flight, "aborted acquire must clear canary");
+            }
+            other => panic!("expected HalfOpen, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_registry_isolates_scopes() {
         let reg = LimiterRegistry::new(test_cfg(), None);
         let a = reg.for_scope(&ThrottleScope::UserCredential(17));
         let b = reg.for_scope(&ThrottleScope::UserCredential(20));
         assert!(!Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn test_normalize_learned_bounds_swaps_inverted() {
+        let (lo, hi) = normalize_learned_bounds((0.101, 0.075));
+        assert!((lo - 0.075).abs() < 1e-9);
+        assert!((hi - 0.101).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_init_rate_no_panic_when_learned_bounds_inverted() {
+        let cfg = test_cfg();
+        let learning = learning_store_with(55, 0.101, 0.075);
+        let lim = AdaptiveLimiter::new_with_context(cfg, Some(55), Some(learning));
+        assert!(lim.current_rate_rps() >= 0.075 - 1e-9);
+        assert!(lim.current_rate_rps() <= 0.101 + 1e-9);
+    }
+
+    fn learning_store_with(id: u64, safe_lo: f64, safe_hi: f64) -> Arc<crate::kiro::account_learning::LearningStore> {
+        use crate::model::config::LearningConfig;
+        let path = std::env::temp_dir().join(format!(
+            "learn_floor_test_{}_{}.json",
+            id,
+            std::process::id()
+        ));
+        let json = format!(
+            r#"{{"accounts":{{"{id}":{{"safeRpsLo":{safe_lo},"safeRpsHi":{safe_hi},"p80HeldMs":30000,"optimalQuarantineSecs":30,"bottleneckDimension":"SendRate"}}}}}}"#,
+            id = id,
+            safe_lo = safe_lo,
+            safe_hi = safe_hi
+        );
+        std::fs::write(&path, json).expect("seed learning file");
+        crate::kiro::account_learning::LearningStore::new(LearningConfig::default(), Some(path))
+    }
+
+    #[tokio::test]
+    async fn test_on_throttle_breaks_static_min_rate_with_learning() {
+        let mut cfg = test_cfg();
+        cfg.open_429_threshold = 100;
+        cfg.min_rate_rps = 0.1;
+        cfg.absolute_min_rate_rps = 0.02;
+        cfg.learned_floor_factor = 0.8;
+        cfg.learning_min_samples_for_floor = 1;
+        let learning = learning_store_with(42, 0.05, 0.06);
+        let lim = AdaptiveLimiter::new_with_context(cfg, Some(42), Some(learning));
+        {
+            let mut st = lim.state.lock();
+            st.rate_rps = 0.1;
+        }
+        lim.on_throttle(ThrottleReason::UserRate, None, 0).await;
+        let after = lim.current_rate_rps();
+        assert!(after < 0.1, "rate should break static min_rate floor, got {after}");
+        assert!(after >= 0.02, "rate must stay above absolute_min, got {after}");
+        assert!((after - 0.05).abs() < 1e-9, "expected 0.05 after halving 0.1, got {after}");
+    }
+
+    #[tokio::test]
+    async fn test_effective_floor_falls_back_to_min_rate_without_learning() {
+        let mut cfg = test_cfg();
+        cfg.open_429_threshold = 100;
+        cfg.min_rate_rps = 0.1;
+        let lim = AdaptiveLimiter::new(cfg);
+        {
+            let mut st = lim.state.lock();
+            st.rate_rps = 0.2;
+        }
+        lim.on_throttle(ThrottleReason::UserRate, None, 0).await;
+        assert!((lim.current_rate_rps() - 0.1).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn test_probe_increase_capped_at_learned_safe_hi() {
+        let mut cfg = test_cfg();
+        cfg.additive_step_rps = 0.05;
+        cfg.increase_interval = Duration::from_millis(0);
+        cfg.successes_per_increase = 1;
+        cfg.probe_budget_low = 0.01;
+        cfg.probe_budget_high = 0.02;
+        cfg.learning_enabled = true;
+        cfg.learning_min_samples_for_floor = 1;
+        let learning = learning_store_with(7, 0.04, 0.08);
+        let lim = AdaptiveLimiter::new_with_context(cfg, Some(7), Some(learning));
+        {
+            let mut st = lim.state.lock();
+            st.rate_rps = 0.04;
+            st.effective_max_inflight = 1;
+        }
+        let _permit = match lim.acquire().await {
+            AcquireOutcome::Proceed(p) => p,
+            other => panic!("expected Proceed, got {other:?}"),
+        };
+        for _ in 0..10 {
+            lim.on_success(0).await;
+        }
+        assert!(
+            lim.current_rate_rps() <= 0.08 + 1e-9,
+            "rate should cap at learned safe_hi 0.08, got {}",
+            lim.current_rate_rps()
+        );
+        assert!(
+            lim.current_rate_rps() > 0.04,
+            "rate should probe upward under low 429 budget, got {}",
+            lim.current_rate_rps()
+        );
+    }
+
+    #[test]
+    fn test_effective_floor_concurrent_no_deadlock() {
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Duration as StdDuration;
+
+        let mut cfg = test_cfg();
+        cfg.learning_enabled = true;
+        let learning = learning_store_with(99, 0.05, 0.07);
+        let lim = Arc::new(AdaptiveLimiter::new_with_context(cfg, Some(99), Some(learning)));
+        let start = Instant::now();
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let lim = lim.clone();
+                thread::spawn(move || {
+                    for _ in 0..20 {
+                        let _ = lim.observe_full();
+                        if i % 2 == 0 {
+                            let rt = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .unwrap();
+                            rt.block_on(async {
+                                lim.on_throttle(ThrottleReason::UserRate, None, 0).await;
+                                lim.on_success(0).await;
+                            });
+                        }
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("concurrent observe/throttle/success must not deadlock");
+        }
+        assert!(start.elapsed() < StdDuration::from_secs(5));
     }
 }

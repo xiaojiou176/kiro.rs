@@ -331,6 +331,18 @@ pub struct AdaptiveLimitConfig {
     /// 最低速率（rps），防止退到 0 死锁。
     #[serde(default = "default_min_rate_rps")]
     pub min_rate_rps: f64,
+    /// 绝对速率下界（rps），与学习下界取 max，防除零/死锁。
+    #[serde(default = "default_absolute_min_rate_rps")]
+    pub absolute_min_rate_rps: f64,
+    /// 有学习数据时：有效下界 = max(absolute_min, safe_rps_lo × 此系数)。
+    #[serde(default = "default_learned_floor_factor")]
+    pub learned_floor_factor: f64,
+    /// 启用 learned floor 所需最少样本数（未成熟则回退 min_rate_rps）。
+    #[serde(default = "default_learning_min_samples_for_floor")]
+    pub learning_min_samples_for_floor: u64,
+    /// acquire 本地排队硬顶（秒）：Absorb-First，在此时间内只等待不 Fail Aloud。
+    #[serde(default = "default_max_absorb_wait_secs")]
+    pub max_absorb_wait_secs: u64,
     /// 最高速率（rps）。先不超过已知会高 429 的 2 rps。
     #[serde(default = "default_max_rate_rps")]
     pub max_rate_rps: f64,
@@ -501,6 +513,10 @@ impl Default for AdaptiveLimitConfig {
             enforce_scope: default_enforce_scope(),
             initial_rate_rps: default_initial_rate_rps(),
             min_rate_rps: default_min_rate_rps(),
+            absolute_min_rate_rps: default_absolute_min_rate_rps(),
+            learned_floor_factor: default_learned_floor_factor(),
+            learning_min_samples_for_floor: default_learning_min_samples_for_floor(),
+            max_absorb_wait_secs: default_max_absorb_wait_secs(),
             max_rate_rps: default_max_rate_rps(),
             burst: default_burst(),
             max_inflight_per_scope: default_max_inflight_per_scope(),
@@ -533,6 +549,18 @@ fn default_initial_rate_rps() -> f64 {
 }
 fn default_min_rate_rps() -> f64 {
     0.1
+}
+fn default_absolute_min_rate_rps() -> f64 {
+    0.02
+}
+fn default_learned_floor_factor() -> f64 {
+    0.8
+}
+fn default_learning_min_samples_for_floor() -> u64 {
+    20
+}
+fn default_max_absorb_wait_secs() -> u64 {
+    120
 }
 fn default_max_rate_rps() -> f64 {
     2.0
@@ -764,6 +792,10 @@ mod adaptive_limit_tests {
         assert_eq!(c.enforce_scope, "retry_only");
         assert_eq!(c.initial_rate_rps, 0.8);
         assert_eq!(c.min_rate_rps, 0.1);
+        assert_eq!(c.absolute_min_rate_rps, 0.02);
+        assert_eq!(c.learned_floor_factor, 0.8);
+        assert_eq!(c.learning_min_samples_for_floor, 20);
+        assert_eq!(c.max_absorb_wait_secs, 120);
         assert_eq!(c.max_rate_rps, 2.0);
         assert_eq!(c.burst, 1.0);
         assert_eq!(c.max_inflight_per_scope, 1, "第一版必须为 1");

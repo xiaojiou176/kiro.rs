@@ -821,6 +821,7 @@ pub struct AccountObservability {
     pub current_max_inflight: usize,
     pub current_inflight: usize,
     pub current_rate_rps: f64,
+    pub effective_rate_floor_rps: f64,
     pub learned_safe_rps_lo: f64,
     pub learned_safe_rps_hi: f64,
     pub p80_held_ms: u64,
@@ -1328,6 +1329,10 @@ impl MultiTokenManager {
                     current_max_inflight: obs.as_ref().map(|o| o.current_max_inflight).unwrap_or(0),
                     current_inflight: obs.as_ref().map(|o| o.current_inflight).unwrap_or(0),
                     current_rate_rps: obs.as_ref().map(|o| o.current_rate_rps).unwrap_or(0.0),
+                    effective_rate_floor_rps: obs
+                        .as_ref()
+                        .map(|o| o.effective_rate_floor_rps)
+                        .unwrap_or(0.1),
                     learned_safe_rps_lo: obs.as_ref().map(|o| o.learned_safe_rps_lo).unwrap_or(0.5),
                     learned_safe_rps_hi: obs.as_ref().map(|o| o.learned_safe_rps_hi).unwrap_or(1.0),
                     p80_held_ms: obs.as_ref().map(|o| o.p80_held_ms).unwrap_or(0),

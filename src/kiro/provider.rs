@@ -34,6 +34,60 @@ const MAX_RETRIES_PER_CREDENTIAL: usize = 3;
 /// 配合 429 专用长退避（见 retry_delay_throttle），被限时尽早返回而非耗尽配额。
 const MAX_TOTAL_RETRIES: usize = 4;
 
+/// 本地 limiter 排队耗尽时的最后状态（用于映射 429 而非 502）。
+#[derive(Debug, Clone, Copy)]
+struct LocalThrottleMarker {
+    reason: &'static str,
+    est_wait_ms: u64,
+    current_rps: f64,
+}
+
+/// 单次 retry attempt 结束时：若仍持有 permit 且未 on_success/on_throttle，清 HALF_OPEN canary。
+struct LimiterAttemptGuard<'a> {
+    provider: &'a KiroProvider,
+    cred_id: u64,
+    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    outcome_recorded: bool,
+}
+
+impl Drop for LimiterAttemptGuard<'_> {
+    fn drop(&mut self) {
+        if self.permit.take().is_some()
+            && !self.outcome_recorded
+            && self.provider.limiters.enabled()
+        {
+            self.provider
+                .limiters
+                .for_scope(&ThrottleScope::UserCredential(self.cred_id))
+                .on_acquire_aborted();
+        }
+    }
+}
+
+impl<'a> LimiterAttemptGuard<'a> {
+    fn new(provider: &'a KiroProvider, cred_id: u64) -> Self {
+        Self {
+            provider,
+            cred_id,
+            permit: None,
+            outcome_recorded: false,
+        }
+    }
+
+    fn set_permit(&mut self, permit: tokio::sync::OwnedSemaphorePermit) {
+        self.permit = Some(permit);
+    }
+
+    fn mark_outcome(&mut self) {
+        self.outcome_recorded = true;
+    }
+
+    fn take_permit_on_success(&mut self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.outcome_recorded = true;
+        self.permit.take()
+    }
+}
+
 /// HTTP Client 缓存容量上限（不含常驻的全局代理 client）。
 /// 代理池条目较多时，避免每个不同代理都常驻一个 reqwest::Client 导致内存无界增长。
 const CLIENT_CACHE_CAP: usize = 64;
@@ -300,10 +354,11 @@ impl KiroProvider {
         let total_credentials = self.token_manager.total_count();
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
+        let mut last_local_throttle: Option<LocalThrottleMarker> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
 
         for attempt in 0..max_retries {
-            // MCP 调用（WebSearch 等工具）不涉及模型选择，也不参与分组隔离；
+            // MCP 调用（WebSearch 等工具）不涉及模型选择
             // 但带上 session_key 做会话亲和：同一会话的搜索黏在它的对话号上，避免跨号。
             let ctx = match self.token_manager.acquire_context(None, None, session_key).await {
                 Ok(c) => c,
@@ -376,7 +431,7 @@ impl KiroProvider {
             }
 
             // ===== 自适应限速发送前闸门（MCP / WebSearch 路径，与 call_api_with_retry 对齐）=====
-            let mut limiter_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
+            let mut limiter_guard = LimiterAttemptGuard::new(self, ctx.id);
             if self.limiters.enabled() {
                 let scope = ThrottleScope::UserCredential(ctx.id);
                 let limiter = self.limiters.for_scope(&scope);
@@ -397,7 +452,7 @@ impl KiroProvider {
                             attempt = attempt,
                             "limiter 放行 (MCP)"
                         );
-                        limiter_permit = Some(permit);
+                        limiter_guard.set_permit(permit);
                     }
                     AcquireOutcome::ShadowProceed {
                         would_wait_ms,
@@ -433,23 +488,18 @@ impl KiroProvider {
                             );
                             continue;
                         }
-                        tracing::warn!(
-                            event = "kiro_limiter_decision",
-                            credential_id = ctx.id,
-                            scope = "user",
-                            action = "acquire_timeout",
-                            est_wait_ms = est_wait_ms,
-                            current_rate_rps = current_rps,
-                            reason = reason,
-                            attempt = attempt,
-                            "Fail Aloud：本地限流，不发上游 MCP 请求"
-                        );
-                        anyhow::bail!(
-                            "MCP 本地限流（Fail Aloud）: kiro_local_throttled reason={} est_wait_ms={} rate_rps={:.3}",
-                            reason,
+                        Self::handle_local_throttled_absorb(
                             est_wait_ms,
-                            current_rps
-                        );
+                            current_rps,
+                            reason,
+                            ctx.id,
+                            attempt,
+                            "mcp",
+                            &mut last_local_throttle,
+                        )
+                        .await;
+                        last_error = None;
+                        continue;
                     }
                 }
             }
@@ -510,10 +560,10 @@ impl KiroProvider {
                         .for_scope(&scope)
                         .on_success(self.token_manager.account_rpm(ctx.id))
                         .await;
+                    limiter_guard.mark_outcome();
                 }
                 let headers = response.headers().clone();
                 let body = response.text().await.unwrap_or_default();
-                drop(limiter_permit);
                 let mut builder = http::Response::builder().status(status);
                 for (name, value) in headers.iter() {
                     if let Ok(v) = value.to_str() {
@@ -530,7 +580,6 @@ impl KiroProvider {
 
             // 失败响应
             let body = response.text().await.unwrap_or_default();
-            drop(limiter_permit);
 
             // 限速器 429 回写
             if status.as_u16() == 429 && self.limiters.enabled() {
@@ -540,6 +589,7 @@ impl KiroProvider {
                     .for_scope(&scope)
                     .on_throttle(reason, None, self.token_manager.account_rpm(ctx.id))
                     .await;
+                limiter_guard.mark_outcome();
                 tracing::info!(
                     event = "kiro_limiter_decision",
                     credential_id = ctx.id,
@@ -626,9 +676,12 @@ impl KiroProvider {
             }
         }
 
-        Err(last_error.unwrap_or_else(|| {
-            anyhow::anyhow!("MCP 请求失败：已达到最大重试次数（{}次）", max_retries)
-        }))
+        Err(Self::final_request_error(
+            "MCP",
+            last_error,
+            last_local_throttle,
+            max_retries,
+        ))
     }
 
     /// 内部方法：带重试逻辑的 API 调用
@@ -649,6 +702,7 @@ impl KiroProvider {
         let total_credentials = self.token_manager.total_count_in_group(group).max(1);
         let max_retries = (total_credentials * MAX_RETRIES_PER_CREDENTIAL).min(MAX_TOTAL_RETRIES);
         let mut last_error: Option<anyhow::Error> = None;
+        let mut last_local_throttle: Option<LocalThrottleMarker> = None;
         let mut force_refreshed: HashSet<u64> = HashSet::new();
         let api_type = if is_stream { "流式" } else { "非流式" };
 
@@ -771,7 +825,7 @@ impl KiroProvider {
             //   - enforce_scope=all：所有 attempt 真拦。
             // Proceed 持 permit 到响应结束（随 KiroCallResult drop，见 struct 字段注释）；
             // LocalThrottled 本地失败不发请求。
-            let mut limiter_permit: Option<tokio::sync::OwnedSemaphorePermit> = None;
+            let mut limiter_guard = LimiterAttemptGuard::new(self, ctx.id);
             if self.limiters.enabled() {
                 let scope = ThrottleScope::UserCredential(ctx.id);
                 let limiter = self.limiters.for_scope(&scope);
@@ -793,7 +847,7 @@ impl KiroProvider {
                             attempt = attempt,
                             "limiter 放行"
                         );
-                        limiter_permit = Some(permit);
+                        limiter_guard.set_permit(permit);
                     }
                     AcquireOutcome::ShadowProceed {
                         would_wait_ms,
@@ -829,25 +883,18 @@ impl KiroProvider {
                             );
                             continue;
                         }
-                        tracing::warn!(
-                            event = "kiro_limiter_decision",
-                            credential_id = ctx.id,
-                            scope = "user",
-                            action = "acquire_timeout",
-                            est_wait_ms = est_wait_ms,
-                            current_rate_rps = current_rps,
-                            reason = reason,
-                            attempt = attempt,
-                            "Fail Aloud：本地限流，不发上游请求"
-                        );
-                        // Fail Aloud 🔴：本地直接失败（带可解释错误，由 handlers 映射成 429）。
-                        anyhow::bail!(
-                            "{} 本地限流（Fail Aloud）: kiro_local_throttled reason={} est_wait_ms={} rate_rps={:.3}",
-                            api_type,
-                            reason,
+                        Self::handle_local_throttled_absorb(
                             est_wait_ms,
-                            current_rps
-                        );
+                            current_rps,
+                            reason,
+                            ctx.id,
+                            attempt,
+                            "messages",
+                            &mut last_local_throttle,
+                        )
+                        .await;
+                        last_error = None;
+                        continue;
                     }
                 }
             }
@@ -903,13 +950,14 @@ impl KiroProvider {
                         .for_scope(&scope)
                         .on_success(self.token_manager.account_rpm(ctx.id))
                         .await;
+                    limiter_guard.mark_outcome();
                 }
                 // limiter_permit 随 KiroCallResult 交给 handler；非流式在 body 读完后 drop，
                 // 流式在 handler 返回时 drop（见 KiroCallResult::limiter_permit 注释）。
                 return Ok(KiroCallResult {
                     response,
                     credential_id: ctx.id,
-                    limiter_permit,
+                    limiter_permit: limiter_guard.take_permit_on_success(),
                 });
             }
 
@@ -954,6 +1002,7 @@ impl KiroProvider {
                     .for_scope(&scope)
                     .on_throttle(reason, None, self.token_manager.account_rpm(ctx.id))
                     .await;
+                limiter_guard.mark_outcome();
                 tracing::info!(
                     event = "kiro_limiter_decision",
                     credential_id = ctx.id,
@@ -1256,13 +1305,12 @@ impl KiroProvider {
         }
 
         // 所有重试都失败
-        Err(last_error.unwrap_or_else(|| {
-            anyhow::anyhow!(
-                "{} API 请求失败：已达到最大重试次数（{}次）",
-                api_type,
-                max_retries
-            )
-        }))
+        Err(Self::final_request_error(
+            api_type,
+            last_error,
+            last_local_throttle,
+            max_retries,
+        ))
     }
 
     /// 向 trace sink 上报一跳结果（sink 为 None 时无开销）
@@ -1316,11 +1364,111 @@ impl KiroProvider {
         Duration::from_millis(backoff.saturating_add(jitter))
     }
 
-    /// 429 限流专用退避：比通用退避更长。
-    ///
-    /// 上游 429（SERVICE_REQUEST_RATE_EXCEEDED）是账号级速率配额耗尽，需要更长
-    /// 时间恢复；用通用的 ≤2s 快速退避只会让请求在配额恢复前反复撞墙、持续触顶。
-    /// 这里 base 1s、封顶 8s，给账号配额留出恢复窗口。
+    /// Absorb-First：本地 limiter 排队在 provider 内消化；limiter 已等到 absorb_timeout 时不再叠睡。
+    async fn handle_local_throttled_absorb(
+        est_wait_ms: u64,
+        current_rps: f64,
+        reason: &str,
+        credential_id: u64,
+        attempt: usize,
+        path: &str,
+        marker: &mut Option<LocalThrottleMarker>,
+    ) {
+        *marker = Some(LocalThrottleMarker {
+            reason: match reason {
+                "upstream_throttle_storm" => "upstream_throttle_storm",
+                "absorb_timeout" => "absorb_timeout",
+                _ => "local_queue_timeout",
+            },
+            est_wait_ms,
+            current_rps,
+        });
+        if reason == "absorb_timeout" || reason == "upstream_throttle_storm" {
+            tracing::info!(
+                event = "kiro_limiter_decision",
+                credential_id = credential_id,
+                scope = "user",
+                action = "absorb_exhaust_retry",
+                est_wait_ms = est_wait_ms,
+                current_rate_rps = current_rps,
+                reason = reason,
+                attempt = attempt,
+                path = path,
+                "limiter 已吸满 max_absorb_wait，换 attempt 重试（不叠睡）"
+            );
+            return;
+        }
+        Self::absorb_local_throttle_wait(
+            est_wait_ms,
+            current_rps,
+            reason,
+            credential_id,
+            attempt,
+            path,
+        )
+        .await;
+    }
+
+    fn local_throttle_exhaust_error(
+        api_type: &str,
+        marker: Option<LocalThrottleMarker>,
+        max_retries: usize,
+    ) -> anyhow::Error {
+        if let Some(lt) = marker {
+            anyhow::anyhow!(
+                "{} 本地限流（吸收超时）: kiro_local_throttled reason={} est_wait_ms={} rate_rps={:.3}",
+                api_type,
+                lt.reason,
+                lt.est_wait_ms,
+                lt.current_rps
+            )
+        } else {
+            anyhow::anyhow!(
+                "{} API 请求失败：已达到最大重试次数（{}次）",
+                api_type,
+                max_retries
+            )
+        }
+    }
+
+    fn final_request_error(
+        api_type: &str,
+        last_error: Option<anyhow::Error>,
+        last_local_throttle: Option<LocalThrottleMarker>,
+        max_retries: usize,
+    ) -> anyhow::Error {
+        if let Some(marker) = last_local_throttle {
+            return Self::local_throttle_exhaust_error(api_type, Some(marker), max_retries);
+        }
+        last_error.unwrap_or_else(|| {
+            Self::local_throttle_exhaust_error(api_type, None, max_retries)
+        })
+    }
+
+    async fn absorb_local_throttle_wait(
+        est_wait_ms: u64,
+        current_rps: f64,
+        reason: &str,
+        credential_id: u64,
+        attempt: usize,
+        path: &str,
+    ) {
+        let wait = Duration::from_millis(est_wait_ms.clamp(50, 15_000));
+        tracing::info!(
+            event = "kiro_limiter_decision",
+            credential_id = credential_id,
+            scope = "user",
+            action = "absorb_wait",
+            est_wait_ms = est_wait_ms,
+            current_rate_rps = current_rps,
+            reason = reason,
+            attempt = attempt,
+            path = path,
+            "limiter 本地排队吸收（不向 CPA/Codex 吐 429）"
+        );
+        sleep(wait).await;
+    }
+
     fn retry_delay_throttle(attempt: usize) -> Duration {
         const BASE_MS: u64 = 1_000;
         const MAX_MS: u64 = 8_000;

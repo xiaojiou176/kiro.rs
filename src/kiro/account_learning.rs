@@ -124,6 +124,8 @@ impl Default for AccountLearningPersisted {
 struct AccountLearningRuntime {
     held_samples: Vec<u64>,
     last_stable_success: Option<Instant>,
+    /// 磁盘加载时已收敛的 safe_rps（无分桶样本的旧数据）；运行时新 429 不会置位。
+    legacy_converged: bool,
 }
 
 struct AccountLearningEntry {
@@ -142,6 +144,13 @@ fn bucket_index(value: f64, max_value: f64, n: usize) -> usize {
 
 const MIN_SAMPLES_FOR_BOTTLENECK: u64 = 20;
 const BUCKET_COUNT: usize = 5;
+pub(crate) const DEFAULT_SAFE_RPS_LO: f64 = 0.5;
+pub(crate) const DEFAULT_SAFE_RPS_HI: f64 = 1.0;
+
+fn persisted_deviates_from_factory(p: &AccountLearningPersisted) -> bool {
+    (p.safe_rps_lo - DEFAULT_SAFE_RPS_LO).abs() > f64::EPSILON
+        || (p.safe_rps_hi - DEFAULT_SAFE_RPS_HI).abs() > f64::EPSILON
+}
 
 /// 进程内学习存储 + 落盘。
 pub struct LearningStore {
@@ -213,6 +222,9 @@ impl LearningStore {
             }
 
             p.bottleneck_dimension = compute_bottleneck(p);
+            if p.safe_rps_lo > p.safe_rps_hi {
+                std::mem::swap(&mut p.safe_rps_lo, &mut p.safe_rps_hi);
+            }
         });
         self.save_debounced();
     }
@@ -264,9 +276,41 @@ impl LearningStore {
 
     pub fn learned_safe_rps(&self, id: u64) -> (f64, f64) {
         match self.snapshot(id) {
-            Some(p) => (p.safe_rps_lo, p.safe_rps_hi),
+            Some(p) => {
+                if p.safe_rps_lo <= p.safe_rps_hi {
+                    (p.safe_rps_lo, p.safe_rps_hi)
+                } else {
+                    (p.safe_rps_hi, p.safe_rps_lo)
+                }
+            }
             None => (0.5, 1.0),
         }
+    }
+
+    /// 累计学习样本数（三维度分桶之和）。
+    pub fn learning_sample_count(&self, id: u64) -> u64 {
+        self.snapshot(id)
+            .map(|p| {
+                p.inflight_buckets.total_samples()
+                    + p.send_rate_buckets.total_samples()
+                    + p.rpm_buckets.total_samples()
+            })
+            .unwrap_or(0)
+    }
+
+    /// 分桶样本足够，或磁盘加载时已收敛的 legacy safe_rps 时视为成熟。
+    pub fn learning_is_mature(&self, id: u64, min_samples: u64) -> bool {
+        let map = self.accounts.lock();
+        let Some(entry) = map.get(&id) else {
+            return false;
+        };
+        let samples = entry.persisted.inflight_buckets.total_samples()
+            + entry.persisted.send_rate_buckets.total_samples()
+            + entry.persisted.rpm_buckets.total_samples();
+        if samples >= min_samples {
+            return true;
+        }
+        entry.runtime.legacy_converged
     }
 
     pub fn p80_held_ms(&self, id: u64) -> u64 {
@@ -340,18 +384,36 @@ impl LearningStore {
             }
         };
         let mut map = self.accounts.lock();
-        for (k, v) in file.accounts {
+        let mut repaired = false;
+        for (k, mut v) in file.accounts {
             if let Ok(id) = k.parse::<u64>() {
+                if v.safe_rps_lo > v.safe_rps_hi {
+                    std::mem::swap(&mut v.safe_rps_lo, &mut v.safe_rps_hi);
+                    repaired = true;
+                }
+                let samples = v.inflight_buckets.total_samples()
+                    + v.send_rate_buckets.total_samples()
+                    + v.rpm_buckets.total_samples();
+                let legacy_converged =
+                    samples < MIN_SAMPLES_FOR_BOTTLENECK && persisted_deviates_from_factory(&v);
                 map.insert(
                     id,
                     AccountLearningEntry {
                         persisted: v,
-                        runtime: AccountLearningRuntime::default(),
+                        runtime: AccountLearningRuntime {
+                            legacy_converged,
+                            ..AccountLearningRuntime::default()
+                        },
                     },
                 );
             }
         }
-        tracing::info!("已加载 {} 条账号学习状态", map.len());
+        drop(map);
+        if repaired {
+            self.dirty.store(true, Ordering::Relaxed);
+            tracing::info!("account_learning 落盘数据已修复 inverted safe_rps bounds");
+        }
+        tracing::info!("已加载 {} 条账号学习状态", self.accounts.lock().len());
     }
 
     pub fn all_snapshots(&self) -> HashMap<u64, AccountLearningPersisted> {
@@ -370,6 +432,7 @@ impl AccountLearningEntry {
             runtime: AccountLearningRuntime {
                 held_samples: self.runtime.held_samples.clone(),
                 last_stable_success: self.runtime.last_stable_success,
+                legacy_converged: self.runtime.legacy_converged,
             },
         }
     }
@@ -507,6 +570,23 @@ mod tests {
         let s2 = LearningStore::new(LearningConfig::default(), Some(path.clone()));
         let snap = s2.snapshot(17).expect("应加载 id=17");
         assert_eq!(snap.p80_held_ms, 42_000);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_repairs_inverted_bounds() {
+        let path = temp_dir().join(format!("account_learning_inv_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            r#"{"accounts":{"17":{"safeRpsLo":0.101,"safeRpsHi":0.075,"p80HeldMs":30000,"optimalQuarantineSecs":30,"bottleneckDimension":"SendRate"}}}"#,
+        )
+        .expect("write inverted learning file");
+        let s = LearningStore::new(LearningConfig::default(), Some(path.clone()));
+        let (lo, hi) = s.learned_safe_rps(17);
+        assert!(lo <= hi, "loaded bounds must be normalized: lo={lo} hi={hi}");
+        assert!((lo - 0.075).abs() < 1e-9);
+        assert!((hi - 0.101).abs() < 1e-9);
         let _ = std::fs::remove_file(&path);
     }
 }
