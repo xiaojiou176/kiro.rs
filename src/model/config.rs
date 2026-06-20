@@ -528,6 +528,10 @@ pub struct LearningConfig {
     pub persist_path: String,
     #[serde(default = "default_ewma_alpha")]
     pub ewma_alpha: f64,
+    /// 学习分桶时间衰减的半衰期（秒）。后台周期对所有账号的桶做指数半衰，
+    /// 让旧 429 随时间被遗忘——避免某号几小时前撞过墙就被永久按慢号对待。
+    #[serde(default = "default_bucket_decay_half_life_secs")]
+    pub bucket_decay_half_life_secs: u64,
 }
 
 impl Default for LearningConfig {
@@ -536,6 +540,7 @@ impl Default for LearningConfig {
             enabled: default_learning_enabled(),
             persist_path: default_learning_persist_path(),
             ewma_alpha: default_ewma_alpha(),
+            bucket_decay_half_life_secs: default_bucket_decay_half_life_secs(),
         }
     }
 }
@@ -716,6 +721,11 @@ fn default_learning_persist_path() -> String {
 }
 fn default_ewma_alpha() -> f64 {
     0.2
+}
+fn default_bucket_decay_half_life_secs() -> u64 {
+    // 1800s = 30min 半衰期：约 30 分钟后旧 429 的权重减半，2-3 小时基本淡出。
+    // 既能让被打狠的号在白天逐步恢复，又不会快到「刚撞墙就忘」失去保护意义。
+    1800
 }
 
 impl Default for Config {

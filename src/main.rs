@@ -294,6 +294,9 @@ async fn main() {
                 tm.flush_affinity_if_dirty();
                 tm.flush_pins_if_dirty();
                 tm.flush_learning_if_dirty();
+                // H1：按经过时间对学习分桶做指数衰减，旧 429 随时间被遗忘，
+                // 避免被打狠的号被永久按慢号对待（白天逐步恢复）。
+                tm.decay_learning_now();
             }
         });
     }

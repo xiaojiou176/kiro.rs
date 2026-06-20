@@ -1545,6 +1545,13 @@ impl MultiTokenManager {
         }
     }
 
+    /// 后台 tick：按经过时间对学习分桶做指数衰减（H1：旧 429 随时间被遗忘）。
+    pub fn decay_learning_now(&self) {
+        if let Some(store) = self.limiters.learning() {
+            store.decay_tick_now();
+        }
+    }
+
     fn is_account_open(&self, id: u64) -> bool {
         self.limiters
             .is_account_open(&ThrottleScope::UserCredential(id))
