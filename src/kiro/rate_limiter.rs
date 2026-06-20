@@ -220,6 +220,9 @@ pub struct AdaptiveConfig {
     pub goodput_sanity_max_rps: f64,
     /// goodput 判「上涨」的最小相对增幅；低于此视为持平→停止爬升。
     pub goodput_rise_epsilon: f64,
+    /// app-limited 去抖拍数：连续 N 拍都判 app-limited 才真当 app-limited，
+    /// 防瞬时 inflight 抖动单拍误判打断爬升。
+    pub app_limited_debounce_ticks: u32,
     pub learning_enabled: bool,
 }
 
@@ -294,6 +297,7 @@ impl AdaptiveConfig {
             goodput_hard_ceiling: pr.goodput_hard_ceiling.clamp(0.0, 1.0),
             goodput_sanity_max_rps: pr.goodput_sanity_max_rps.max(min_rate),
             goodput_rise_epsilon: pr.goodput_rise_epsilon.max(0.0),
+            app_limited_debounce_ticks: pr.app_limited_debounce_ticks.max(1),
             learning_enabled: c.learning.enabled,
         }
     }
@@ -338,6 +342,10 @@ struct State {
     last_probe_rate: f64,
     /// goodput 爬山方向：true=正在向上探(上轮抬了 rate)，需下轮验证 goodput 是否随之涨。
     probe_climbing: bool,
+    /// app-limited 连击计数（瞬态，不持久化）：连续多少拍判定为 app-limited。
+    /// 用于去抖——只有连续 ≥ app_limited_debounce_ticks 拍才真当 app-limited，
+    /// 防瞬时 inflight 抖动单拍误判把正在爬升的状态机打断。
+    app_limited_streak: u32,
     /// 自适应退避：上次退避(on_throttle 降速)的时刻，用于「退避后多快又撞 429」判断。
     last_backoff_at: Option<Instant>,
     /// 自适应退避学到的当前 beta（乘性减速系数），随「退避后是否很快又 429」调整。
@@ -391,6 +399,7 @@ impl AdaptiveLimiter {
             last_probe_goodput: 0.0,
             last_probe_rate: initial_rate,
             probe_climbing: false,
+            app_limited_streak: 0,
             last_backoff_at: None,
             adaptive_beta: cfg.beta_user,
         };
@@ -558,14 +567,24 @@ impl AdaptiveLimiter {
             return false;
         }
 
-        // 门 3：app-limited——在飞远低于并发上限，没 backlog → 没活干，不是到顶。保持不动。
+        // 门 3：app-limited——在飞远低于并发上限，没 backlog → 没活干，不是到顶（P2-c）。
         // 判据：当前在飞 + 1 < effective_max_inflight（还有空槽没被占满 = 需求不足）。
-        let app_limited = self.current_inflight() + 1 < st.effective_max_inflight;
-        if app_limited {
-            // 记录基线但不动 rate（避免把空闲误判成天花板而降速）。
+        // 两处修复：
+        //  ① 去抖：瞬时 inflight 低只是「这一拍碰巧没排满」，不代表真没需求。连续
+        //     `app_limited_debounce_ticks` 拍都判 app-limited 才真当 app-limited，
+        //     防单拍抖动误判。未达阈值时不暂停，继续走下面正常的护栏带/爬升逻辑。
+        //  ② 保留爬升状态：真进入 app-limited 时只记基线、**不清 probe_climbing**——
+        //     这样需求恢复后从原档继续爬，而不是被打断后从头起步（旧 bug：每次空闲一拍就重置）。
+        let app_limited_now = self.current_inflight() + 1 < st.effective_max_inflight;
+        if app_limited_now {
+            st.app_limited_streak = st.app_limited_streak.saturating_add(1);
+        } else {
+            st.app_limited_streak = 0;
+        }
+        if app_limited_now && st.app_limited_streak >= self.cfg.app_limited_debounce_ticks {
+            // 连续多拍确认需求不足 → 记录基线但不动 rate、保留 probe_climbing（需求回来接着爬）。
             st.last_probe_goodput = goodput;
             st.last_probe_rate = st.rate_rps;
-            st.probe_climbing = false;
             return false;
         }
 
@@ -1482,6 +1501,7 @@ mod tests {
             goodput_hard_ceiling: 0.15,
             goodput_sanity_max_rps: 5.0,
             goodput_rise_epsilon: 0.05,
+            app_limited_debounce_ticks: 2,
             learning_enabled: false,
         }
     }
@@ -1926,6 +1946,7 @@ mod tests {
     async fn test_goodput_holds_when_app_limited() {
         // app-limited(在飞远低于并发上限=没活干) → 不把空闲误判成天花板，rate 保持不动。
         // 这正是根治 #19 卡 0.06 的关键：低流量不该被当成「到顶了」而降速。
+        // P2-c：去抖后需连续 app_limited_debounce_ticks 拍才真当 app-limited，故先跑满阈值。
         let mut cfg = test_cfg();
         cfg.additive_step_rps = 0.05;
         cfg.goodput_sanity_max_rps = 1.0;
@@ -1938,10 +1959,102 @@ mod tests {
             st.upstream_events.clear();
             st.effective_max_inflight = 8; // 无在飞 → current_inflight(0)+1 < 8 → app-limited
         }
+        let debounce = lim.cfg.app_limited_debounce_ticks;
+        // 先跑满去抖阈值（每拍都 app-limited），最后一拍应进入 hold。
+        let mut last_raised = true;
+        for _ in 0..debounce {
+            last_raised = lim.goodput_control_tick();
+        }
         let before = lim.current_rate_rps();
         let raised = lim.goodput_control_tick();
-        assert!(!raised, "app-limited -> rate must hold");
+        assert!(!last_raised, "持续 app-limited(达去抖阈值) -> rate must hold");
+        assert!(!raised, "app-limited 稳态 -> rate must hold");
         assert!((lim.current_rate_rps() - before).abs() < 1e-9, "rate stays put when no demand");
+    }
+
+    // P2-c①：真进入 app-limited(连续达去抖阈值)时不清 probe_climbing —— 需求回来从原档继续爬。
+    #[tokio::test]
+    async fn test_app_limited_preserves_probe_climbing() {
+        let mut cfg = test_cfg();
+        cfg.additive_step_rps = 0.05;
+        cfg.goodput_sanity_max_rps = 1.0;
+        let lim = AdaptiveLimiter::new(cfg);
+        {
+            let mut st = lim.state.lock();
+            st.rate_rps = 0.2;
+            st.cooldown_until = None;
+            st.circuit = CircuitState::Healthy;
+            st.upstream_events.clear();
+            st.effective_max_inflight = 8; // 无在飞 → app-limited
+            st.probe_climbing = true; // 假装正在爬升
+        }
+        let debounce = lim.cfg.app_limited_debounce_ticks;
+        for _ in 0..(debounce + 2) {
+            lim.goodput_control_tick();
+        }
+        assert!(
+            lim.state.lock().probe_climbing,
+            "app-limited 不该清 probe_climbing（需求回来要从原档继续爬，旧 bug 每拍重置）"
+        );
+    }
+
+    // P2-c②：去抖——仅 1 拍 app-limited(阈值=2)不该触发 hold，仍按正常逻辑走(429 低时能爬)。
+    #[tokio::test]
+    async fn test_app_limited_single_tick_debounced() {
+        let mut cfg = test_cfg();
+        cfg.additive_step_rps = 0.05;
+        cfg.goodput_sanity_max_rps = 1.0;
+        cfg.goodput_band_low = 0.02;
+        assert!(
+            cfg.app_limited_debounce_ticks >= 2,
+            "本测前提：去抖阈值 ≥2，单拍才不触发"
+        );
+        let lim = AdaptiveLimiter::new(cfg);
+        {
+            let mut st = lim.state.lock();
+            st.rate_rps = 0.2;
+            st.cooldown_until = None;
+            st.circuit = CircuitState::Healthy;
+            st.upstream_events.clear(); // 0% 429 < band_low → 有余量该爬
+            st.effective_max_inflight = 8; // app-limited（但只这一拍）
+        }
+        let before = lim.current_rate_rps();
+        let raised = lim.goodput_control_tick(); // streak=1 < 2 → 不进 app-limited，走爬升
+        assert!(
+            raised && lim.current_rate_rps() > before,
+            "仅 1 拍 app-limited(阈值2)应被去抖忽略，按 429<band_low 正常爬升"
+        );
+    }
+
+    // P2-c③：连续达到去抖阈值后才进入 app-limited hold（第 N 拍起 rate 不再升）。
+    #[tokio::test]
+    async fn test_app_limited_engages_after_n_ticks() {
+        let mut cfg = test_cfg();
+        cfg.additive_step_rps = 0.05;
+        cfg.goodput_sanity_max_rps = 5.0;
+        cfg.goodput_band_low = 0.02;
+        let lim = AdaptiveLimiter::new(cfg);
+        {
+            let mut st = lim.state.lock();
+            st.rate_rps = 0.2;
+            st.cooldown_until = None;
+            st.circuit = CircuitState::Healthy;
+            st.upstream_events.clear();
+            st.effective_max_inflight = 8; // 持续 app-limited
+        }
+        let debounce = lim.cfg.app_limited_debounce_ticks;
+        // 前 debounce-1 拍：streak 未达阈值 → 仍按 429<band_low 爬升。
+        for _ in 0..(debounce - 1) {
+            lim.goodput_control_tick();
+        }
+        let rate_before_engage = lim.current_rate_rps();
+        // 第 debounce 拍：streak 达阈值 → 进入 hold，rate 不再升。
+        let raised = lim.goodput_control_tick();
+        assert!(!raised, "达去抖阈值后应进入 app-limited hold，不再升 rate");
+        assert!(
+            (lim.current_rate_rps() - rate_before_engage).abs() < 1e-9,
+            "进入 hold 后 rate 保持不动"
+        );
     }
 
     #[tokio::test]

@@ -534,6 +534,11 @@ pub struct ProbeConfig {
     /// 涨幅低于此视为「持平」→ 停止继续爬。默认 0.05（5%）。
     #[serde(default = "default_goodput_rise_epsilon")]
     pub goodput_rise_epsilon: f64,
+    /// goodput 控制器：app-limited 去抖拍数。inflight 瞬时低于并发上限只是「这一拍碰巧没排满」，
+    /// 不代表真没需求；连续 N 拍都判 app-limited 才真当 app-limited（暂停爬升）。
+    /// 防瞬时 inflight 抖动单拍误判把正在爬升的状态机打断。默认 2。
+    #[serde(default = "default_app_limited_debounce_ticks")]
+    pub app_limited_debounce_ticks: u32,
 }
 
 impl Default for ProbeConfig {
@@ -547,6 +552,7 @@ impl Default for ProbeConfig {
             goodput_hard_ceiling: default_goodput_hard_ceiling(),
             goodput_sanity_max_rps: default_goodput_sanity_max_rps(),
             goodput_rise_epsilon: default_goodput_rise_epsilon(),
+            app_limited_debounce_ticks: default_app_limited_debounce_ticks(),
         }
     }
 }
@@ -763,6 +769,9 @@ fn default_goodput_sanity_max_rps() -> f64 {
 }
 fn default_goodput_rise_epsilon() -> f64 {
     0.05
+}
+fn default_app_limited_debounce_ticks() -> u32 {
+    2
 }
 fn default_learning_enabled() -> bool {
     true

@@ -1710,6 +1710,15 @@ impl MultiTokenManager {
         counts
     }
 
+    /// 被动负载再平衡是否启用：利用率信号 或 会话数信号 任一开启即启用（P2-b）。
+    /// 抽成纯函数便于单测，并消除调用门处的内联布尔魔法。
+    /// - util_gap > 0 → 利用率信号开（rebalance_target 内 util 分支优先）；
+    /// - min_gap > 0 → 会话数信号开（util 未触发时的 fallback）；
+    /// - 两者都 0 → 完全关闭被动再平衡。
+    fn rebalance_signal_enabled(ma: &crate::model::config::MultiAccountConfig) -> bool {
+        ma.rebalance_utilization_gap > 0.0 || ma.rebalance_min_gap > 0
+    }
+
     /// 被动负载再平衡：若 `current` 号的活跃会话数比最空号多 ≥ `rebalance_min_gap`，
     /// 返回应迁往的最空号（排除 `current`）；否则 `None`（不迁，保持黏定）。
     /// 滞后阈值(≥2)+ 调用方的防抖保证迁移后不会 A↔B 反复横跳。
@@ -1924,10 +1933,11 @@ impl MultiTokenManager {
                         }
                     } else {
                         // 原号健康（不到切号阈值）。先看是否该「被动负载再平衡」：
-                        // 当原号活跃会话数明显多于最空号（差距 ≥ rebalance_min_gap）、且不在切号防抖窗口、
-                        // 且再平衡未关闭（min_gap>0）时，把当前会话迁到最空号。迁移复用切号路径
+                        // 触发条件 = 「利用率信号 或 会话数信号」任一启用，且不在切号防抖窗口（P2-b 修复：
+                        // 旧逻辑只看 min_gap>0，min_gap=0 时连 rebalance_target 都不调 → util 信号被绑死摸不到）。
+                        // rebalance_target 内部 util 分支优先、会话数分支 fallback；迁移复用切号路径
                         // （写 last_switch_at + 防抖 + 不黏回），滞后阈值(≥2)保证迁完两边不会立刻反向触发。
-                        let rebalanced = if ma.rebalance_min_gap > 0 && !in_debounce {
+                        let rebalanced = if Self::rebalance_signal_enabled(ma) && !in_debounce {
                             self.rebalance_target(pick_pool, b.credential_id, ma)
                         } else {
                             None
@@ -5535,6 +5545,75 @@ mod tests {
             idle,
             "应把会话迁到利用率最低的 idle 号 {idle}"
         );
+    }
+
+    // P2-b 核心反假绿：调用门 rebalance_signal_enabled 必须「util_gap>0 或 min_gap>0」任一即开。
+    // 旧调用门只看 `rebalance_min_gap > 0`，min_gap=0 时整段 short-circuit → 连 rebalance_target 都不调
+    // → util 信号被绑死永远摸不到（#19 满载不迁 #18 的雷）。这里直接对纯函数断言四种组合，钉死布尔逻辑。
+    #[test]
+    fn test_rebalance_signal_enabled_combinations() {
+        let mut ma = crate::model::config::MultiAccountConfig::default();
+        // ① 只有 util 信号（min_gap=0）：必须启用——这正是旧代码漏掉的情形。
+        ma.rebalance_min_gap = 0;
+        ma.rebalance_utilization_gap = 0.3;
+        assert!(
+            MultiTokenManager::rebalance_signal_enabled(&ma),
+            "min_gap=0 但 util_gap>0 必须启用再平衡（旧 bug：被 min_gap 绑死）"
+        );
+        // ② 只有会话数信号（util_gap=0）：必须启用（fallback 仍可用）。
+        ma.rebalance_min_gap = 2;
+        ma.rebalance_utilization_gap = 0.0;
+        assert!(
+            MultiTokenManager::rebalance_signal_enabled(&ma),
+            "util_gap=0 但 min_gap>0 必须启用再平衡（会话数 fallback）"
+        );
+        // ③ 两个信号都开：启用。
+        ma.rebalance_min_gap = 2;
+        ma.rebalance_utilization_gap = 0.3;
+        assert!(MultiTokenManager::rebalance_signal_enabled(&ma));
+        // ④ 两个信号都关：彻底关闭。
+        ma.rebalance_min_gap = 0;
+        ma.rebalance_utilization_gap = 0.0;
+        assert!(
+            !MultiTokenManager::rebalance_signal_enabled(&ma),
+            "两个信号都为 0 时必须完全关闭被动再平衡"
+        );
+    }
+
+    // P2-b 补充：min_gap=0 + util_gap>0 时，rebalance_target 内部 util 分支仍能选中有余量的 idle 号
+    // （证明开门后里面真能干活，会话数 fallback 因 min_gap=0 提前 return，所以命中只可能来自 util 分支）。
+    #[tokio::test]
+    async fn test_rebalance_target_util_picks_idle_when_min_gap_zero() {
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.switch_debounce_secs = 0;
+        config.adaptive_limit.multi_account.rebalance_min_gap = 0; // 会话数 fallback 关
+        config.adaptive_limit.multi_account.rebalance_utilization_gap = 0.3; // 只留 util
+        let manager = affinity_manager(config);
+        let c = manager.acquire_context(None, None, Some("sess-X")).await.unwrap();
+        let busy = c.id;
+        let idle = if busy == 1 { 2 } else { 1 };
+        let busy_lim = manager
+            .limiters()
+            .for_scope(&ThrottleScope::UserCredential(busy));
+        for _ in 0..3 {
+            busy_lim
+                .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None, 0)
+                .await;
+        }
+        let available: Vec<_> = manager
+            .available_credentials(None, None)
+            .into_iter()
+            .collect();
+        let target = manager.rebalance_target(
+            &available,
+            busy,
+            &manager.config.adaptive_limit.multi_account,
+        );
+        assert!(
+            target.is_some(),
+            "min_gap=0 但 util_gap>0：util 分支应选中有余量的号（会话数 fallback 已因 min_gap=0 退出）"
+        );
+        assert_eq!(target.unwrap().0, idle, "应按利用率选最闲的 idle 号 {idle}");
     }
 
     // 原号冷却短于阈值：继续黏原号（由 limiter 自行等待，不切号）。
