@@ -304,14 +304,17 @@ impl LearningStore {
         if half_lives <= 0.0 {
             return;
         }
-        let factor = 0.5_f64.powf(half_lives);
         let mut map = self.accounts.lock();
         for entry in map.values_mut() {
             let p = &mut entry.persisted;
             p.inflight_buckets.decay_by_half_lives(half_lives);
             p.send_rate_buckets.decay_by_half_lives(half_lives);
             p.rpm_buckets.decay_by_half_lives(half_lives);
-            p.real_sample_count = ((p.real_sample_count as f64) * factor) as u64;
+            // ⚠️ real_sample_count（成熟度门）**绝不衰减**：它代表「这个号一共从多少真实请求
+            // 学过」，是单调 latch。若它随空闲衰减，低流量号会在第一个 idle tick 就从「已成熟」
+            // 跌回「未成熟」(20×0.9885=19<20) → effective_floor 退回静态 min_rate → 重新引入
+            // 「卡 min_rate 地板」的 #19 病（P2-a）。桶统计衰减(让旧 429 随时间淡出)归桶统计，
+            // 成熟度归成熟度，两者解耦。
         }
         drop(map);
         self.dirty.store(true, Ordering::Relaxed);
@@ -731,9 +734,10 @@ mod tests {
     }
 
     #[test]
-    fn test_decay_tick_lets_old_429_fade_so_account_recovers() {
-        // H1 回归：某号历史大量 429 把 safe_rps 压低；之后长期无 429 + decay
-        // → 桶里的旧 429 比率应随衰减下降，monotonic_score 不再被旧账永久钉高。
+    fn test_decay_fades_bucket_429_but_preserves_maturity() {
+        // H1 回归 + P2-a 防回归：衰减让桶里的旧 429「绝对计数」淡出（旧账不永久压制），
+        // 但 real_sample_count（成熟度门）**绝不衰减**——否则低流量号会在 idle 时跌回未成熟、
+        // floor 退回 min_rate（#19 病复活）。
         let s = store();
         for _ in 0..40 {
             s.record_sample(
@@ -747,13 +751,26 @@ mod tests {
                 },
             );
         }
-        // 模拟「过了很多个半衰期」——衰减后旧 429 计数趋近 0。
+        assert_eq!(s.learning_sample_count(3), 40, "衰减前 40 真实样本");
+        assert!(s.learning_is_mature(3, 20), "40 样本应成熟");
+        // 模拟「过了很多个半衰期」。
         s.decay_all(20.0);
-        let total_after = s.learning_sample_count(3);
+        // ① 桶里的旧 429 绝对计数应趋近 0（旧账淡出，不再永久压制 monotonic_score/瓶颈判定）。
+        let snap = s.snapshot(3).expect("account exists");
+        let bucket_total: f64 = snap.send_rate_buckets.buckets.iter().map(|(t, _)| t).sum();
         assert!(
-            total_after < 5,
-            "衰减 20 个半衰期后旧样本计数应趋近 0: {total_after}"
+            bucket_total < 5.0,
+            "衰减 20 个半衰期后桶样本绝对计数应趋近 0: {bucket_total}"
         );
-        // 衰减后旧 429 已淡出，不会永久压制。
+        // ② 但成熟度门(real_sample_count)绝不衰减——仍是 40、仍成熟（P2-a 防回归）。
+        assert_eq!(
+            s.learning_sample_count(3),
+            40,
+            "real_sample_count 不应随衰减下降（成熟度是单调 latch）"
+        );
+        assert!(
+            s.learning_is_mature(3, 20),
+            "衰减后仍应保持成熟，不能跌回未成熟导致 floor 退回 min_rate"
+        );
     }
 }

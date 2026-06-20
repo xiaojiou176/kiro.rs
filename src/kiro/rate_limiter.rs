@@ -590,32 +590,41 @@ impl AdaptiveLimiter {
             return false;
         }
 
-        // 门 5：429 < band_low，还有余量 → goodput 爬山。
+        // 门 5：429 < band_low，确认还有余量 → 爬升。
         if step <= 0.0 || st.rate_rps >= sanity_max - f64::EPSILON {
             return false;
         }
+        // 控制律（修正 P1）：低 429 = 上游确认有余量，这本身就是「可以探更高」的许可。
+        // goodput-delta 只用来**否决**爬升——仅当上一拍抬了 rate 后 goodput 明显**回落**
+        // （rate 升反而吞吐降，说明 429 在吃掉产能/过了最优点）才退档并停爬。
+        //
+        // 为什么不要求 goodput「必须上涨」才继续：稳态需求下 goodput = min(需求, rate)，
+        // 抬 rate 不一定立刻让 goodput 涨（需求没那么多/backlog 已清），但只要 429 仍 < band_low
+        // 且 goodput 没倒退，就说明没撞墙、继续贴墙探是安全的。要求「必须涨 5%」会在稳态需求下
+        // 恒为 false → 抬一档又退一档的极限环（P1 根因）。
         if st.probe_climbing {
-            // 上一轮抬过 rate，这轮检验 goodput 是否随之上涨。
-            let rose = goodput > st.last_probe_goodput * (1.0 + self.cfg.goodput_rise_epsilon);
-            if rose {
-                // goodput 还在涨 → 继续抬一档。
-                st.rate_rps = (st.rate_rps + step).min(sanity_max);
-                st.last_probe_goodput = goodput;
-                st.last_probe_rate = st.rate_rps;
-            } else {
-                // goodput 没涨/降了 → 过了最优点，回退一档并停止爬升。
+            // regressed：goodput 比上次探测时明显回落（跌破 1 - epsilon）= 抬过头了。
+            let regressed =
+                goodput < st.last_probe_goodput * (1.0 - self.cfg.goodput_rise_epsilon);
+            if regressed {
+                // 抬 rate 反而吞吐降 → 回退一档并停爬，停在上一个更优点。
                 st.rate_rps = (st.rate_rps - step).max(floor);
                 st.probe_climbing = false;
-                st.last_probe_goodput = goodput;
-                st.last_probe_rate = st.rate_rps;
+            } else {
+                // 没回退 + 429 仍低 → 继续抬一档贴墙探。
+                st.rate_rps = (st.rate_rps + step).min(sanity_max);
             }
         } else {
-            // 起步爬升：抬一档，下轮验证 goodput。
+            // 起步爬升：抬一档，下一拍用 regressed 判据验证。
             st.rate_rps = (st.rate_rps + step).min(sanity_max);
             st.probe_climbing = true;
-            st.last_probe_goodput = goodput;
-            st.last_probe_rate = st.rate_rps;
         }
+        // 记录本拍 goodput 高水位：只在 goodput 创新高时更新基线，避免「需求抖动暂时低一下」
+        // 被误判成 regressed（基线一直跟着最高吞吐走，回退判定更稳）。
+        if goodput > st.last_probe_goodput {
+            st.last_probe_goodput = goodput;
+        }
+        st.last_probe_rate = st.rate_rps;
         st.last_increase = now;
         let changed = (before - st.rate_rps).abs() > f64::EPSILON;
         if changed {
@@ -1270,14 +1279,32 @@ fn record_goodput(events: &mut VecDeque<Instant>, window: Duration) {
 
 /// 计算窗口内 goodput（成功请求/秒）= 窗口内成功数 / 窗口长度（秒）。
 /// 用「成功数 / 窗口秒数」而非「/ 样本时间跨度」，避免低样本时分母过小放大噪声。
+/// 估算「当前」goodput（成功请求/秒）。
+///
+/// 关键：分母用窗口内样本的**实际时间跨度**(最新−最旧)，而不是固定 window 长度。
+/// 若用固定 300s 当分母，goodput 就成了「过去 5 分钟平均」这种慢变量——每 15s 一次的
+/// 控制 tick 根本无法在一拍里把它抬高一个可检测的相对增幅，爬山判据(rose)会恒为 false，
+/// 退化成「抬一档→判没涨→退一档」的极限环(P1)。用实际跨度则反映**最近真实速率**，
+/// rate 一升、单位时间成功数随之升，goodput 能同步跟上，爬山判据才有意义。
+///
+/// 边界：窗口内样本 < 2 或跨度过小（< 1s）时无法可靠估速，返回 count/window 的保守平均
+/// （避免极小分母把 goodput 放大成噪声）。
 fn goodput_rps_locked(events: &VecDeque<Instant>, window: Duration) -> f64 {
     let now = Instant::now();
-    let count = events
+    let recent: Vec<Instant> = events
         .iter()
         .filter(|t| now.duration_since(**t) <= window)
-        .count();
-    let secs = window.as_secs_f64().max(1.0);
-    count as f64 / secs
+        .copied()
+        .collect();
+    let count = recent.len();
+    if count < 2 {
+        // 样本太少，无法测速率：用 count/window 的保守平均（低估而非高估，不制造噪声）。
+        return count as f64 / window.as_secs_f64().max(1.0);
+    }
+    // 实际跨度 = 最新样本到「现在」的时间（含正在累积的当前区间），下限 1s 防极小分母放大。
+    let oldest = recent.iter().min().copied().unwrap_or(now);
+    let span = now.duration_since(oldest).as_secs_f64().max(1.0);
+    count as f64 / span
 }
 
 fn exp_cooldown(base: Duration, cap: Duration, n: u32) -> Duration {
@@ -2087,6 +2114,49 @@ mod tests {
             lim.current_rate_rps() <= 1.0 + 1e-9,
             "rate must not exceed sanity max 1.0, got {}",
             lim.current_rate_rps()
+        );
+    }
+
+    // P1 反假绿回归（真实时间节奏）：上一版 goodput 用固定 300s 窗口当分母 → 成了慢均值，
+    // 15s 一拍的 tick 抬一档后下拍 goodput 几乎不动(< rise_epsilon) → rose 恒 false → 极限环爬不动。
+    // 本测用**真实墙钟时间间隔**喂样本：rate 升 → 单位时间成功数升 → 实际跨度分母下的 goodput
+    // 必须同步上涨被检测到，从而真正连爬多拍。紧循环零墙钟的旧测掩盖了这个问题，这里专门复现。
+    #[tokio::test]
+    async fn test_goodput_climbs_under_realtime_pacing() {
+        let mut cfg = test_cfg();
+        cfg.additive_step_rps = 0.05;
+        cfg.goodput_band_low = 0.02;
+        cfg.goodput_sanity_max_rps = 2.0;
+        cfg.goodput_rise_epsilon = 0.05;
+        cfg.probe_window = Duration::from_secs(300); // 与生产同量级的大窗口
+        cfg.hard_max_inflight = 1; // 单飞：占满 1 个 permit = 饱和(非 app-limited)
+        cfg.min_inflight = 1;
+        cfg.adaptive_concurrency_enabled = false; // 防 recompute 把 effective_max_inflight 涨回去
+        let lim = AdaptiveLimiter::new(cfg);
+        {
+            let mut st = lim.state.lock();
+            st.rate_rps = 0.2;
+            st.effective_max_inflight = 1;
+        }
+        let _permit = match lim.acquire().await {
+            AcquireOutcome::Proceed(p) => p,
+            other => panic!("expected Proceed, got {other:?}"),
+        };
+        let start = lim.current_rate_rps();
+        // 模拟真实节奏：每拍之间隔真实时间(20ms)喂几个成功样本再 tick。
+        // 关键是样本带**真实时间间隔**，使「实际跨度分母」的 goodput 能反映速率上升。
+        for _ in 0..12 {
+            for _ in 0..3 {
+                lim.on_success(0).await;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            lim.goodput_control_tick();
+        }
+        let end = lim.current_rate_rps();
+        // 核心断言：真实时间节奏下 rate 必须实打实往上爬（不是卡在起点附近的极限环）。
+        assert!(
+            end > start + 0.05,
+            "真实时间节奏下 goodput 控制器必须能持续爬升: {start} -> {end}（卡住=P1 未修）"
         );
     }
 
