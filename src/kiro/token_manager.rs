@@ -1719,7 +1719,38 @@ impl MultiTokenManager {
         current: u64,
         ma: &crate::model::config::MultiAccountConfig,
     ) -> Option<(u64, KiroCredentials)> {
-        if ma.rebalance_min_gap == 0 || available.len() < 2 {
+        if available.len() < 2 {
+            return None;
+        }
+        // ① 利用率信号（Task 7 根治：会话数 ≠ 真实负载）。利用率 = current_rate / safe_rps_hi
+        //    （≥1=贴墙/过载，<1=有余量）+ 429 率叠加。一个号会话少但每个都在撞墙(利用率高)，
+        //    应把会话迁给会话多但很闲(利用率低)的号——这是会话数指标永远做不到的。
+        if ma.rebalance_utilization_gap > 0.0 {
+            let cur_util = self.account_utilization(current);
+            // 前置门：仅当原号「真的接近/超过自己的天花板」(util ≥ SATURATED)才考虑按利用率迁移。
+            // 否则单次瞬态 429 也会把 util 抬高、引发不必要的会话搬家(churn)。
+            const SATURATED: f64 = 1.0;
+            if cur_util >= SATURATED {
+                // 找利用率最低的「别的号」（最有余量）。
+                if let Some((tid, tcreds)) = available
+                    .iter()
+                    .filter(|(id, _)| *id != current)
+                    .min_by(|(a, _), (b, _)| {
+                        self.account_utilization(*a)
+                            .partial_cmp(&self.account_utilization(*b))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                            .then(a.cmp(b))
+                    })
+                {
+                    let target_util = self.account_utilization(*tid);
+                    if cur_util - target_util >= ma.rebalance_utilization_gap {
+                        return Some((*tid, tcreds.clone()));
+                    }
+                }
+            }
+        }
+        // ② 会话数信号（回退/补充）：原号活跃会话数比最空号多 ≥ rebalance_min_gap。
+        if ma.rebalance_min_gap == 0 {
             return None;
         }
         let window = Duration::seconds(ma.rebalance_active_window_secs as i64);
@@ -1735,6 +1766,30 @@ impl MultiTokenManager {
             Some((target.0, target.1.clone()))
         } else {
             None
+        }
+    }
+
+    /// 账号「真实利用率」：current_rate / safe_rps_hi（越接近/超过 1 越满载），
+    /// 叠加「持续撞墙」的额外压力。无 limiter 数据时返回 0（视为空闲）。
+    /// 用于负载再平衡：把会话从高利用率(撞墙)号迁到低利用率(有余量)号。
+    ///
+    /// ⚠️ 429 压力只在**持续**撞墙(consecutive_throttles ≥ 2)时才计入，避免单次瞬态 429
+    /// 把利用率瞬间抬高引发不必要的会话搬家(churn)——单次 429 由 limiter 自己冷却消化即可。
+    fn account_utilization(&self, id: u64) -> f64 {
+        let scope = ThrottleScope::UserCredential(id);
+        match self.limiters.observe_full(&scope) {
+            Some(o) => {
+                let safe = o.learned_safe_rps_hi.max(1e-6);
+                let rate_util = (o.current_rate_rps / safe).clamp(0.0, 4.0);
+                // 持续撞墙才把 429 率计入；单次瞬态(consecutive < 2)不算「过载」。
+                let throttle_pressure = if o.consecutive_throttles >= 2 {
+                    o.upstream_429_rate_5m
+                } else {
+                    0.0
+                };
+                rate_util + throttle_pressure
+            }
+            None => 0.0,
         }
     }
 
@@ -5434,6 +5489,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(c1b.id, c1.id, "同一会话应黏回原号");
+    }
+
+    // Task 7 回归（#19 满载不迁给 #18 根治）：负载再平衡按「真实利用率」而非会话数。
+    // 构造：原号 t1 满载(高 429 + rate 贴 safe_hi=高利用率)，目标 t2 空闲(低利用率)，
+    // 即便 t1 的会话数不比 t2 多，也必须把会话迁到 t2。
+    #[tokio::test]
+    async fn test_rebalance_by_utilization_not_session_count() {
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.switch_debounce_secs = 0; // 不防抖，便于断言
+        config.adaptive_limit.multi_account.rebalance_utilization_gap = 0.3;
+        let manager = affinity_manager(config);
+        // 先把 sess-X 绑到 t1(id=1)。
+        let c = manager.acquire_context(None, None, Some("sess-X")).await.unwrap();
+        let busy = c.id;
+        let idle = if busy == 1 { 2 } else { 1 };
+        // 让 busy 号「满载」：撞几次 429 → rate 降、429 率拉高 → 利用率高。
+        let busy_lim = manager
+            .limiters()
+            .for_scope(&ThrottleScope::UserCredential(busy));
+        for _ in 0..3 {
+            busy_lim
+                .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None, 0)
+                .await;
+        }
+        // idle 号保持干净（无 429）→ 利用率低。
+        // 选号：sess-X 仍黏 busy，但 busy 利用率远高于 idle → 应触发利用率再平衡迁到 idle。
+        // 注意 busy 撞 3 次可能进 OPEN；OPEN 会走「强制切号」路径而非 rebalance。
+        // 为隔离测 rebalance 路径，这里直接调 rebalance_target 验证它按利用率选 idle。
+        let available: Vec<_> = manager
+            .available_credentials(None, None)
+            .into_iter()
+            .collect();
+        let target = manager.rebalance_target(
+            &available,
+            busy,
+            &manager.config.adaptive_limit.multi_account,
+        );
+        assert!(
+            target.is_some(),
+            "busy 号利用率高、idle 号有余量 → 应触发利用率再平衡"
+        );
+        assert_eq!(
+            target.unwrap().0,
+            idle,
+            "应把会话迁到利用率最低的 idle 号 {idle}"
+        );
     }
 
     // 原号冷却短于阈值：继续黏原号（由 limiter 自行等待，不切号）。

@@ -323,6 +323,12 @@ pub struct MultiAccountConfig {
     /// 才把当前会话迁到最空号。默认 2（≥2 保证迁移后两边不会立刻反向触发）。0 表示关闭被动再平衡。
     #[serde(default = "default_rebalance_min_gap")]
     pub rebalance_min_gap: usize,
+    /// 负载再平衡的「真实利用率」差距阈值。利用率 = current_rate / safe_rps_hi（越接近/超过 1 越满载）。
+    /// 仅当「原号利用率 − 最闲号利用率 ≥ 此值」才迁移。这是比会话数更真实的负载信号：
+    /// 一个号会话少但每个都在撞墙(利用率高)，应把会话迁给会话多但很闲(利用率低)的号。
+    /// 默认 0.3。0 表示关闭按利用率再平衡（回退到纯会话数）。
+    #[serde(default = "default_rebalance_utilization_gap")]
+    pub rebalance_utilization_gap: f64,
 }
 
 impl Default for MultiAccountConfig {
@@ -334,6 +340,7 @@ impl Default for MultiAccountConfig {
             switch_debounce_secs: default_switch_debounce_secs(),
             rebalance_active_window_secs: default_rebalance_active_window_secs(),
             rebalance_min_gap: default_rebalance_min_gap(),
+            rebalance_utilization_gap: default_rebalance_utilization_gap(),
         }
     }
 }
@@ -684,6 +691,9 @@ fn default_rebalance_active_window_secs() -> u64 {
 }
 fn default_rebalance_min_gap() -> usize {
     2
+}
+fn default_rebalance_utilization_gap() -> f64 {
+    0.3
 }
 
 fn default_circuit_breaker_enabled() -> bool {
