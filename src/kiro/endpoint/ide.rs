@@ -28,7 +28,11 @@ impl IdeEndpoint {
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("q.{}.amazonaws.com", self.api_region(ctx))
+        if ctx.config.runtime_endpoint {
+            format!("runtime.{}.kiro.dev", self.api_region(ctx))
+        } else {
+            format!("q.{}.amazonaws.com", self.api_region(ctx))
+        }
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
@@ -63,13 +67,13 @@ impl KiroEndpoint for IdeEndpoint {
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
         format!(
-            "https://q.{}.amazonaws.com/generateAssistantResponse",
-            self.api_region(ctx)
+            "https://{}/generateAssistantResponse",
+            self.host(ctx)
         )
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://q.{}.amazonaws.com/mcp", self.api_region(ctx))
+        format!("https://{}/mcp", self.host(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {

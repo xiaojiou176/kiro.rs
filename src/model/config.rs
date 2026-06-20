@@ -139,6 +139,21 @@ pub struct Config {
     #[serde(default = "default_endpoint")]
     pub default_endpoint: String,
 
+    /// 是否将推理端点从 legacy `q.{region}.amazonaws.com` 切到现役
+    /// `runtime.{region}.kiro.dev`。默认 false（保持旧行为，可灰度 / 回滚）。
+    ///
+    /// 实测（mitmproxy 抓包 + 真账 A/B）：runtime 端点限速更松（同号同负载 429 约 -30%），
+    /// apikey 鉴权下仍免费（额度 0 消耗，计费看鉴权不看端点），且为现役 Kiro CLI
+    /// （v2/v3、Social/apikey）实际使用的推理端点；legacy 已被官方标注为待弃用、只发遥测。
+    #[serde(default = "default_runtime_endpoint")]
+    pub runtime_endpoint: bool,
+
+    /// Kiro CLI 客户端版本号,用于 CLI 端点 UA 的 `md/appVersion-`。
+    /// 默认对齐当前真实 CLI 版本(抓包实测);官方 CLI 升级后可在 config 里直接 bump,
+    /// 无需重编译,避免指纹再次过时。
+    #[serde(default = "default_cli_version")]
+    pub cli_version: String,
+
     /// 是否启用请求链路追踪（写 traces.db）。默认 true。
     ///
     /// 关闭后：不再写入 trace 记录、不走 TraceSink，但 `GET /api/admin/traces`
@@ -227,6 +242,17 @@ fn default_extract_thinking() -> bool {
 
 fn default_endpoint() -> String {
     crate::kiro::endpoint::ide::IDE_ENDPOINT_NAME.to_string()
+}
+
+fn default_runtime_endpoint() -> bool {
+    // 默认开：runtime 端点实测 429 更低且 apikey 仍免费，是现役 Kiro CLI 的真实推理端点。
+    // 设为默认 true 后，万一 config 丢失/重置，回退到「好状态」(runtime + 新指纹) 而非
+    // legacy 端点的 429 风暴。要回 legacy 显式在 config 写 runtimeEndpoint=false。
+    true
+}
+
+fn default_cli_version() -> String {
+    "2.8.1".to_string()
 }
 
 fn default_trace_enabled() -> bool {
@@ -349,7 +375,12 @@ pub struct AdaptiveLimitConfig {
     /// 令牌桶容量（突发）。实测 burst 很小，先禁止瞬时双发。
     #[serde(default = "default_burst")]
     pub burst: f64,
-    /// 每个 scope 的最大在飞请求数。第一版 1（毫秒分析：在飞>1.5 升 429）。
+    /// 每个 scope 的最大在飞请求数（旧字段，语义已被重载，注意陷阱）：
+    /// - `> 1`：作为 `adaptiveConcurrency.hardMaxInflight` 的上限（下钳到该值）；
+    /// - `== 1`：视为「serde 默认 / 未配置」哨兵，**不覆盖** adaptive，走 `adaptiveConcurrency`。
+    ///
+    /// ⚠️ 因此本字段**无法表达「真单飞 1」**：写 1 会被当成「没配置」而忽略。
+    /// 要强制单飞，请改用 `adaptiveConcurrency.hardMaxInflight = 1`，不要在这里写 1。
     #[serde(default = "default_max_inflight_per_scope")]
     pub max_inflight_per_scope: usize,
     /// AIMD 加性增步长（rps）。
@@ -709,6 +740,8 @@ impl Default for Config {
             account_throttle_cooldown_secs: default_account_throttle_cooldown_secs(),
             extract_thinking: default_extract_thinking(),
             default_endpoint: default_endpoint(),
+            runtime_endpoint: default_runtime_endpoint(),
+            cli_version: default_cli_version(),
             trace_enabled: default_trace_enabled(),
             trace_retention_days: default_trace_retention_days(),
             usage_log_retention_days: default_usage_log_retention_days(),
@@ -798,7 +831,13 @@ mod adaptive_limit_tests {
         assert_eq!(c.max_absorb_wait_secs, 120);
         assert_eq!(c.max_rate_rps, 2.0);
         assert_eq!(c.burst, 1.0);
-        assert_eq!(c.max_inflight_per_scope, 1, "第一版必须为 1");
+        assert_eq!(c.max_inflight_per_scope, 1, "serde 默认仍为 1（不覆盖 adaptive）");
+        assert_eq!(c.adaptive_concurrency.hard_max_inflight, 32);
+        assert_eq!(
+            crate::kiro::rate_limiter::AdaptiveConfig::from_cfg(&c).hard_max_inflight,
+            32,
+            "默认 max_inflight_per_scope=1 不应 cap adaptive hard max"
+        );
         assert_eq!(c.beta_user, 0.5);
         assert_eq!(c.local_queue_timeout_secs, 90);
         assert!(!c.respect_retry_after, "AWS 不返回 Retry-After，默认关");
@@ -820,5 +859,16 @@ mod adaptive_limit_tests {
         let f = FailAloudConfig::default();
         assert_eq!(f.degraded_429_rate, 0.2);
         assert_eq!(f.soft_warn_rate_rps, 0.3);
+    }
+
+    #[test]
+    fn max_inflight_per_scope_caps_hard_max_when_above_one() {
+        let json = r#"{
+            "maxInflightPerScope": 12,
+            "adaptiveConcurrency": { "hardMaxInflight": 32, "minInflight": 4 }
+        }"#;
+        let c: AdaptiveLimitConfig = serde_json::from_str(json).expect("parse config");
+        let adaptive = crate::kiro::rate_limiter::AdaptiveConfig::from_cfg(&c);
+        assert_eq!(adaptive.hard_max_inflight, 12);
     }
 }

@@ -27,19 +27,24 @@ impl CliEndpoint {
     }
 
     fn host(&self, ctx: &RequestContext<'_>) -> String {
-        format!("q.{}.amazonaws.com", self.api_region(ctx))
+        if ctx.config.runtime_endpoint {
+            // 现役 Kiro CLI 推理端点（实测：apikey 仍免费、429 更低）
+            format!("runtime.{}.kiro.dev", self.api_region(ctx))
+        } else {
+            format!("q.{}.amazonaws.com", self.api_region(ctx))
+        }
     }
 
     fn user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
-            "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.14474 os/{} lang/rust/1.92.0 md/appVersion-{} app/AmazonQ-For-CLI",
-            ctx.config.system_version, ctx.config.kiro_version,
+            "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.16551 os/{} lang/rust/1.92.0 exec-env/AmazonQ-For-CLI Version/2.7.0 md/appVersion-{} app/AmazonQ-For-CLI",
+            ctx.config.system_version, ctx.config.cli_version,
         )
     }
 
     fn x_amz_user_agent(&self, ctx: &RequestContext<'_>) -> String {
         format!(
-            "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.14474 os/{} lang/rust/1.92.0 m/F app/AmazonQ-For-CLI",
+            "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.16551 os/{} lang/rust/1.92.0 exec-env/AmazonQ-For-CLI Version/2.7.0 m/F app/AmazonQ-For-CLI",
             ctx.config.system_version,
         )
     }
@@ -61,11 +66,11 @@ impl KiroEndpoint for CliEndpoint {
     }
 
     fn api_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://q.{}.amazonaws.com/", self.api_region(ctx))
+        format!("https://{}/", self.host(ctx))
     }
 
     fn mcp_url(&self, ctx: &RequestContext<'_>) -> String {
-        format!("https://q.{}.amazonaws.com/mcp", self.api_region(ctx))
+        format!("https://{}/mcp", self.host(ctx))
     }
 
     fn decorate_api(&self, req: RequestBuilder, ctx: &RequestContext<'_>) -> RequestBuilder {
