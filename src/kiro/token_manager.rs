@@ -1585,6 +1585,26 @@ impl MultiTokenManager {
         self.lowest_load_prioritized(available, exclude, false)
     }
 
+    /// M2 全 OPEN 兜底：当所有可用号都处于 OPEN 熔断窗口、正常选号(过滤 open)全灭时，
+    /// 退而求其次——挑 cooldown 剩余最短的那个号（最快能恢复的），而不是直接返回 None
+    /// 导致 acquire_context bail（"所有凭据均已禁用"）。OPEN 号被选中后，limiter 的
+    /// acquire 仍会按熔断状态本地排队/退避，不会真把请求硬打到上游——只是不再"无号可用"。
+    fn shortest_cooldown_fallback(
+        &self,
+        available: &[(u64, KiroCredentials)],
+    ) -> Option<(u64, KiroCredentials)> {
+        available
+            .iter()
+            .min_by_key(|(id, c)| {
+                let cd_ms = self
+                    .limiters
+                    .cooldown_remaining(&ThrottleScope::UserCredential(*id))
+                    .as_millis() as u64;
+                (cd_ms, c.priority, *id)
+            })
+            .map(|(id, c)| (*id, c.clone()))
+    }
+
     /// 选号：默认最低 RPM；`prefer_healthy=true` 时优先最低冷却，再最低 RPM，再凭据 priority/id。
     fn lowest_load_prioritized(
         &self,
@@ -1748,7 +1768,9 @@ impl MultiTokenManager {
             _ => {
                 let pick = self.lowest_load(pick_pool, None).or_else(|| {
                     self.lowest_load(&all_available, None)
-                })?;
+                })
+                // M2 全 OPEN 兜底：无会话的纯负载选号同样别在全 OPEN 时返回 None。
+                .or_else(|| self.shortest_cooldown_fallback(&all_available))?;
                 Self::log_select("load_select", pick.0, self.rpm(pick.0), 0, None, 0);
                 return Some(pick);
             }
@@ -1802,9 +1824,12 @@ impl MultiTokenManager {
         let pick_from_pool = |exclude: Option<u64>| {
             self.lowest_load_prioritized(pick_pool, exclude, prefer_healthy)
                 .or_else(|| self.lowest_load_prioritized(&all_available, exclude, prefer_healthy))
+                // M2 全 OPEN 兜底：上面两步会过滤掉 OPEN 号，全 OPEN 时返回 None。
+                // 这里退到「cooldown 最短的号」，保证有号可用而非整体 bail。
+                .or_else(|| self.shortest_cooldown_fallback(&all_available))
         };
 
-        let (act, chosen, cd_ms) = match &existing {
+        let (act, mut chosen, cd_ms) = match &existing {
             Some(b) if (now - b.last_seen) <= ttl => {
                 let bound_in_pool = all_available
                     .iter()
@@ -1912,16 +1937,51 @@ impl MultiTokenManager {
                     e.priority = bind_priority;
                 }
                 Act::NewBind => {
-                    aff.insert(
-                        key.clone(),
-                        AffinityBinding {
-                            credential_id: chosen.0,
-                            bound_at: now,
-                            last_seen: now,
-                            last_switch_at: None,
-                            priority: bind_priority,
-                        },
-                    );
+                    // H3 串号竞态根治（check-and-adopt）：本请求开头读 existing=None 走到这里，
+                    // 但 pick_from_pool 期间不持 affinity 锁（避免与 rpm/limiter 锁交叉死锁）。
+                    // 这个窗口里另一个同会话并发请求可能已经绑好号。提交前在锁内 re-check：
+                    // 若已存在未过 TTL 的有效绑定，**采纳它**（把 chosen 改成已绑号），绝不用自己
+                    // 独立选的号覆盖——否则两请求各打不同号 = 同会话串号(封号高危)。
+                    let adopt = aff
+                        .get(&key)
+                        .filter(|b| (now - b.last_seen) <= ttl)
+                        .filter(|b| {
+                            all_available.iter().any(|(id, _)| *id == b.credential_id)
+                        })
+                        .map(|b| b.credential_id);
+                    if let Some(adopt_id) = adopt {
+                        if adopt_id != chosen.0 {
+                            if let Some(creds) = all_available
+                                .iter()
+                                .find(|(id, _)| *id == adopt_id)
+                                .map(|(_, c)| c.clone())
+                            {
+                                tracing::debug!(
+                                    session = %key,
+                                    picked = chosen.0,
+                                    adopted = adopt_id,
+                                    "并发 NewBind：采纳已存在的会话绑定，避免同会话串号"
+                                );
+                                chosen = (adopt_id, creds);
+                            }
+                        }
+                        // 已有有效绑定：只刷新 last_seen/priority，不覆盖 credential_id。
+                        if let Some(e) = aff.get_mut(&key) {
+                            e.last_seen = now;
+                            e.priority = bind_priority;
+                        }
+                    } else {
+                        aff.insert(
+                            key.clone(),
+                            AffinityBinding {
+                                credential_id: chosen.0,
+                                bound_at: now,
+                                last_seen: now,
+                                last_switch_at: None,
+                                priority: bind_priority,
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -5292,6 +5352,58 @@ mod tests {
         assert_eq!(
             manager.affinity.lock().get("sess-A").map(|b| b.credential_id),
             Some(p1.0)
+        );
+    }
+
+    // H3 回归（并发串号竞态）：多个同会话请求并发选号，必须全部收敛到同一个号。
+    // 旧实现里 NewBind 无条件覆盖绑定，pick_from_pool 期间不持锁，两请求各 pick 不同号
+    // → 同会话串号(封号高危)。check-and-adopt 修复后：提交时锁内 re-check 采纳已有绑定。
+    #[tokio::test]
+    async fn test_concurrent_same_session_converges_to_one_account() {
+        let manager = std::sync::Arc::new(affinity_manager(Config::default()));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let m = manager.clone();
+            handles.push(tokio::spawn(async move {
+                m.select_with_affinity(None, None, Some("sess-RACE")).map(|p| p.0)
+            }));
+        }
+        let mut ids = std::collections::HashSet::new();
+        for h in handles {
+            if let Ok(Some(id)) = h.await {
+                ids.insert(id);
+            }
+        }
+        let bound = manager.affinity.lock().get("sess-RACE").map(|b| b.credential_id);
+        assert!(bound.is_some(), "并发后会话应有绑定");
+        assert_eq!(
+            ids.len(),
+            1,
+            "同会话并发选号必须收敛到同一个号，实际落到 {ids:?}（串号=封号高危）"
+        );
+    }
+
+    // M2 回归：所有号都 OPEN 熔断时，选号不应返回 None（导致 acquire_context bail），
+    // 而应退到 cooldown 最短的号——保证「有号可用」，由 limiter 自行排队/退避。
+    #[tokio::test]
+    async fn test_all_open_falls_back_to_shortest_cooldown() {
+        let mut config = Config::default();
+        config.adaptive_limit.circuit_breaker.open_429_threshold = 1;
+        config.adaptive_limit.user_cooldown_base_secs = 30;
+        let manager = affinity_manager(config);
+        for id in [1u64, 2u64] {
+            let lim = manager
+                .limiters()
+                .for_scope(&ThrottleScope::UserCredential(id));
+            for _ in 0..3 {
+                lim.on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None, 0)
+                    .await;
+            }
+        }
+        let pick = manager.select_with_affinity(None, None, Some("sess-AO"));
+        assert!(
+            pick.is_some(),
+            "全 OPEN 时应退到 cooldown 最短号，而非返回 None 导致整体 bail"
         );
     }
 
