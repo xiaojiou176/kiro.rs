@@ -829,7 +829,7 @@ async fn handle_stream_request(
     session_key: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
+    let mut call_result = match provider
         .call_api_stream(
             request_body,
             Some(tracer.as_ref()),
@@ -846,6 +846,7 @@ async fn handle_stream_request(
             return map_provider_error(e);
         }
     };
+    let limiter_permit = call_result.limiter_permit.take();
     let response = call_result.response;
     let credential_id = call_result.credential_id;
 
@@ -858,6 +859,8 @@ async fn handle_stream_request(
 
     // 创建 SSE 流
     let stream = create_sse_stream(response, ctx, initial_events, hook, credential_id, tracer);
+    // M1：permit 随 SSE 流活到流结束才 drop（而非 handler 返回即 drop）。
+    let stream = PermitHoldingStream::new(stream, limiter_permit);
 
     // 返回 SSE 响应
     Response::builder()
@@ -871,6 +874,40 @@ async fn handle_stream_request(
 
 /// Ping 事件间隔（25秒）
 const PING_INTERVAL_SECS: u64 = 25;
+
+/// M1：把限速器在飞许可(LimiterPermit)的生命周期绑定到 SSE 流本身。
+///
+/// 包住任意 SSE 字节流 + 持有 permit；只有当这个 wrapper 被 drop(流被完整消费完，
+/// 或客户端断连导致 axum 丢弃响应体)时，permit 才 drop → maxInflight 槽位才释放。
+/// 这修掉了「流式请求 permit 在 handler 返回(构建完 Body)时就 drop、而非流真正结束」
+/// 导致的长流在飞欠计数(实际并发可超 maxInflight、放大 429)。
+struct PermitHoldingStream {
+    inner: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>>,
+    // 持有到 drop；非流式/shadow 模式为 None。下划线：仅靠 Drop 释放，不主动读。
+    _permit: Option<crate::kiro::rate_limiter::LimiterPermit>,
+}
+
+impl PermitHoldingStream {
+    fn new(
+        inner: impl Stream<Item = Result<Bytes, Infallible>> + Send + 'static,
+        permit: Option<crate::kiro::rate_limiter::LimiterPermit>,
+    ) -> Self {
+        Self {
+            inner: Box::pin(inner),
+            _permit: permit,
+        }
+    }
+}
+
+impl Stream for PermitHoldingStream {
+    type Item = Result<Bytes, Infallible>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        self.inner.as_mut().poll_next(cx)
+    }
+}
 
 /// 创建 ping 事件的 SSE 字符串
 fn create_ping_sse() -> Bytes {
@@ -1610,7 +1647,7 @@ async fn handle_stream_request_buffered(
     session_key: Option<String>,
 ) -> Response {
     // 调用 Kiro API（支持多凭据故障转移）
-    let call_result = match provider
+    let mut call_result = match provider
         .call_api_stream(
             request_body,
             Some(tracer.as_ref()),
@@ -1626,6 +1663,7 @@ async fn handle_stream_request_buffered(
             return map_provider_error(e);
         }
     };
+    let limiter_permit = call_result.limiter_permit.take();
     let response = call_result.response;
     let credential_id = call_result.credential_id;
 
@@ -1641,6 +1679,8 @@ async fn handle_stream_request_buffered(
 
     // 创建缓冲 SSE 流
     let stream = create_buffered_sse_stream(response, ctx, hook, credential_id, tracer);
+    // M1：permit 随缓冲 SSE 流活到流结束才 drop（而非 handler 返回即 drop）。
+    let stream = PermitHoldingStream::new(stream, limiter_permit);
 
     // 返回 SSE 响应
     Response::builder()
@@ -1786,6 +1826,51 @@ fn create_buffered_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // M1 回归：PermitHoldingStream 持有 permit 直到流被完整消费(或 drop)，
+    // 而非构建后立即释放。验证「流未消费完时 inflight 仍占用，消费完才释放」。
+    #[tokio::test]
+    async fn permit_held_until_stream_fully_consumed() {
+        use crate::kiro::rate_limiter::{AcquireOutcome, AdaptiveConfig, AdaptiveLimiter};
+        use futures::StreamExt;
+
+        // 单飞 limiter：拿到 permit 后，第二次 acquire 必须等到 permit 释放。
+        let mut acfg = crate::model::config::AdaptiveLimitConfig::default();
+        acfg.enabled = true;
+        acfg.enforce = true;
+        acfg.adaptive_concurrency.hard_max_inflight = 1;
+        acfg.adaptive_concurrency.min_inflight = 1;
+        let mut cfg = AdaptiveConfig::from_cfg(&acfg);
+        cfg.hard_max_inflight = 1;
+        cfg.min_inflight = 1;
+        // 高速率 + 大 burst：让「令牌桶」几乎不拦，使测试只考验「inflight 槽位」这一维度
+        // （否则第二次 acquire 会被令牌桶节流而非 inflight，掩盖 permit 释放语义）。
+        cfg.initial_rate_rps = 1000.0;
+        cfg.max_rate_rps = 1000.0;
+        cfg.goodput_sanity_max_rps = 1000.0;
+        cfg.burst = 10.0;
+        let lim = AdaptiveLimiter::new(cfg);
+        let permit = match lim.acquire().await {
+            AcquireOutcome::Proceed(p) => p,
+            other => panic!("expected Proceed, got {other:?}"),
+        };
+        // 构造一个 2 元素的 SSE 流，permit 交给 PermitHoldingStream。
+        let inner = stream::iter(vec![
+            Ok::<Bytes, Infallible>(Bytes::from_static(b"a")),
+            Ok::<Bytes, Infallible>(Bytes::from_static(b"b")),
+        ]);
+        let mut held = PermitHoldingStream::new(inner, Some(permit));
+        // 消费第一个元素：流没结束 → permit 仍被持有 → 第二次 acquire 拿不到。
+        assert!(held.next().await.is_some());
+        let blocked = tokio::time::timeout(Duration::from_millis(80), lim.acquire()).await;
+        assert!(blocked.is_err(), "流未消费完时 permit 应仍占用 inflight");
+        // 消费完整个流并 drop wrapper → permit 释放 → 第二次 acquire 能拿到。
+        assert!(held.next().await.is_some());
+        assert!(held.next().await.is_none());
+        drop(held);
+        let ok = tokio::time::timeout(Duration::from_millis(200), lim.acquire()).await;
+        assert!(ok.is_ok(), "流结束 + wrapper drop 后 permit 应释放，inflight 可再获取");
+    }
 
     #[test]
     fn bedrock_client_validation_errors_map_to_400() {
