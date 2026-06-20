@@ -77,6 +77,15 @@ async fn main() {
         std::process::exit(1);
     });
 
+    // 打印端点 / 指纹的实际生效值：这俩收益(runtime 端点 + 新指纹)以前只锁在 config 标志位后面，
+    // 静默生效难排查。启动时显式记录一行，丢配置/回退时一眼可见走的是哪个端点。
+    tracing::info!(
+        runtime_endpoint = config.runtime_endpoint,
+        cli_version = %config.cli_version,
+        "端点配置生效: {}",
+        if config.runtime_endpoint { "runtime.{region}.kiro.dev" } else { "q.{region}.amazonaws.com (legacy)" }
+    );
+
     // 加载凭证（支持单对象或数组格式）
     let credentials_config = CredentialsConfig::load(&credentials_path).unwrap_or_else(|e| {
         tracing::error!("加载凭证失败: {}", e);
@@ -285,6 +294,46 @@ async fn main() {
                 tm.flush_affinity_if_dirty();
                 tm.flush_pins_if_dirty();
                 tm.flush_learning_if_dirty();
+            }
+        });
+    }
+
+    // 恢复探测:低流量也能把 rate 从地板爬回「最近真实天花板」(只看最近 probe_window 窗口的 429,
+    // 不是终身均值)。这是"学死卡地板"的根治:不依赖 near_cap / 高流量;撞墙后 on_throttle 自动停手退避。
+    {
+        let tm = token_manager.clone();
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(15);
+            // 探测器健康信号：连续多少轮没抬升任何 scope。地板自恢复是这套限速器的根治点，
+            // 一旦探测静默失效(panic/逻辑回归)，速率会重新被「学死」却无人知。这里做两件兜底：
+            // 1) catch_unwind 包住单轮，panic 不杀循环、记 error 后继续；
+            // 2) 连续 N 轮 0 抬升发一条 warn 作为「可能卡住」信号(正常零流量也会 0 抬升，故仅作弱信号)。
+            let mut consecutive_zero: u32 = 0;
+            const ZERO_WARN_THRESHOLD: u32 = 240; // 240×15s ≈ 1 小时持续 0 抬升才告警，避免噪声
+            loop {
+                tokio::time::sleep(interval).await;
+                let limiters = tm.limiters();
+                let raised = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    limiters.recovery_probe_tick_all()
+                })) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        tracing::error!("recovery_probe_tick_all panic，已捕获本轮，循环继续");
+                        continue;
+                    }
+                };
+                if raised > 0 {
+                    consecutive_zero = 0;
+                    tracing::debug!(scopes = raised, "recovery_probe 抬升速率");
+                } else {
+                    consecutive_zero = consecutive_zero.saturating_add(1);
+                    if consecutive_zero == ZERO_WARN_THRESHOLD {
+                        tracing::warn!(
+                            rounds = consecutive_zero,
+                            "recovery_probe 已连续约 1 小时未抬升任何 scope：可能全员已达 max(正常)，"
+                        );
+                    }
+                }
             }
         });
     }

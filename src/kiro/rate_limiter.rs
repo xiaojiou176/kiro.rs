@@ -81,10 +81,57 @@ pub enum AccountState {
     Disabled,
 }
 
+/// 在飞许可：drop 时记录持有时长并唤醒 WaitInflight 等待者。
+pub(crate) struct LimiterPermit {
+    permit: tokio::sync::OwnedSemaphorePermit,
+    limiter: Arc<AdaptiveLimiter>,
+    /// 仅当 token 桶放行、真实请求在飞时起算；abort 路径为 None，drop 时不记 held 样本。
+    acquired_at: Option<Instant>,
+}
+
+impl LimiterPermit {
+    pub(crate) fn new(limiter: Arc<AdaptiveLimiter>, permit: tokio::sync::OwnedSemaphorePermit) -> Self {
+        Self {
+            permit,
+            limiter,
+            acquired_at: None,
+        }
+    }
+
+    /// token 桶等待结束、即将发请求时调用，held_ms 只统计此后到 drop 的时长。
+    fn mark_request_started(&mut self) {
+        self.acquired_at = Some(Instant::now());
+    }
+}
+
+impl std::fmt::Debug for LimiterPermit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LimiterPermit")
+            .field(
+                "held_ms",
+                &self
+                    .acquired_at
+                    .map(|t| t.elapsed().as_millis())
+                    .unwrap_or(0),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for LimiterPermit {
+    fn drop(&mut self) {
+        if let Some(acquired_at) = self.acquired_at {
+            let held_ms = acquired_at.elapsed().as_millis() as u64;
+            self.limiter.record_held_duration(held_ms);
+        }
+        self.limiter.notify.notify_waiters();
+    }
+}
+
 /// acquire 的结果。
 #[derive(Debug)]
 pub enum AcquireOutcome {
-    Proceed(tokio::sync::OwnedSemaphorePermit),
+    Proceed(LimiterPermit),
     LocalThrottled {
         est_wait_ms: u64,
         current_rps: f64,
@@ -139,6 +186,30 @@ impl AdaptiveConfig {
         let ac = &c.adaptive_concurrency;
         let cb = &c.circuit_breaker;
         let pr = &c.probe;
+        let ac_hard = ac.hard_max_inflight.max(ac.min_inflight).max(1);
+        // max_inflight_per_scope > 1 表示 ops 显式配置了旧字段；=1 为 serde 默认，不覆盖 adaptive_concurrency。
+        let hard_max_inflight = if c.max_inflight_per_scope > 1 {
+            let requested = c.max_inflight_per_scope;
+            let raised = requested.max(ac.min_inflight).min(ac_hard);
+            if requested < ac.min_inflight {
+                tracing::warn!(
+                    max_inflight_per_scope = requested,
+                    min_inflight = ac.min_inflight,
+                    effective = raised,
+                    "maxInflightPerScope 低于 minInflight，已上抬至 minInflight"
+                );
+            } else if requested > ac_hard {
+                tracing::warn!(
+                    max_inflight_per_scope = requested,
+                    hard_max_inflight = ac_hard,
+                    effective = raised,
+                    "maxInflightPerScope 超过 hardMaxInflight，已下调至 hardMaxInflight"
+                );
+            }
+            raised
+        } else {
+            ac_hard
+        };
         Self {
             enabled: c.enabled,
             enforce: c.enforce,
@@ -150,7 +221,7 @@ impl AdaptiveConfig {
             max_absorb_wait: Duration::from_secs(c.max_absorb_wait_secs.max(1)),
             max_rate_rps: max_rate,
             burst: c.burst.max(1.0),
-            hard_max_inflight: ac.hard_max_inflight.max(ac.min_inflight).max(1),
+            hard_max_inflight,
             min_inflight: ac.min_inflight.max(1),
             additive_step_rps: c.additive_step_rps.max(0.0),
             increase_interval: Duration::from_secs(c.increase_interval_secs),
@@ -348,6 +419,44 @@ impl AdaptiveLimiter {
         rate_429_locked(&self.state.lock().upstream_events, self.cfg.probe_window)
     }
 
+    /// 恢复探测条件的单一判定源(持锁版)：电路 Healthy、已冷却、rate 未到 max、
+    /// 最近窗口 429 率 < budget_low。`recovery_probe_tick()`(实际抬升的门) 和
+    /// `observe_full()`(面板 `recovery_eligible` 指标) 都复用它，避免两处各写一份导致
+    /// 「面板说能恢复但实际不抬」或反之的漂移。
+    fn recovery_eligible_locked(cfg: &AdaptiveConfig, st: &State) -> bool {
+        matches!(st.circuit, CircuitState::Healthy)
+            && st.cooldown_until.map(|t| Instant::now() >= t).unwrap_or(true)
+            && st.rate_rps < cfg.max_rate_rps - f64::EPSILON
+            && rate_429_locked(&st.upstream_events, cfg.probe_window) < cfg.probe_budget_low
+    }
+
+    /// 恢复探测(根治"学死卡地板")：低流量也能把 rate 从地板爬回「最近真实天花板」。
+    ///
+    /// 只依据**最近 `probe_window` 窗口**的 429 率(不是终身均值,旧 429 会随窗口自然过期),
+    /// 当窗口干净(< `probe_budget_low`)、电路 Healthy、已冷却、rate 未达 max 时,
+    /// 按 `additive_step_rps` 抬升 rate 向 `max_rate_rps`。
+    ///
+    /// 与 `on_success` 的涨速不同:**不要求 near_cap、不依赖流量、不被终身学习 hi 压制** ——
+    /// 由后台周期调用,所以即使零流量也能恢复。撞墙后 `on_throttle` 会把窗口 429 拉高 →
+    /// 本探测自动停手并退避,形成"贴着最近墙浮动"的闭环。返回是否实际抬升。
+    pub fn recovery_probe_tick(&self) -> bool {
+        let mut st = self.state.lock();
+        // 门：复用单一判定源，确保「面板 recovery_eligible」与「实际抬升」永远一致。
+        if !Self::recovery_eligible_locked(&self.cfg, &st) {
+            return false;
+        }
+        let now = Instant::now();
+        let step = self.cfg.additive_step_rps.max(0.0);
+        if step <= 0.0 {
+            return false;
+        }
+        Self::refill_locked(&self.cfg, &mut st);
+        st.rate_rps = (st.rate_rps + step).min(self.cfg.max_rate_rps);
+        st.last_increase = now;
+        self.notify.notify_waiters();
+        true
+    }
+
     pub fn observe_full(&self) -> LimiterObservation {
         let mut st = self.state.lock();
         let (state, reason, reopen_ms) = Self::circuit_snapshot(&mut st);
@@ -392,6 +501,7 @@ impl AdaptiveLimiter {
             upstream_429_rate_5m: rate_429_locked(&st.upstream_events, self.cfg.probe_window),
             consecutive_throttles: st.consecutive_throttles,
             cooldown_remaining_ms: Self::cooldown_remaining_from_state(&st).as_millis() as u64,
+            recovery_eligible: Self::recovery_eligible_locked(&self.cfg, &st),
         }
     }
 
@@ -499,12 +609,13 @@ impl AdaptiveLimiter {
             }
         }
 
-        let permit = self
+        let raw_permit = self
             .inflight
             .clone()
             .acquire_owned()
             .await
             .expect("semaphore never closed");
+        let mut permit = LimiterPermit::new(Arc::clone(self), raw_permit);
 
         let absorb_deadline = Instant::now() + self.cfg.max_absorb_wait;
         let mut slice_deadline = Instant::now() + self.cfg.local_queue_timeout;
@@ -524,6 +635,7 @@ impl AdaptiveLimiter {
                 } else if st.tokens >= 1.0 {
                     st.tokens -= 1.0;
                     self.note_send();
+                    permit.mark_request_started();
                     return AcquireOutcome::Proceed(permit);
                 } else {
                     let missing = 1.0 - st.tokens;
@@ -689,8 +801,9 @@ impl AdaptiveLimiter {
                 0.0
             };
             if probe_step > 0.0 {
-                let cap = self.learned_probe_cap();
-                st.rate_rps = (st.rate_rps + probe_step).min(cap);
+                // 最近窗口干净(probe_step>0 ⟺ global_429<budget_low)→ 上探向 max,
+                // 不被终身学习 hi 压制(与 recovery_probe 一致,贴最近真实天花板)。
+                st.rate_rps = (st.rate_rps + probe_step).min(self.cfg.max_rate_rps);
             } else if probe_step < 0.0 {
                 st.rate_rps = (st.rate_rps + probe_step).max(self.effective_rate_floor());
             } else {
@@ -903,6 +1016,8 @@ pub struct LimiterObservation {
     pub upstream_429_rate_5m: f64,
     pub consecutive_throttles: u32,
     pub cooldown_remaining_ms: u64,
+    /// 是否满足恢复探测条件(最近窗口干净、电路健康、可向上恢复速率)——观测指标。
+    pub recovery_eligible: bool,
 }
 
 fn record_upstream(events: &mut VecDeque<(Instant, bool)>, was_429: bool, window: Duration) {
@@ -1014,6 +1129,12 @@ impl LimiterRegistry {
         map.get(&key).map(|l| l.observe_full())
     }
 
+    /// 对所有 scope 跑一次恢复探测(后台周期调用)。返回实际抬升 rate 的 scope 数量。
+    pub fn recovery_probe_tick_all(&self) -> usize {
+        let limiters: Vec<Arc<AdaptiveLimiter>> = self.map.lock().values().cloned().collect();
+        limiters.iter().filter(|l| l.recovery_probe_tick()).count()
+    }
+
     pub fn global_upstream_429_rate(&self) -> f64 {
         let map = self.map.lock();
         let mut events: VecDeque<(Instant, bool)> = VecDeque::new();
@@ -1034,6 +1155,23 @@ impl LimiterRegistry {
             *counts.entry(s).or_insert(0) += 1;
         }
         counts
+    }
+}
+
+#[cfg(test)]
+impl AdaptiveLimiter {
+    async fn test_acquire_unmarked_permit(self: &Arc<Self>) -> LimiterPermit {
+        let raw = self
+            .inflight
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("inflight semaphore open");
+        LimiterPermit::new(Arc::clone(self), raw)
+    }
+
+    fn test_notify(&self) -> &Notify {
+        &self.notify
     }
 }
 
@@ -1416,6 +1554,83 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_recovery_probe_climbs_when_recent_429_clean() {
+        let mut cfg = test_cfg();
+        cfg.additive_step_rps = 0.05;
+        cfg.max_rate_rps = 1.0;
+        cfg.probe_budget_low = 0.01;
+        let lim = AdaptiveLimiter::new(cfg);
+        {
+            let mut st = lim.state.lock();
+            st.rate_rps = 0.02; // 模拟"学死卡地板"
+            st.cooldown_until = None;
+            st.circuit = CircuitState::Healthy;
+            st.upstream_events.clear(); // 最近窗口干净
+        }
+        let before = lim.current_rate_rps();
+        let raised = lim.recovery_probe_tick();
+        let after = lim.current_rate_rps();
+        assert!(raised, "recent window clean -> should climb");
+        assert!(after > before, "rate must increase: {before} -> {after}");
+        assert!(after <= 1.0 + 1e-9, "must not exceed max_rate");
+    }
+
+    #[tokio::test]
+    async fn test_recovery_probe_holds_when_recent_429_present() {
+        let mut cfg = test_cfg();
+        cfg.probe_budget_low = 0.01;
+        let lim = AdaptiveLimiter::new(cfg);
+        {
+            let mut st = lim.state.lock();
+            st.rate_rps = 0.02;
+            st.cooldown_until = None;
+            st.circuit = CircuitState::Healthy;
+            st.upstream_events.clear();
+            st.upstream_events.push_back((Instant::now(), true)); // 最近有 429
+        }
+        let before = lim.current_rate_rps();
+        let raised = lim.recovery_probe_tick();
+        assert!(!raised, "recent 429 above budget -> must NOT climb");
+        assert!((lim.current_rate_rps() - before).abs() < 1e-9, "rate must stay put");
+    }
+
+    // P2-1 回归：面板指标 observe_full().recovery_eligible 必须与「探测会不会抬升」一致，
+    // 防止两处判定漂移(面板说能恢复但实际不抬，或反之)。
+    #[tokio::test]
+    async fn test_recovery_eligible_metric_matches_probe_outcome() {
+        // case A：窗口干净 → 指标应为 true，且探测确实抬升
+        let mut cfg = test_cfg();
+        cfg.additive_step_rps = 0.05;
+        cfg.max_rate_rps = 1.0;
+        cfg.probe_budget_low = 0.01;
+        let lim = AdaptiveLimiter::new(cfg);
+        {
+            let mut st = lim.state.lock();
+            st.rate_rps = 0.02;
+            st.cooldown_until = None;
+            st.circuit = CircuitState::Healthy;
+            st.upstream_events.clear();
+        }
+        assert!(lim.observe_full().recovery_eligible, "clean window -> metric true");
+        assert!(lim.recovery_probe_tick(), "clean window -> probe fires");
+
+        // case B：最近有 429 → 指标应为 false，且探测不抬升
+        let mut cfg2 = test_cfg();
+        cfg2.probe_budget_low = 0.01;
+        let lim2 = AdaptiveLimiter::new(cfg2);
+        {
+            let mut st = lim2.state.lock();
+            st.rate_rps = 0.02;
+            st.cooldown_until = None;
+            st.circuit = CircuitState::Healthy;
+            st.upstream_events.clear();
+            st.upstream_events.push_back((Instant::now(), true));
+        }
+        assert!(!lim2.observe_full().recovery_eligible, "recent 429 -> metric false");
+        assert!(!lim2.recovery_probe_tick(), "recent 429 -> probe holds");
+    }
+
     #[test]
     fn test_registry_isolates_scopes() {
         let reg = LimiterRegistry::new(test_cfg(), None);
@@ -1493,13 +1708,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_probe_increase_capped_at_learned_safe_hi() {
+    async fn test_probe_climbs_past_stale_lifetime_hi_when_window_clean() {
+        // 根治:最近窗口干净时,上探不再被"终身学到的 hi"(此处 0.08)压制,而是向 max_rate 爬。
         let mut cfg = test_cfg();
         cfg.additive_step_rps = 0.05;
         cfg.increase_interval = Duration::from_millis(0);
         cfg.successes_per_increase = 1;
         cfg.probe_budget_low = 0.01;
         cfg.probe_budget_high = 0.02;
+        cfg.max_rate_rps = 1.0;
         cfg.learning_enabled = true;
         cfg.learning_min_samples_for_floor = 1;
         let learning = learning_store_with(7, 0.04, 0.08);
@@ -1517,13 +1734,13 @@ mod tests {
             lim.on_success(0).await;
         }
         assert!(
-            lim.current_rate_rps() <= 0.08 + 1e-9,
-            "rate should cap at learned safe_hi 0.08, got {}",
+            lim.current_rate_rps() > 0.08,
+            "clean window: rate must climb PAST stale lifetime hi 0.08, got {}",
             lim.current_rate_rps()
         );
         assert!(
-            lim.current_rate_rps() > 0.04,
-            "rate should probe upward under low 429 budget, got {}",
+            lim.current_rate_rps() <= 1.0 + 1e-9,
+            "rate must not exceed max_rate 1.0, got {}",
             lim.current_rate_rps()
         );
     }
@@ -1563,5 +1780,295 @@ mod tests {
             h.join().expect("concurrent observe/throttle/success must not deadlock");
         }
         assert!(start.elapsed() < StdDuration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn test_permit_drop_records_held_duration_for_p80() {
+        use crate::kiro::account_learning::LearningStore;
+        use crate::model::config::LearningConfig;
+
+        let mut cfg = test_cfg();
+        cfg.learning_enabled = true;
+        let learning = LearningStore::new(LearningConfig::default(), None);
+        let lim = AdaptiveLimiter::new_with_context(cfg, Some(42), Some(learning.clone()));
+
+        assert_eq!(learning.p80_held_ms(42), 30_000);
+
+        let permit = ensure_proceed(lim.acquire().await);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(permit);
+
+        let p80 = learning.p80_held_ms(42);
+        assert_ne!(p80, 30_000, "p80 should update after record_held_duration on permit drop");
+        assert!(p80 >= 45, "held ~50ms should reflect in p80, got {p80}");
+    }
+
+    #[tokio::test]
+    async fn test_permit_drop_notifies_inflight_waiters() {
+        let mut cfg = test_cfg();
+        cfg.hard_max_inflight = 1;
+        cfg.min_inflight = 1;
+        cfg.initial_rate_rps = 100.0;
+        cfg.max_rate_rps = 100.0;
+        cfg.burst = 10.0;
+        let lim = Arc::new(AdaptiveLimiter::new(cfg));
+
+        let held = ensure_proceed(lim.acquire().await);
+
+        let lim2 = lim.clone();
+        let waiter = tokio::spawn(async move {
+            let start = Instant::now();
+            ensure_proceed(lim2.acquire().await);
+            start.elapsed()
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(held);
+
+        let elapsed = tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("waiter should complete after permit drop")
+            .expect("waiter join");
+        assert!(
+            elapsed < Duration::from_millis(40),
+            "waiter should wake on notify, not poll 50ms; got {:?}",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_max_inflight_per_scope_caps_hard_max_in_adaptive_config() {
+        let json = r#"{
+            "maxInflightPerScope": 12,
+            "adaptiveConcurrency": { "hardMaxInflight": 32, "minInflight": 4 }
+        }"#;
+        let c: AdaptiveLimitConfig = serde_json::from_str(json).expect("parse");
+        let adaptive = AdaptiveConfig::from_cfg(&c);
+        assert_eq!(adaptive.hard_max_inflight, 12);
+    }
+
+    #[test]
+    fn test_max_inflight_below_min_warns_and_raises() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::EnvFilter;
+
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let make_writer = {
+            let logs = Arc::clone(&logs);
+            move || TestLogWriter(Arc::clone(&logs))
+        };
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::new("warn"))
+                .with_writer(make_writer)
+                .with_ansi(false)
+                .finish(),
+        );
+
+        let json = r#"{
+            "maxInflightPerScope": 2,
+            "adaptiveConcurrency": { "hardMaxInflight": 32, "minInflight": 4 }
+        }"#;
+        let c: AdaptiveLimitConfig = serde_json::from_str(json).expect("parse");
+        let adaptive = AdaptiveConfig::from_cfg(&c);
+        assert_eq!(
+            adaptive.hard_max_inflight, 4,
+            "maxInflightPerScope=2 should be raised to minInflight=4"
+        );
+
+        let log_text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(
+            log_text.contains("maxInflightPerScope 低于 minInflight"),
+            "expected warn log, got: {log_text}"
+        );
+        assert!(log_text.contains("min_inflight=4") || log_text.contains("min_inflight: 4"));
+    }
+
+    #[tokio::test]
+    async fn test_held_ms_excludes_token_bucket_wait() {
+        use crate::kiro::account_learning::LearningStore;
+        use crate::model::config::LearningConfig;
+
+        let mut cfg = test_cfg();
+        cfg.learning_enabled = true;
+        cfg.initial_rate_rps = 0.5;
+        cfg.min_rate_rps = 0.5;
+        cfg.max_rate_rps = 0.5;
+        cfg.burst = 1.0;
+        cfg.local_queue_timeout = Duration::from_secs(30);
+        cfg.max_absorb_wait = Duration::from_secs(30);
+        let learning = LearningStore::new(LearningConfig::default(), None);
+        let lim = Arc::new(AdaptiveLimiter::new_with_context(
+            cfg,
+            Some(77),
+            Some(learning.clone()),
+        ));
+
+        let held_first = ensure_proceed(lim.acquire().await);
+        let lim2 = Arc::clone(&lim);
+        let waiter = tokio::spawn(async move {
+            let permit = ensure_proceed(lim2.acquire().await);
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            permit
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(held_first);
+
+        let permit = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("second acquire should complete after token refill")
+            .expect("waiter join");
+        drop(permit);
+
+        let p80 = learning.p80_held_ms(77);
+        assert!(
+            p80 < 500,
+            "held_ms should exclude ~2s token wait; p80={p80}"
+        );
+        assert!(p80 >= 45, "held_ms should include ~60ms in-flight; p80={p80}");
+    }
+
+    #[tokio::test]
+    async fn test_abort_permit_drop_notifies_waiters_without_held_sample() {
+        use crate::kiro::account_learning::LearningStore;
+        use crate::model::config::LearningConfig;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut cfg = test_cfg();
+        cfg.hard_max_inflight = 2;
+        cfg.min_inflight = 2;
+        cfg.learning_enabled = true;
+        let learning = LearningStore::new(LearningConfig::default(), None);
+        let lim = Arc::new(AdaptiveLimiter::new_with_context(
+            cfg,
+            Some(91),
+            Some(learning.clone()),
+        ));
+
+        assert_eq!(learning.p80_held_ms(91), 30_000);
+
+        let held = ensure_proceed(lim.acquire().await);
+        let abort_permit = lim.test_acquire_unmarked_permit().await;
+
+        let lim_notify = Arc::clone(&lim);
+        let notified = Arc::new(AtomicBool::new(false));
+        let notified_flag = Arc::clone(&notified);
+        let listener = tokio::spawn(async move {
+            lim_notify.test_notify().notified().await;
+            notified_flag.store(true, Ordering::SeqCst);
+        });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        drop(abort_permit);
+
+        tokio::time::timeout(Duration::from_millis(100), listener)
+            .await
+            .expect("listener should wake on abort permit drop notify")
+            .expect("listener join");
+        assert!(
+            notified.load(Ordering::SeqCst),
+            "abort drop must notify waiters on notify.notified()"
+        );
+        assert_eq!(
+            learning.p80_held_ms(91),
+            30_000,
+            "abort drop (acquired_at=None) must not record held sample"
+        );
+
+        drop(held);
+    }
+
+    #[test]
+    fn test_max_inflight_above_hard_warns_and_caps() {
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::EnvFilter;
+
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let make_writer = {
+            let logs = Arc::clone(&logs);
+            move || TestLogWriter(Arc::clone(&logs))
+        };
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::new("warn"))
+                .with_writer(make_writer)
+                .with_ansi(false)
+                .finish(),
+        );
+
+        let json = r#"{
+            "maxInflightPerScope": 50,
+            "adaptiveConcurrency": { "hardMaxInflight": 32, "minInflight": 4 }
+        }"#;
+        let c: AdaptiveLimitConfig = serde_json::from_str(json).expect("parse");
+        let adaptive = AdaptiveConfig::from_cfg(&c);
+        assert_eq!(
+            adaptive.hard_max_inflight, 32,
+            "maxInflightPerScope=50 should be capped to hardMaxInflight=32"
+        );
+
+        let log_text = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(
+            log_text.contains("maxInflightPerScope 超过 hardMaxInflight"),
+            "expected warn log, got: {log_text}"
+        );
+        assert!(
+            log_text.contains("hard_max_inflight=32") || log_text.contains("hard_max_inflight: 32")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_local_throttled_abort_does_not_record_held() {
+        use crate::kiro::account_learning::LearningStore;
+        use crate::model::config::LearningConfig;
+
+        let mut cfg = test_cfg();
+        cfg.learning_enabled = true;
+        cfg.local_queue_timeout = Duration::from_millis(50);
+        cfg.max_absorb_wait = Duration::from_millis(120);
+        cfg.open_429_threshold = 100;
+        let learning = LearningStore::new(LearningConfig::default(), None);
+        let lim = Arc::new(AdaptiveLimiter::new_with_context(
+            cfg,
+            Some(88),
+            Some(learning.clone()),
+        ));
+
+        assert_eq!(learning.p80_held_ms(88), 30_000);
+
+        let held = ensure_proceed(lim.acquire().await);
+        match lim.acquire().await {
+            AcquireOutcome::LocalThrottled { reason, .. } => {
+                assert_eq!(reason, "absorb_timeout");
+            }
+            other => panic!("expected LocalThrottled absorb_timeout, got {other:?}"),
+        }
+        assert_eq!(
+            learning.p80_held_ms(88),
+            30_000,
+            "abort drop must not record held sample"
+        );
+        drop(held);
+    }
+
+    struct TestLogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for TestLogWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn ensure_proceed(outcome: AcquireOutcome) -> LimiterPermit {
+        match outcome {
+            AcquireOutcome::Proceed(p) => p,
+            other => panic!("expected Proceed, got {other:?}"),
+        }
     }
 }

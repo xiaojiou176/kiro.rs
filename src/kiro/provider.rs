@@ -46,7 +46,7 @@ struct LocalThrottleMarker {
 struct LimiterAttemptGuard<'a> {
     provider: &'a KiroProvider,
     cred_id: u64,
-    permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    permit: Option<crate::kiro::rate_limiter::LimiterPermit>,
     outcome_recorded: bool,
 }
 
@@ -74,7 +74,7 @@ impl<'a> LimiterAttemptGuard<'a> {
         }
     }
 
-    fn set_permit(&mut self, permit: tokio::sync::OwnedSemaphorePermit) {
+    fn set_permit(&mut self, permit: crate::kiro::rate_limiter::LimiterPermit) {
         self.permit = Some(permit);
     }
 
@@ -82,7 +82,7 @@ impl<'a> LimiterAttemptGuard<'a> {
         self.outcome_recorded = true;
     }
 
-    fn take_permit_on_success(&mut self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    fn take_permit_on_success(&mut self) -> Option<crate::kiro::rate_limiter::LimiterPermit> {
         self.outcome_recorded = true;
         self.permit.take()
     }
@@ -152,7 +152,7 @@ pub struct KiroCallResult {
     ///   `KiroCallResult` 随 handler 返回 drop → maxInflight 在 handler 返回时释放，
     ///   而非客户端/SSE 流结束。`None` 表示未启用限速或 shadow 模式。
     #[allow(dead_code)]
-    pub(crate) limiter_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    pub(crate) limiter_permit: Option<crate::kiro::rate_limiter::LimiterPermit>,
 }
 
 /// Kiro API Provider
