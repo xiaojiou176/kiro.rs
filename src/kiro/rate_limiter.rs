@@ -211,6 +211,15 @@ pub struct AdaptiveConfig {
     pub probe_budget_low: f64,
     pub probe_budget_high: f64,
     pub probe_window: Duration,
+    /// goodput 控制器护栏带：[band_low, band_high] 是理想稳态(贴天花板),
+    /// 低于 band_low 允许爬山，高于 hard_ceiling 强制降速。
+    pub goodput_band_low: f64,
+    pub goodput_band_high: f64,
+    pub goodput_hard_ceiling: f64,
+    /// 失控保险丝：rate 绝对上限(rps)，去掉日常 max_rate 封顶后防 bug 冲天。
+    pub goodput_sanity_max_rps: f64,
+    /// goodput 判「上涨」的最小相对增幅；低于此视为持平→停止爬升。
+    pub goodput_rise_epsilon: f64,
     pub learning_enabled: bool,
 }
 
@@ -280,6 +289,11 @@ impl AdaptiveConfig {
             probe_budget_low: pr.upstream_429_budget_low.clamp(0.0, 1.0),
             probe_budget_high: pr.upstream_429_budget_high.clamp(0.0, 1.0),
             probe_window: Duration::from_secs(pr.window_secs.max(60)),
+            goodput_band_low: pr.goodput_band_low.clamp(0.0, 1.0),
+            goodput_band_high: pr.goodput_band_high.clamp(0.0, 1.0),
+            goodput_hard_ceiling: pr.goodput_hard_ceiling.clamp(0.0, 1.0),
+            goodput_sanity_max_rps: pr.goodput_sanity_max_rps.max(min_rate),
+            goodput_rise_epsilon: pr.goodput_rise_epsilon.max(0.0),
             learning_enabled: c.learning.enabled,
         }
     }
@@ -317,6 +331,17 @@ struct State {
     circuit: CircuitState,
     effective_max_inflight: usize,
     upstream_events: VecDeque<(Instant, bool)>,
+    /// goodput 测量：每次成功完成(on_success)记一个时间戳，按窗口算「成功请求/秒」。
+    goodput_events: VecDeque<Instant>,
+    /// 上一次 goodput 爬山时的 (goodput_rps, rate_rps)，用于「涨了继续/没涨退回」判断。
+    last_probe_goodput: f64,
+    last_probe_rate: f64,
+    /// goodput 爬山方向：true=正在向上探(上轮抬了 rate)，需下轮验证 goodput 是否随之涨。
+    probe_climbing: bool,
+    /// 自适应退避：上次退避(on_throttle 降速)的时刻，用于「退避后多快又撞 429」判断。
+    last_backoff_at: Option<Instant>,
+    /// 自适应退避学到的当前 beta（乘性减速系数），随「退避后是否很快又 429」调整。
+    adaptive_beta: f64,
 }
 
 /// 单 scope 自适应限速 + 熔断 + 学习。
@@ -362,6 +387,12 @@ impl AdaptiveLimiter {
             circuit: CircuitState::Healthy,
             effective_max_inflight: effective,
             upstream_events: VecDeque::new(),
+            goodput_events: VecDeque::new(),
+            last_probe_goodput: 0.0,
+            last_probe_rate: initial_rate,
+            probe_climbing: false,
+            last_backoff_at: None,
+            adaptive_beta: cfg.beta_user,
         };
         Arc::new(Self {
             credential_id,
@@ -472,31 +503,125 @@ impl AdaptiveLimiter {
             && rate_429_locked(&st.upstream_events, cfg.probe_window) < cfg.probe_budget_low
     }
 
-    /// 恢复探测(根治"学死卡地板")：低流量也能把 rate 从地板爬回「最近真实天花板」。
+    /// goodput 控制器 tick（统一替代旧 recovery_probe + on_success 的 AIMD 上探）。
     ///
-    /// 只依据**最近 `probe_window` 窗口**的 429 率(不是终身均值,旧 429 会随窗口自然过期),
-    /// 当窗口干净(< `probe_budget_low`)、电路 Healthy、已冷却、rate 未达 max 时,
-    /// 按 `additive_step_rps` 抬升 rate 向 `max_rate_rps`。
+    /// 核心：目标函数是「最大化 goodput（成功请求/秒）」，不是「429 最低」。由后台周期调用，
+    /// 即使零流量也能驱动恢复。决策逻辑（按优先级）：
     ///
-    /// 与 `on_success` 的涨速不同:**不要求 near_cap、不依赖流量、不被终身学习 hi 压制** ——
-    /// 由后台周期调用,所以即使零流量也能恢复。撞墙后 `on_throttle` 会把窗口 429 拉高 →
-    /// 本探测自动停手并退避,形成"贴着最近墙浮动"的闭环。返回是否实际抬升。
-    pub fn recovery_probe_tick(&self) -> bool {
+    /// 1. 门：仅在 Healthy + 已冷却时动作；否则交给熔断/退避路径。
+    /// 2. 🔴 **429 硬上限**：窗口 429 率 > `goodput_hard_ceiling`(默认15%) → 强制降速一档，
+    ///    无视 goodput 趋势（防被 AWS 升级惩罚），并记录信号。
+    /// 3. 🅿️ **app-limited**：在飞远低于并发上限(没 backlog) → 说明「没活干」不是「到顶了」，
+    ///    保持 rate 不动（不把空闲误判成天花板，根治 #19 卡 0.06 那种病）。
+    /// 4. ✅ **护栏带内** `[band_low, band_high]`：贴着天花板的理想稳态，保持不动。
+    /// 5. 🔺 **带下沿以下**(429 < band_low，还有余量)：BBR 式 goodput 爬山——
+    ///    上一轮抬了 rate 后，这轮看 goodput 涨没涨：涨了(≥ rise_epsilon)继续抬；
+    ///    没涨/降了说明过了最优点，回退一档并停止爬升，直到 goodput 重新有空间。
+    ///
+    /// rate 受 `goodput_sanity_max_rps`(失控保险丝)封顶，不再受日常 `max_rate_rps` 封。
+    /// 返回是否实际改动了 rate。
+    pub fn goodput_control_tick(&self) -> bool {
         let mut st = self.state.lock();
-        // 门：复用单一判定源，确保「面板 recovery_eligible」与「实际抬升」永远一致。
-        if !Self::recovery_eligible_locked(&self.cfg, &st) {
-            return false;
-        }
         let now = Instant::now();
-        let step = self.cfg.additive_step_rps.max(0.0);
-        if step <= 0.0 {
+        // 门 1：仅 Healthy + 已冷却时由本控制器调速；其余状态交给熔断/退避。
+        let cooled = st.cooldown_until.map(|t| now >= t).unwrap_or(true);
+        if !matches!(st.circuit, CircuitState::Healthy) || !cooled {
             return false;
         }
         Self::refill_locked(&self.cfg, &mut st);
-        st.rate_rps = (st.rate_rps + step).min(self.cfg.max_rate_rps);
+
+        let window = self.cfg.probe_window;
+        let throttle_rate = rate_429_locked(&st.upstream_events, window);
+        let goodput = goodput_rps_locked(&st.goodput_events, window);
+        let floor = self.effective_rate_floor();
+        let sanity_max = self.cfg.goodput_sanity_max_rps;
+        let step = self.cfg.additive_step_rps.max(0.0);
+        let before = st.rate_rps;
+
+        // 门 2：429 硬上限——强制降速，无视 goodput（防升级惩罚）。
+        if throttle_rate > self.cfg.goodput_hard_ceiling {
+            st.rate_rps = (st.rate_rps - step).max(floor);
+            st.probe_climbing = false;
+            st.last_probe_goodput = goodput;
+            st.last_probe_rate = st.rate_rps;
+            if (before - st.rate_rps).abs() > f64::EPSILON {
+                tracing::warn!(
+                    event = "goodput_hard_ceiling_hit",
+                    credential_id = ?self.credential_id,
+                    throttle_rate = throttle_rate,
+                    ceiling = self.cfg.goodput_hard_ceiling,
+                    "429 超硬上限，强制降速（可能的升级惩罚信号）"
+                );
+                self.notify.notify_waiters();
+                return true;
+            }
+            return false;
+        }
+
+        // 门 3：app-limited——在飞远低于并发上限，没 backlog → 没活干，不是到顶。保持不动。
+        // 判据：当前在飞 + 1 < effective_max_inflight（还有空槽没被占满 = 需求不足）。
+        let app_limited = self.current_inflight() + 1 < st.effective_max_inflight;
+        if app_limited {
+            // 记录基线但不动 rate（避免把空闲误判成天花板而降速）。
+            st.last_probe_goodput = goodput;
+            st.last_probe_rate = st.rate_rps;
+            st.probe_climbing = false;
+            return false;
+        }
+
+        // 门 4a：带上沿以上、硬上限以下 [band_high, hard_ceiling] → 偏热，轻微抑制：
+        // 退一档让 429 回落进带内，但不像硬上限那样强降（区别于门 2）。
+        if throttle_rate > self.cfg.goodput_band_high {
+            st.rate_rps = (st.rate_rps - step).max(floor);
+            st.probe_climbing = false;
+            st.last_probe_goodput = goodput;
+            st.last_probe_rate = st.rate_rps;
+            let changed = (before - st.rate_rps).abs() > f64::EPSILON;
+            if changed {
+                self.notify.notify_waiters();
+            }
+            return changed;
+        }
+        // 门 4b：护栏带内 [band_low, band_high] → 贴着天花板的理想稳态，保持不动。
+        if throttle_rate >= self.cfg.goodput_band_low {
+            st.probe_climbing = false;
+            st.last_probe_goodput = goodput;
+            st.last_probe_rate = st.rate_rps;
+            return false;
+        }
+
+        // 门 5：429 < band_low，还有余量 → goodput 爬山。
+        if step <= 0.0 || st.rate_rps >= sanity_max - f64::EPSILON {
+            return false;
+        }
+        if st.probe_climbing {
+            // 上一轮抬过 rate，这轮检验 goodput 是否随之上涨。
+            let rose = goodput > st.last_probe_goodput * (1.0 + self.cfg.goodput_rise_epsilon);
+            if rose {
+                // goodput 还在涨 → 继续抬一档。
+                st.rate_rps = (st.rate_rps + step).min(sanity_max);
+                st.last_probe_goodput = goodput;
+                st.last_probe_rate = st.rate_rps;
+            } else {
+                // goodput 没涨/降了 → 过了最优点，回退一档并停止爬升。
+                st.rate_rps = (st.rate_rps - step).max(floor);
+                st.probe_climbing = false;
+                st.last_probe_goodput = goodput;
+                st.last_probe_rate = st.rate_rps;
+            }
+        } else {
+            // 起步爬升：抬一档，下轮验证 goodput。
+            st.rate_rps = (st.rate_rps + step).min(sanity_max);
+            st.probe_climbing = true;
+            st.last_probe_goodput = goodput;
+            st.last_probe_rate = st.rate_rps;
+        }
         st.last_increase = now;
-        self.notify.notify_waiters();
-        true
+        let changed = (before - st.rate_rps).abs() > f64::EPSILON;
+        if changed {
+            self.notify.notify_waiters();
+        }
+        changed
     }
 
     pub fn observe_full(&self) -> LimiterObservation {
@@ -544,6 +669,10 @@ impl AdaptiveLimiter {
             consecutive_throttles: st.consecutive_throttles,
             cooldown_remaining_ms: Self::cooldown_remaining_from_state(&st).as_millis() as u64,
             recovery_eligible: Self::recovery_eligible_locked(&self.cfg, &st),
+            goodput_rps: goodput_rps_locked(&st.goodput_events, self.cfg.probe_window),
+            app_limited: (self.cfg.hard_max_inflight - self.inflight.available_permits()) + 1
+                < st.effective_max_inflight,
+            adaptive_beta: st.adaptive_beta,
         }
     }
 
@@ -838,11 +967,14 @@ impl AdaptiveLimiter {
     pub async fn on_success(&self, rpm_last_60s: usize) {
         let mut st = self.state.lock();
         Self::refill_locked(&self.cfg, &mut st);
-        let now = Instant::now();
         st.consecutive_throttles = 0;
         st.consecutive_user_429 = 0;
         st.successes_since_increase += 1;
         record_upstream(&mut st.upstream_events, false, self.cfg.probe_window);
+        // goodput 测量：每次成功完成记一个样本。rate 的升降统一由 goodput_control_tick
+        // 驱动（见该函数），on_success 不再直接 AIMD 抬升 rate——目标函数从「429 最低」
+        // 改成「goodput 最大」，这是本控制器的核心。
+        record_goodput(&mut st.goodput_events, self.cfg.probe_window);
 
         let from = Self::circuit_label(&st);
         if let CircuitState::HalfOpen { canary_in_flight, successes, .. } = &mut st.circuit {
@@ -865,37 +997,6 @@ impl AdaptiveLimiter {
         });
 
         self.recompute_effective_inflight(&mut st);
-
-        let cooled = st.cooldown_until.map(|t| now >= t).unwrap_or(true);
-        let near_cap = self.current_inflight() + 1 >= st.effective_max_inflight;
-        let can_increase = cooled
-            && near_cap
-            && now.duration_since(st.last_increase) >= self.cfg.increase_interval
-            && st.successes_since_increase >= self.cfg.successes_per_increase
-            && matches!(st.circuit, CircuitState::Healthy);
-
-        if can_increase {
-            let global_429 = rate_429_locked(&st.upstream_events, self.cfg.probe_window);
-            let probe_step = if global_429 < self.cfg.probe_budget_low {
-                self.cfg.additive_step_rps
-            } else if global_429 > self.cfg.probe_budget_high {
-                -self.cfg.additive_step_rps
-            } else {
-                0.0
-            };
-            if probe_step > 0.0 {
-                // 最近窗口干净(probe_step>0 ⟺ global_429<budget_low)→ 上探向 max,
-                // 不被终身学习 hi 压制(与 recovery_probe 一致,贴最近真实天花板)。
-                st.rate_rps = (st.rate_rps + probe_step).min(self.cfg.max_rate_rps);
-            } else if probe_step < 0.0 {
-                st.rate_rps = (st.rate_rps + probe_step).max(self.effective_rate_floor());
-            } else {
-                st.rate_rps = (st.rate_rps + self.cfg.additive_step_rps).min(self.learned_probe_cap());
-            }
-            st.successes_since_increase = 0;
-            st.last_increase = now;
-            self.notify.notify_waiters();
-        }
     }
 
     pub async fn on_throttle(
@@ -968,10 +1069,32 @@ impl AdaptiveLimiter {
             return;
         }
 
+        // 自适应退避：beta(乘性减速系数)随「上次退避后多快又撞 429」学习。
+        // - 退避后很快(< probe_window/4)又 429 → 上次退得不够狠 → beta 调小(降更狠)。
+        // - 距上次退避很久(> probe_window)才 429 → 上次退过头了 → beta 调大(降更温柔)。
+        // beta 夹在 [beta_user×0.5, 0.9] 之间，避免学飞。Suspicious 仍用固定狠降 0.1。
         let beta = match reason {
             ThrottleReason::Suspicious => 0.1,
-            _ => self.cfg.beta_user,
+            _ => {
+                let beta_min = (self.cfg.beta_user * 0.5).clamp(0.05, 0.9);
+                let beta_max = 0.9_f64;
+                if let Some(last) = st.last_backoff_at {
+                    let since = now.duration_since(last);
+                    if since < self.cfg.probe_window / 4 {
+                        // 退避后很快又撞 → 退更狠。
+                        st.adaptive_beta = (st.adaptive_beta * 0.8).max(beta_min);
+                    } else if since > self.cfg.probe_window {
+                        // 隔了很久才撞，上次退过头 → 退更温柔。
+                        st.adaptive_beta = (st.adaptive_beta * 1.1).min(beta_max);
+                    }
+                    // 中间区间：保持当前 adaptive_beta 不变。
+                } else {
+                    st.adaptive_beta = self.cfg.beta_user.clamp(beta_min, beta_max);
+                }
+                st.adaptive_beta
+            }
         };
+        st.last_backoff_at = Some(now);
         st.rate_rps = (st.rate_rps * beta).max(self.effective_rate_floor());
 
         if self.cfg.adaptive_concurrency_enabled {
@@ -1101,6 +1224,12 @@ pub struct LimiterObservation {
     pub cooldown_remaining_ms: u64,
     /// 是否满足恢复探测条件(最近窗口干净、电路健康、可向上恢复速率)——观测指标。
     pub recovery_eligible: bool,
+    /// goodput 控制器：窗口内成功请求/秒（真吞吐，控制器的优化目标）。
+    pub goodput_rps: f64,
+    /// goodput 控制器：当前是否 app-limited（在飞低于并发上限=没活干，非到顶）。
+    pub app_limited: bool,
+    /// 自适应退避当前学到的 beta（乘性减速系数）。
+    pub adaptive_beta: f64,
 }
 
 fn record_upstream(events: &mut VecDeque<(Instant, bool)>, was_429: bool, window: Duration) {
@@ -1125,6 +1254,30 @@ fn rate_429_locked(events: &VecDeque<(Instant, bool)>, window: Duration) -> f64 
     }
     let throttled = relevant.iter().filter(|(_, r)| *r).count();
     throttled as f64 / relevant.len() as f64
+}
+
+/// 记录一次成功完成（goodput 样本），并淘汰窗口外旧样本。
+fn record_goodput(events: &mut VecDeque<Instant>, window: Duration) {
+    let now = Instant::now();
+    events.push_back(now);
+    while events
+        .front()
+        .is_some_and(|t| now.duration_since(*t) > window)
+    {
+        events.pop_front();
+    }
+}
+
+/// 计算窗口内 goodput（成功请求/秒）= 窗口内成功数 / 窗口长度（秒）。
+/// 用「成功数 / 窗口秒数」而非「/ 样本时间跨度」，避免低样本时分母过小放大噪声。
+fn goodput_rps_locked(events: &VecDeque<Instant>, window: Duration) -> f64 {
+    let now = Instant::now();
+    let count = events
+        .iter()
+        .filter(|t| now.duration_since(**t) <= window)
+        .count();
+    let secs = window.as_secs_f64().max(1.0);
+    count as f64 / secs
 }
 
 fn exp_cooldown(base: Duration, cap: Duration, n: u32) -> Duration {
@@ -1212,10 +1365,10 @@ impl LimiterRegistry {
         map.get(&key).map(|l| l.observe_full())
     }
 
-    /// 对所有 scope 跑一次恢复探测(后台周期调用)。返回实际抬升 rate 的 scope 数量。
+    /// 对所有 scope 跑一次 goodput 控制器 tick(后台周期调用)。返回实际改动 rate 的 scope 数量。
     pub fn recovery_probe_tick_all(&self) -> usize {
         let limiters: Vec<Arc<AdaptiveLimiter>> = self.map.lock().values().cloned().collect();
-        limiters.iter().filter(|l| l.recovery_probe_tick()).count()
+        limiters.iter().filter(|l| l.goodput_control_tick()).count()
     }
 
     pub fn global_upstream_429_rate(&self) -> f64 {
@@ -1297,6 +1450,11 @@ mod tests {
             probe_budget_low: 0.01,
             probe_budget_high: 0.02,
             probe_window: Duration::from_secs(300),
+            goodput_band_low: 0.02,
+            goodput_band_high: 0.08,
+            goodput_hard_ceiling: 0.15,
+            goodput_sanity_max_rps: 5.0,
+            goodput_rise_epsilon: 0.05,
             learning_enabled: false,
         }
     }
@@ -1371,11 +1529,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_probe_budget_increase() {
+    async fn test_on_success_does_not_directly_climb_rate() {
+        // 新语义：on_success 只记 goodput 样本，不再直接抬 rate（抬升交给 goodput 控制器 tick）。
         let lim = AdaptiveLimiter::new(test_cfg());
         let before = lim.current_rate_rps();
         lim.on_success(0).await;
-        assert!(lim.current_rate_rps() >= before);
+        assert!(
+            (lim.current_rate_rps() - before).abs() < 1e-9,
+            "on_success 不应直接改 rate（goodput 控制器统一负责升降）"
+        );
     }
 
     #[tokio::test]
@@ -1705,11 +1867,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_recovery_probe_climbs_when_recent_429_clean() {
+    async fn test_goodput_climbs_when_clean_and_demand_present() {
+        // goodput 控制器：窗口干净(429<band_low) + 有需求(非 app-limited) → 爬山抬 rate。
         let mut cfg = test_cfg();
         cfg.additive_step_rps = 0.05;
-        cfg.max_rate_rps = 1.0;
-        cfg.probe_budget_low = 0.01;
+        cfg.goodput_sanity_max_rps = 1.0;
+        cfg.goodput_band_low = 0.02;
         let lim = AdaptiveLimiter::new(cfg);
         {
             let mut st = lim.state.lock();
@@ -1717,19 +1880,28 @@ mod tests {
             st.cooldown_until = None;
             st.circuit = CircuitState::Healthy;
             st.upstream_events.clear(); // 最近窗口干净
+            st.effective_max_inflight = 1; // 配合下面占满 1 个在飞 → 非 app-limited
         }
+        // 占满唯一在飞槽，确保不被判 app-limited（current_inflight+1 >= max）。
+        let _permit = match lim.acquire().await {
+            AcquireOutcome::Proceed(p) => p,
+            other => panic!("expected Proceed, got {other:?}"),
+        };
         let before = lim.current_rate_rps();
-        let raised = lim.recovery_probe_tick();
+        let raised = lim.goodput_control_tick();
         let after = lim.current_rate_rps();
-        assert!(raised, "recent window clean -> should climb");
+        assert!(raised, "clean window + demand -> should climb");
         assert!(after > before, "rate must increase: {before} -> {after}");
-        assert!(after <= 1.0 + 1e-9, "must not exceed max_rate");
+        assert!(after <= 1.0 + 1e-9, "must not exceed sanity max");
     }
 
     #[tokio::test]
-    async fn test_recovery_probe_holds_when_recent_429_present() {
+    async fn test_goodput_holds_when_app_limited() {
+        // app-limited(在飞远低于并发上限=没活干) → 不把空闲误判成天花板，rate 保持不动。
+        // 这正是根治 #19 卡 0.06 的关键：低流量不该被当成「到顶了」而降速。
         let mut cfg = test_cfg();
-        cfg.probe_budget_low = 0.01;
+        cfg.additive_step_rps = 0.05;
+        cfg.goodput_sanity_max_rps = 1.0;
         let lim = AdaptiveLimiter::new(cfg);
         {
             let mut st = lim.state.lock();
@@ -1737,19 +1909,43 @@ mod tests {
             st.cooldown_until = None;
             st.circuit = CircuitState::Healthy;
             st.upstream_events.clear();
-            st.upstream_events.push_back((Instant::now(), true)); // 最近有 429
+            st.effective_max_inflight = 8; // 无在飞 → current_inflight(0)+1 < 8 → app-limited
         }
         let before = lim.current_rate_rps();
-        let raised = lim.recovery_probe_tick();
-        assert!(!raised, "recent 429 above budget -> must NOT climb");
-        assert!((lim.current_rate_rps() - before).abs() < 1e-9, "rate must stay put");
+        let raised = lim.goodput_control_tick();
+        assert!(!raised, "app-limited -> rate must hold");
+        assert!((lim.current_rate_rps() - before).abs() < 1e-9, "rate stays put when no demand");
     }
 
-    // P2-1 回归：面板指标 observe_full().recovery_eligible 必须与「探测会不会抬升」一致，
-    // 防止两处判定漂移(面板说能恢复但实际不抬，或反之)。
     #[tokio::test]
-    async fn test_recovery_eligible_metric_matches_probe_outcome() {
-        // case A：窗口干净 → 指标应为 true，且探测确实抬升
+    async fn test_goodput_hard_ceiling_forces_down() {
+        // 429 超硬上限 → 强制降速，无视 goodput 趋势（防升级惩罚）。
+        let mut cfg = test_cfg();
+        cfg.additive_step_rps = 0.05;
+        cfg.goodput_hard_ceiling = 0.15;
+        let lim = AdaptiveLimiter::new(cfg);
+        {
+            let mut st = lim.state.lock();
+            st.rate_rps = 0.5;
+            st.cooldown_until = None;
+            st.circuit = CircuitState::Healthy;
+            st.upstream_events.clear();
+            // 塞满窗口 429（5 个全 429 → 100% > 15% 硬上限）。
+            for _ in 0..5 {
+                st.upstream_events.push_back((Instant::now(), true));
+            }
+        }
+        let before = lim.current_rate_rps();
+        let changed = lim.goodput_control_tick();
+        assert!(changed, "over hard ceiling -> force down");
+        assert!(lim.current_rate_rps() < before, "rate must drop: {before} -> {}", lim.current_rate_rps());
+    }
+
+    // 面板指标 observe_full().recovery_eligible 仍反映「窗口干净、Healthy、已冷却、未到上限」，
+    // 作为「这个号还有恢复空间」的可观测信号（与 goodput 控制器是否真抬升解耦：
+    // 真抬升还取决于是否 app-limited）。
+    #[tokio::test]
+    async fn test_recovery_eligible_metric_reflects_clean_window() {
         let mut cfg = test_cfg();
         cfg.additive_step_rps = 0.05;
         cfg.max_rate_rps = 1.0;
@@ -1763,9 +1959,7 @@ mod tests {
             st.upstream_events.clear();
         }
         assert!(lim.observe_full().recovery_eligible, "clean window -> metric true");
-        assert!(lim.recovery_probe_tick(), "clean window -> probe fires");
 
-        // case B：最近有 429 → 指标应为 false，且探测不抬升
         let mut cfg2 = test_cfg();
         cfg2.probe_budget_low = 0.01;
         let lim2 = AdaptiveLimiter::new(cfg2);
@@ -1778,7 +1972,6 @@ mod tests {
             st.upstream_events.push_back((Instant::now(), true));
         }
         assert!(!lim2.observe_full().recovery_eligible, "recent 429 -> metric false");
-        assert!(!lim2.recovery_probe_tick(), "recent 429 -> probe holds");
     }
 
     #[test]
@@ -1858,15 +2051,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_probe_climbs_past_stale_lifetime_hi_when_window_clean() {
-        // 根治:最近窗口干净时,上探不再被"终身学到的 hi"(此处 0.08)压制,而是向 max_rate 爬。
+    async fn test_goodput_climbs_past_stale_lifetime_hi_when_clean() {
+        // 根治:窗口干净 + 有需求时,goodput 控制器抬 rate 不被"终身学到的 hi"(0.08)压制,
+        // 而是向 sanity_max 爬。多次 tick 模拟后台周期驱动。
         let mut cfg = test_cfg();
         cfg.additive_step_rps = 0.05;
-        cfg.increase_interval = Duration::from_millis(0);
-        cfg.successes_per_increase = 1;
-        cfg.probe_budget_low = 0.01;
-        cfg.probe_budget_high = 0.02;
-        cfg.max_rate_rps = 1.0;
+        cfg.goodput_band_low = 0.02;
+        cfg.goodput_sanity_max_rps = 1.0;
+        cfg.goodput_rise_epsilon = 0.05;
         cfg.learning_enabled = true;
         cfg.learning_min_samples_for_floor = 1;
         let learning = learning_store_with(7, 0.04, 0.08);
@@ -1876,21 +2068,24 @@ mod tests {
             st.rate_rps = 0.04;
             st.effective_max_inflight = 1;
         }
+        // 占满唯一在飞槽 → 非 app-limited，且持续灌成功样本让 goodput 持续上涨。
         let _permit = match lim.acquire().await {
             AcquireOutcome::Proceed(p) => p,
             other => panic!("expected Proceed, got {other:?}"),
         };
-        for _ in 0..10 {
+        // 反复：灌成功样本(goodput 涨) + tick(爬山)。goodput 单调涨 → 持续抬 rate。
+        for _ in 0..40 {
             lim.on_success(0).await;
+            lim.goodput_control_tick();
         }
         assert!(
             lim.current_rate_rps() > 0.08,
-            "clean window: rate must climb PAST stale lifetime hi 0.08, got {}",
+            "clean+demand: rate must climb PAST stale lifetime hi 0.08, got {}",
             lim.current_rate_rps()
         );
         assert!(
             lim.current_rate_rps() <= 1.0 + 1e-9,
-            "rate must not exceed max_rate 1.0, got {}",
+            "rate must not exceed sanity max 1.0, got {}",
             lim.current_rate_rps()
         );
     }

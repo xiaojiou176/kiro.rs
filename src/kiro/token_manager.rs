@@ -829,6 +829,12 @@ pub struct AccountObservability {
     pub bottleneck_dimension: crate::kiro::account_learning::BottleneckDimension,
     pub upstream429_rate5m: f64,
     pub consecutive_throttles: u32,
+    /// goodput 控制器：窗口内成功请求/秒（真吞吐，控制器优化目标）。
+    pub goodput_rps: f64,
+    /// goodput 控制器：是否 app-limited（在飞低于并发上限=没活干，非到顶）。
+    pub app_limited: bool,
+    /// 自适应退避当前 beta（乘性减速系数）。
+    pub adaptive_beta: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1346,6 +1352,9 @@ impl MultiTokenManager {
                         .unwrap_or_default(),
                     upstream429_rate5m: obs.as_ref().map(|o| o.upstream_429_rate_5m).unwrap_or(0.0),
                     consecutive_throttles: obs.as_ref().map(|o| o.consecutive_throttles).unwrap_or(0),
+                    goodput_rps: obs.as_ref().map(|o| o.goodput_rps).unwrap_or(0.0),
+                    app_limited: obs.as_ref().map(|o| o.app_limited).unwrap_or(false),
+                    adaptive_beta: obs.as_ref().map(|o| o.adaptive_beta).unwrap_or(0.0),
                 }
             })
             .collect();

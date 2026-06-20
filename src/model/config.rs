@@ -506,6 +506,27 @@ pub struct ProbeConfig {
     pub upstream_429_budget_high: f64,
     #[serde(default = "default_probe_window_secs")]
     pub window_secs: u64,
+    /// goodput 控制器：429 目标护栏带下沿。窗口 429 率 < 此值 → 仍有余量，
+    /// 允许 goodput 爬山探更高 rate。默认 0.02（2%）。
+    #[serde(default = "default_goodput_band_low")]
+    pub goodput_band_low: f64,
+    /// goodput 控制器：429 目标护栏带上沿。带内([low,high])= 贴着天花板的理想稳态，
+    /// 不主动升降。默认 0.08（8%）。
+    #[serde(default = "default_goodput_band_high")]
+    pub goodput_band_high: f64,
+    /// goodput 控制器：429 硬上限。超过此值 → 强制降速（无视 goodput 趋势），
+    /// 并记录可能的升级惩罚信号。默认 0.15（15%）。
+    #[serde(default = "default_goodput_hard_ceiling")]
+    pub goodput_hard_ceiling: f64,
+    /// goodput 控制器：失控保险丝——rate 的绝对上限（rps）。去掉了日常 maxRateRps
+    /// 人为封顶后，这是防控制器 bug 把 rate 冲上天的最后护栏。默认 5.0
+    /// （远高于实测单号 ~2/s 真顶，日常碰不到）。
+    #[serde(default = "default_goodput_sanity_max_rps")]
+    pub goodput_sanity_max_rps: f64,
+    /// goodput 控制器：判定 goodput「上涨」的最小相对增幅（占上一窗口的比例）。
+    /// 涨幅低于此视为「持平」→ 停止继续爬。默认 0.05（5%）。
+    #[serde(default = "default_goodput_rise_epsilon")]
+    pub goodput_rise_epsilon: f64,
 }
 
 impl Default for ProbeConfig {
@@ -514,6 +535,11 @@ impl Default for ProbeConfig {
             upstream_429_budget_low: default_upstream_429_budget_low(),
             upstream_429_budget_high: default_upstream_429_budget_high(),
             window_secs: default_probe_window_secs(),
+            goodput_band_low: default_goodput_band_low(),
+            goodput_band_high: default_goodput_band_high(),
+            goodput_hard_ceiling: default_goodput_hard_ceiling(),
+            goodput_sanity_max_rps: default_goodput_sanity_max_rps(),
+            goodput_rise_epsilon: default_goodput_rise_epsilon(),
         }
     }
 }
@@ -712,6 +738,21 @@ fn default_upstream_429_budget_high() -> f64 {
 }
 fn default_probe_window_secs() -> u64 {
     300
+}
+fn default_goodput_band_low() -> f64 {
+    0.02
+}
+fn default_goodput_band_high() -> f64 {
+    0.08
+}
+fn default_goodput_hard_ceiling() -> f64 {
+    0.15
+}
+fn default_goodput_sanity_max_rps() -> f64 {
+    5.0
+}
+fn default_goodput_rise_epsilon() -> f64 {
+    0.05
 }
 fn default_learning_enabled() -> bool {
     true
