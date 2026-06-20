@@ -288,15 +288,26 @@ async fn main() {
     {
         let tm = token_manager.clone();
         tokio::spawn(async move {
-            let interval = std::time::Duration::from_secs(30);
+            // tokio interval（而非 sleep）：周期 = 固定 30s，不随每轮 flush 耗时累积漂移。
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(30));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ticker.tick().await; // 首个 tick 立即返回，跳过它，从 30s 后开始。
             loop {
-                tokio::time::sleep(interval).await;
-                tm.flush_affinity_if_dirty();
-                tm.flush_pins_if_dirty();
-                tm.flush_learning_if_dirty();
-                // H1：按经过时间对学习分桶做指数衰减，旧 429 随时间被遗忘，
-                // 避免被打狠的号被永久按慢号对待（白天逐步恢复）。
-                tm.decay_learning_now();
+                ticker.tick().await;
+                // catch_unwind 兜底：单轮 flush/decay panic 不杀整个落盘任务，
+                // 否则「重启后同会话黏号」窗口会无限扩大且无人知（对齐 recovery_probe 的兜底）。
+                let tm_inner = tm.clone();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tm_inner.flush_affinity_if_dirty();
+                    tm_inner.flush_pins_if_dirty();
+                    tm_inner.flush_learning_if_dirty();
+                    // H1：按经过时间对学习分桶做指数衰减，旧 429 随时间被遗忘，
+                    // 避免被打狠的号被永久按慢号对待（白天逐步恢复）。
+                    tm_inner.decay_learning_now();
+                }));
+                if result.is_err() {
+                    tracing::error!("flush/decay 落盘任务单轮 panic，已捕获，循环继续");
+                }
             }
         });
     }

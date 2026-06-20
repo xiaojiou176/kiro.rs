@@ -245,7 +245,15 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension("tmp");
+    // 唯一 tmp 名（pid + 单调计数）：防止多个并发 write_atomic 写同一个 `.tmp`
+    // 导致内容交错撕裂 / rename 竞争。每次写各用各的临时文件，再原子 rename。
+    let unique = {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("tmp.{}.{}", std::process::id(), n)
+    };
+    let tmp = path.with_extension(unique);
     {
         let mut f = std::fs::OpenOptions::new()
             .create(true)
@@ -255,7 +263,11 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         f.write_all(bytes)?;
         f.flush()?;
     }
-    std::fs::rename(&tmp, path)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        // rename 失败时清理临时文件，避免残留垃圾。
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
     Ok(())
 }
 
@@ -314,6 +326,49 @@ mod tests {
         let tp = generate_traceparent(Some("4bf92f3577b34da6a3ce929d0e0e4736"));
         assert!(tp.starts_with("00-4bf92f3577b34da6a3ce929d0e0e4736-"));
         assert!(tp.ends_with("-01"));
+    }
+
+    // M3-a 回归：并发 write_atomic 写同一目标文件不应互相撕裂。
+    // 每次写用唯一 tmp 名 + 原子 rename，最终内容必须是某一次的完整写入，
+    // 不能是两次交错的半截。
+    #[test]
+    fn write_atomic_concurrent_no_tear() {
+        let dir = std::env::temp_dir().join(format!("kiro_wa_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let target = dir.join("concurrent.json");
+        // 两种长度差异明显的内容，撕裂会产生既非 A 也非 B 的混合体。
+        let payload_a = vec![b'A'; 20_000];
+        let payload_b = vec![b'B'; 20_000];
+        let t = target.clone();
+        let (a, b) = (payload_a.clone(), payload_b.clone());
+        let h1 = std::thread::spawn(move || {
+            for _ in 0..50 {
+                write_atomic(&t, &a).unwrap();
+            }
+        });
+        let t2 = target.clone();
+        let h2 = std::thread::spawn(move || {
+            for _ in 0..50 {
+                write_atomic(&t2, &b).unwrap();
+            }
+        });
+        h1.join().unwrap();
+        h2.join().unwrap();
+        // 最终文件必须是 A 或 B 的完整内容之一，绝不能是撕裂/混合。
+        let got = std::fs::read(&target).unwrap();
+        assert!(
+            got == payload_a || got == payload_b,
+            "并发写后文件被撕裂：len={}, 既非全 A 也非全 B",
+            got.len()
+        );
+        // 不应残留 tmp 文件（rename 成功路径会清掉）。
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftover.is_empty(), "残留了 {} 个 tmp 文件", leftover.len());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
