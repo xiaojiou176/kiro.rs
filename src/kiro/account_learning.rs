@@ -299,7 +299,8 @@ impl LearningStore {
 
     /// 对所有账号的分桶统计做指数时间衰减（H1：旧 429 随时间被遗忘）。
     /// `half_lives` = 距上次衰减经过的「半衰期数」。由后台 tick 周期调用，
-    /// 也供测试直接驱动。real_sample_count 同步衰减以保持成熟度门槛与桶规模一致。
+    /// 也供测试直接驱动。注意：只衰减分桶统计（让旧 429 随时间淡出）；
+    /// `real_sample_count`（成熟度门）是单调 latch，**绝不衰减**（见函数体内注释，P2-a）。
     pub fn decay_all(&self, half_lives: f64) {
         if half_lives <= 0.0 {
             return;
