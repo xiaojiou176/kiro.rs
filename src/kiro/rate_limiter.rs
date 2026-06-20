@@ -128,6 +128,41 @@ impl Drop for LimiterPermit {
     }
 }
 
+/// HalfOpen canary 的 RAII 守卫。
+///
+/// 当 `acquire()` 内某次决策把 `canary_in_flight` 置 true 后，立刻把这个守卫
+/// armed 起来。守卫 `Drop` 时（无论是 LocalThrottled 正常返回、还是 acquire future
+/// 在任意 await 点被取消而整体 drop）都会无条件把 canary 清回 false。
+///
+/// 唯一例外是 `disarm()`：当 permit 成功交还给调用方（`Proceed`）时调用，把清理
+/// 责任移交给 provider 侧的 `LimiterAttemptGuard` + `on_success`/`on_throttle`/
+/// `on_acquire_aborted`，避免重复清理。
+struct CanaryGuard {
+    limiter: Arc<AdaptiveLimiter>,
+    armed: bool,
+}
+
+impl CanaryGuard {
+    fn new(limiter: Arc<AdaptiveLimiter>) -> Self {
+        Self {
+            limiter,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CanaryGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.limiter.clear_half_open_canary();
+        }
+    }
+}
+
 /// acquire 的结果。
 #[derive(Debug)]
 pub enum AcquireOutcome {
@@ -168,6 +203,7 @@ pub struct AdaptiveConfig {
     pub initial_quarantine: Duration,
     pub min_quarantine: Duration,
     pub max_quarantine: Duration,
+    pub half_open_max: Duration,
     pub adaptive_concurrency_enabled: bool,
     pub safety_factor: f64,
     pub grow_factor: f64,
@@ -236,6 +272,7 @@ impl AdaptiveConfig {
             initial_quarantine: Duration::from_secs(cb.initial_quarantine_secs.max(1)),
             min_quarantine: Duration::from_secs(cb.min_quarantine_secs.max(1)),
             max_quarantine: Duration::from_secs(cb.max_quarantine_secs.max(cb.min_quarantine_secs)),
+            half_open_max: Duration::from_secs(cb.half_open_max_secs.max(1)),
             adaptive_concurrency_enabled: ac.enabled,
             safety_factor: ac.safety_factor.clamp(0.1, 1.0),
             grow_factor: ac.grow_factor_per_window.max(1.0),
@@ -252,13 +289,20 @@ impl AdaptiveConfig {
 enum CircuitState {
     Healthy,
     Open { until: Instant, reason: String },
-    HalfOpen { canary_in_flight: bool, successes: u32 },
+    HalfOpen {
+        canary_in_flight: bool,
+        successes: u32,
+        /// 进入 HalfOpen 的时刻，用于超时自愈（防 canary 泄漏永久卡死）。
+        entered_at: Instant,
+    },
 }
 
 enum AcquireDecision {
     Return(AcquireOutcome),
     WaitInflight,
-    ProceedToPermit,
+    /// 放行去拿 permit。`claimed_canary=true` 表示本次决策刚把 HalfOpen canary 置 true，
+    /// 调用方必须用 `CanaryGuard` 保证后续无论成功/失败/被取消都能清回 false。
+    ProceedToPermit { claimed_canary: bool },
 }
 
 struct State {
@@ -272,7 +316,6 @@ struct State {
     last_increase: Instant,
     circuit: CircuitState,
     effective_max_inflight: usize,
-    sends_recent: VecDeque<Instant>,
     upstream_events: VecDeque<(Instant, bool)>,
 }
 
@@ -318,7 +361,6 @@ impl AdaptiveLimiter {
             last_increase: now,
             circuit: CircuitState::Healthy,
             effective_max_inflight: effective,
-            sends_recent: VecDeque::new(),
             upstream_events: VecDeque::new(),
         };
         Arc::new(Self {
@@ -377,8 +419,8 @@ impl AdaptiveLimiter {
         }
     }
 
-    fn circuit_snapshot(st: &mut State) -> (AccountState, String, u64) {
-        Self::maybe_advance_circuit(st);
+    fn circuit_snapshot(cfg: &AdaptiveConfig, st: &mut State) -> (AccountState, String, u64) {
+        Self::maybe_advance_circuit(cfg, st);
         let now = Instant::now();
         match &st.circuit {
             CircuitState::Healthy => (AccountState::Healthy, String::new(), 0),
@@ -396,7 +438,7 @@ impl AdaptiveLimiter {
 
     pub fn account_state(&self) -> (AccountState, String, u64) {
         let mut st = self.state.lock();
-        Self::circuit_snapshot(&mut st)
+        Self::circuit_snapshot(&self.cfg, &mut st)
     }
 
     pub fn is_open(&self) -> bool {
@@ -459,7 +501,7 @@ impl AdaptiveLimiter {
 
     pub fn observe_full(&self) -> LimiterObservation {
         let mut st = self.state.lock();
-        let (state, reason, reopen_ms) = Self::circuit_snapshot(&mut st);
+        let (state, reason, reopen_ms) = Self::circuit_snapshot(&self.cfg, &mut st);
         let (safe_lo, safe_hi) = self
             .credential_id
             .and_then(|id| {
@@ -556,14 +598,33 @@ impl AdaptiveLimiter {
         }
     }
 
-    fn maybe_advance_circuit(st: &mut State) {
+    fn maybe_advance_circuit(cfg: &AdaptiveConfig, st: &mut State) {
         let now = Instant::now();
         if let CircuitState::Open { until, .. } = &st.circuit {
             if now >= *until {
                 st.circuit = CircuitState::HalfOpen {
                     canary_in_flight: false,
                     successes: 0,
+                    entered_at: now,
                 };
+            }
+        } else if let CircuitState::HalfOpen {
+            canary_in_flight,
+            entered_at,
+            ..
+        } = &mut st.circuit
+        {
+            // 超时自愈：HalfOpen 停留过久（多半是 canary 被取消/漏调清理而泄漏，
+            // 或探测请求长期未回）→ 强制清 canary，让下一次 acquire 能重新放探测请求。
+            // 这是 HalfOpenCanaryGuard（RAII）之外的第二层兜底，确保即使 RAII 失效
+            // 也不会让账号永久卡在 HalfOpen。
+            if *canary_in_flight && now.duration_since(*entered_at) >= cfg.half_open_max {
+                *canary_in_flight = false;
+                *entered_at = now;
+                tracing::warn!(
+                    event = "half_open_canary_timeout",
+                    "HalfOpen canary 探测超时，强制清 canary 重新探测"
+                );
             }
         }
     }
@@ -593,6 +654,13 @@ impl AdaptiveLimiter {
             return self.acquire_shadow();
         }
 
+        // RAII canary 守卫：一旦某次决策把 HalfOpen canary 置 true，就用这个守卫接管它。
+        // 只有把 permit 成功交还给调用方（Proceed）时才 disarm（此后由 provider 侧的
+        // LimiterAttemptGuard + on_success/on_throttle/on_acquire_aborted 接管清理）。
+        // 其余任何出口——LocalThrottled 返回、或 acquire future 在 await 点被取消而整体 drop
+        // ——守卫 drop 都会无条件把 canary 清回 false，从结构上根治「canary 泄漏卡死」。
+        let mut canary_guard: Option<CanaryGuard> = None;
+
         loop {
             if let Some(out) = self.try_acquire_decision() {
                 match out {
@@ -604,7 +672,12 @@ impl AdaptiveLimiter {
                         }
                         continue;
                     }
-                    AcquireDecision::ProceedToPermit => break,
+                    AcquireDecision::ProceedToPermit { claimed_canary } => {
+                        if claimed_canary {
+                            canary_guard = Some(CanaryGuard::new(Arc::clone(self)));
+                        }
+                        break;
+                    }
                 }
             }
         }
@@ -636,6 +709,11 @@ impl AdaptiveLimiter {
                     st.tokens -= 1.0;
                     self.note_send();
                     permit.mark_request_started();
+                    // 成功放行：把 canary 清理责任交给调用方（provider LimiterAttemptGuard +
+                    // on_success/on_throttle/on_acquire_aborted），disarm 本地守卫避免重复清。
+                    if let Some(g) = canary_guard.as_mut() {
+                        g.disarm();
+                    }
                     return AcquireOutcome::Proceed(permit);
                 } else {
                     let missing = 1.0 - st.tokens;
@@ -690,7 +768,7 @@ impl AdaptiveLimiter {
 
     fn try_acquire_decision(&self) -> Option<AcquireDecision> {
         let mut st = self.state.lock();
-        Self::maybe_advance_circuit(&mut st);
+        Self::maybe_advance_circuit(&self.cfg, &mut st);
         if let CircuitState::Open { until, .. } = st.circuit {
             let now = Instant::now();
             if now < until {
@@ -719,8 +797,13 @@ impl AdaptiveLimiter {
             if let CircuitState::HalfOpen { canary_in_flight, .. } = &mut st.circuit {
                 *canary_in_flight = true;
             }
+            return Some(AcquireDecision::ProceedToPermit {
+                claimed_canary: true,
+            });
         }
-        Some(AcquireDecision::ProceedToPermit)
+        Some(AcquireDecision::ProceedToPermit {
+            claimed_canary: false,
+        })
     }
 
     fn clear_half_open_canary(&self) {
@@ -762,7 +845,7 @@ impl AdaptiveLimiter {
         record_upstream(&mut st.upstream_events, false, self.cfg.probe_window);
 
         let from = Self::circuit_label(&st);
-        if let CircuitState::HalfOpen { canary_in_flight, successes } = &mut st.circuit {
+        if let CircuitState::HalfOpen { canary_in_flight, successes, .. } = &mut st.circuit {
             *canary_in_flight = false;
             *successes += 1;
             if *successes >= self.cfg.half_open_success_target {
@@ -1206,6 +1289,7 @@ mod tests {
             initial_quarantine: Duration::from_secs(1),
             min_quarantine: Duration::from_millis(100),
             max_quarantine: Duration::from_secs(60),
+            half_open_max: Duration::from_secs(120),
             adaptive_concurrency_enabled: true,
             safety_factor: 0.8,
             grow_factor: 1.25,
@@ -1507,6 +1591,7 @@ mod tests {
             st.circuit = CircuitState::HalfOpen {
                 canary_in_flight: false,
                 successes: 0,
+                entered_at: Instant::now(),
             };
         }
         let r = tokio::time::timeout(Duration::from_millis(100), lim.acquire()).await;
@@ -1543,12 +1628,77 @@ mod tests {
             st.circuit = CircuitState::HalfOpen {
                 canary_in_flight: true,
                 successes: 0,
+                entered_at: Instant::now(),
             };
         }
         lim.on_acquire_aborted();
         match &lim.state.lock().circuit {
             CircuitState::HalfOpen { canary_in_flight, .. } => {
                 assert!(!canary_in_flight, "aborted acquire must clear canary");
+            }
+            other => panic!("expected HalfOpen, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cancelled_acquire_clears_half_open_canary() {
+        // P1 回归：HalfOpen 放行 canary 后，acquire() future 在 await 点被取消（客户端断连），
+        // CanaryGuard drop 必须把 canary 清回 false，否则该号永久卡死在 HalfOpen。
+        let mut cfg = test_cfg();
+        cfg.initial_rate_rps = 0.001; // 极低 rate → token 桶要等很久 → acquire 卡在 absorb 循环 await
+        cfg.burst = 1.0;
+        let lim = AdaptiveLimiter::new(cfg);
+        // 先消耗掉初始 burst token，确保下一次 acquire 必须在 token 等待处 await。
+        match lim.acquire().await {
+            AcquireOutcome::Proceed(p) => drop(p),
+            other => panic!("warm-up acquire should Proceed, got {other:?}"),
+        }
+        {
+            let mut st = lim.state.lock();
+            st.circuit = CircuitState::HalfOpen {
+                canary_in_flight: false,
+                successes: 0,
+                entered_at: Instant::now(),
+            };
+        }
+        // acquire 会放行 canary（置 true）然后卡在 token 等待 await；timeout 取消它 → future drop。
+        let r = tokio::time::timeout(Duration::from_millis(120), lim.acquire()).await;
+        assert!(r.is_err(), "acquire should still be waiting on token bucket");
+        // 关键断言：被取消后 canary 必须已清回 false（RAII 守卫生效）。
+        match &lim.state.lock().circuit {
+            CircuitState::HalfOpen { canary_in_flight, .. } => {
+                assert!(
+                    !canary_in_flight,
+                    "cancelled acquire must clear canary via RAII guard (P1 fix)"
+                );
+            }
+            other => panic!("expected HalfOpen, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_half_open_canary_timeout_self_heals() {
+        // P1 第二层兜底：即便 canary 因任何原因泄漏卡 true，HalfOpen 停留超过 half_open_max
+        // 后，maybe_advance_circuit（被 account_state 触发）必须强制清 canary 重新探测。
+        let mut cfg = test_cfg();
+        cfg.half_open_max = Duration::from_millis(50);
+        let lim = AdaptiveLimiter::new(cfg);
+        {
+            let mut st = lim.state.lock();
+            st.circuit = CircuitState::HalfOpen {
+                canary_in_flight: true,
+                successes: 0,
+                entered_at: Instant::now() - Duration::from_millis(200),
+            };
+        }
+        // 触发 maybe_advance_circuit（account_state 内部会调）。
+        let _ = lim.account_state();
+        match &lim.state.lock().circuit {
+            CircuitState::HalfOpen { canary_in_flight, .. } => {
+                assert!(
+                    !canary_in_flight,
+                    "HalfOpen canary stuck past half_open_max must self-heal to false"
+                );
             }
             other => panic!("expected HalfOpen, got {other:?}"),
         }

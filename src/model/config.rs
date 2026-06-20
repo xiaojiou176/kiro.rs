@@ -443,6 +443,9 @@ pub struct CircuitBreakerConfig {
     pub min_quarantine_secs: u64,
     #[serde(default = "default_max_quarantine_secs")]
     pub max_quarantine_secs: u64,
+    /// HalfOpen 停留超过此秒数 → 强制清 canary 重新探测（RAII 之外的第二层兜底，防 canary 泄漏卡死）。
+    #[serde(default = "default_half_open_max_secs")]
+    pub half_open_max_secs: u64,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -454,6 +457,7 @@ impl Default for CircuitBreakerConfig {
             initial_quarantine_secs: default_initial_quarantine_secs(),
             min_quarantine_secs: default_min_quarantine_secs(),
             max_quarantine_secs: default_max_quarantine_secs(),
+            half_open_max_secs: default_half_open_max_secs(),
         }
     }
 }
@@ -668,6 +672,11 @@ fn default_min_quarantine_secs() -> u64 {
 }
 fn default_max_quarantine_secs() -> u64 {
     1800
+}
+fn default_half_open_max_secs() -> u64 {
+    // HalfOpen 探测窗口上限：超过则强制清 canary 重新探测。取一个比 canary 单次请求
+    // 合理耗时大得多、又不至于让坏号长期占着 HalfOpen 的值。
+    120
 }
 fn default_adaptive_concurrency_enabled() -> bool {
     true

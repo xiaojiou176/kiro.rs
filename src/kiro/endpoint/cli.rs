@@ -79,7 +79,7 @@ impl KiroEndpoint for CliEndpoint {
                 "x-amz-target",
                 "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
             )
-            .header("x-amzn-codewhisperer-optout", "false")
+            .header("x-amzn-codewhisperer-optout", "true")
             .header("x-amz-user-agent", self.x_amz_user_agent(ctx))
             .header("user-agent", self.user_agent(ctx))
             .header("host", self.host(ctx))
