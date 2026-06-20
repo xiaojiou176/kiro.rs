@@ -148,10 +148,10 @@ pub struct KiroCallResult {
     ///
     /// - **非流式**：handler 取出 `response` 后读完 body，`KiroCallResult`（含本字段）在 handler
     ///   返回前 drop → maxInflight 在 body 消费完毕后才释放。
-    /// - **流式**：handler 取出 `response`、构建 SSE `Body::from_stream` 后立即返回；
-    ///   `KiroCallResult` 随 handler 返回 drop → maxInflight 在 handler 返回时释放，
-    ///   而非客户端/SSE 流结束。`None` 表示未启用限速或 shadow 模式。
-    #[allow(dead_code)]
+    /// - **流式**：handler 用 `.take()` 取出本 permit，move 进 `PermitHoldingStream` 包住 SSE 流
+    ///   （见 anthropic/handlers.rs）→ permit 随流活到**流真正结束**(完整消费或客户端断连)才 drop，
+    ///   maxInflight 槽位才释放。修掉了「流式 permit 在 handler 返回即 drop、长流在飞欠计数」。
+    ///   `None` 表示未启用限速或 shadow 模式。
     pub(crate) limiter_permit: Option<crate::kiro::rate_limiter::LimiterPermit>,
 }
 
