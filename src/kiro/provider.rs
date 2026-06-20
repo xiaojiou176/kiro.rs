@@ -709,6 +709,11 @@ impl KiroProvider {
         // 尝试从请求体中提取模型信息
         let model = Self::extract_model_from_request(request_body);
 
+        // 400 安全网（Task 2 兜底）：若上游以「additionalModelRequestFields 不支持」拒绝，
+        // 剥掉该字段后用 `effective_body` 重发一次。仅触发一次，避免循环。
+        let mut effective_body: std::borrow::Cow<'_, str> = std::borrow::Cow::Borrowed(request_body);
+        let mut amrf_stripped = false;
+
         for attempt in 0..max_retries {
             let attempt_start = Instant::now();
             // 获取调用上下文（绑定 index、credentials、token）
@@ -768,7 +773,7 @@ impl KiroProvider {
             };
 
             let url = endpoint.api_url(&rctx);
-            let body = endpoint.transform_api_body(request_body, &rctx);
+            let body = endpoint.transform_api_body(&effective_body, &rctx);
 
             tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
             tracing::debug!("实际发送请求体: {}", body);
@@ -1055,6 +1060,31 @@ impl KiroProvider {
 
             // 400 Bad Request - 请求问题，重试/切换凭据无意义
             if status.as_u16() == 400 {
+                // 400 安全网（Task 2 兜底）：仅当 400 是「additionalModelRequestFields 不支持」这一类，
+                // 且尚未剥过、body 里确实带该字段时，剥掉它用同一凭据重发一次。
+                if !amrf_stripped && Self::is_additional_fields_unsupported_400(&body) {
+                    if let Some(stripped) =
+                        Self::strip_additional_model_request_fields(&effective_body)
+                    {
+                        amrf_stripped = true;
+                        effective_body = std::borrow::Cow::Owned(stripped);
+                        tracing::warn!(
+                            credential_id = ctx.id,
+                            "上游 400 拒绝 additionalModelRequestFields，已剥除该字段重发一次（effort 兜底降级）"
+                        );
+                        Self::emit_attempt(
+                            sink,
+                            attempt,
+                            ctx.id,
+                            endpoint_name,
+                            Some(400),
+                            outcome::BAD_REQUEST,
+                            Some("additionalModelRequestFields stripped, retrying once"),
+                            attempt_start,
+                        );
+                        continue;
+                    }
+                }
                 Self::emit_attempt(
                     sink,
                     attempt,
@@ -1353,6 +1383,32 @@ impl KiroProvider {
             .map(|s| s.to_string())
     }
 
+    /// 400 安全网（Task 2 兜底）：上游若以「`additionalModelRequestFields` 不被该模型支持」拒绝
+    /// （400），把出站 body 里的 `additionalModelRequestFields` 整段剥掉，返回新 body 供单次重发。
+    ///
+    /// effort 门已按「上游真实存在即放行」收敛，正常流程几乎不会触发；此函数是纯兜底，
+    /// 保证即使某模型上游临时不收该字段，也能去字段重试一次而不是直接失败。
+    ///
+    /// 返回 `None` 表示 body 里本就没有该字段（无需重试）或解析失败（不擅自改）。
+    fn strip_additional_model_request_fields(request_body: &str) -> Option<String> {
+        use serde_json::Value;
+        let mut json: Value = serde_json::from_str(request_body).ok()?;
+        let obj = json.as_object_mut()?;
+        if obj.remove("additionalModelRequestFields").is_some() {
+            serde_json::to_string(&json).ok()
+        } else {
+            None
+        }
+    }
+
+    /// 判定一个 400 响应体是否是「additionalModelRequestFields 不被支持」这一类，
+    /// 只有这类才触发去字段重试（避免对无关 400 误重试）。
+    fn is_additional_fields_unsupported_400(body: &str) -> bool {
+        let b = body.to_ascii_lowercase();
+        b.contains("additionalmodelrequestfields")
+            || (b.contains("output_config") && b.contains("not supported"))
+    }
+
     fn retry_delay(attempt: usize) -> Duration {
         // 指数退避 + 少量抖动，避免上游抖动时放大故障
         const BASE_MS: u64 = 200;
@@ -1477,5 +1533,44 @@ impl KiroProvider {
         let jitter_max = (backoff / 4).max(1);
         let jitter = fastrand::u64(0..=jitter_max);
         Duration::from_millis(backoff.saturating_add(jitter))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_amrf_removes_field_when_present() {
+        let body = r#"{"conversationState":{"x":1},"additionalModelRequestFields":{"output_config":{"effort":"max"}},"profileArn":"arn"}"#;
+        let stripped = KiroProvider::strip_additional_model_request_fields(body)
+            .expect("field present → should return new body");
+        assert!(!stripped.contains("additionalModelRequestFields"));
+        assert!(stripped.contains("conversationState"));
+        assert!(stripped.contains("profileArn"));
+    }
+
+    #[test]
+    fn strip_amrf_returns_none_when_absent() {
+        let body = r#"{"conversationState":{"x":1},"profileArn":"arn"}"#;
+        assert!(KiroProvider::strip_additional_model_request_fields(body).is_none());
+    }
+
+    #[test]
+    fn strip_amrf_returns_none_on_garbage() {
+        assert!(KiroProvider::strip_additional_model_request_fields("not json").is_none());
+    }
+
+    #[test]
+    fn detects_additional_fields_unsupported_400() {
+        assert!(KiroProvider::is_additional_fields_unsupported_400(
+            "additionalModelRequestFields is not supported for this model"
+        ));
+        assert!(KiroProvider::is_additional_fields_unsupported_400(
+            "The output_config field is not supported"
+        ));
+        assert!(!KiroProvider::is_additional_fields_unsupported_400(
+            "validation error: messages must not be empty"
+        ));
     }
 }

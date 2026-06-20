@@ -223,22 +223,31 @@ pub fn get_context_window_size(model: &str) -> i32 {
 
 /// Whether this request should use `additionalModelRequestFields.output_config`.
 ///
-/// The field is currently only known to be accepted by the Opus 4.6 adaptive-thinking path.
-/// Sending it to other models causes upstream 400 responses such as
-/// `additionalModelRequestFields is not supported for this model`.
-fn should_emit_output_config(req: &MessagesRequest, model_id: &str) -> bool {
-    match model_id {
-        // opus-4.6：历史上仅 adaptive-thinking 路径接受该字段。
-        "claude-opus-4.6" => req
+/// Dynamic gate (Task 2): emit `output_config` when the request carries a non-empty effort
+/// AND the (already `map_model`-normalized) `model_id` is a model the upstream truly exposes
+/// (per the cached `ListAvailableModels`). This auto-unlocks every high-end model the upstream
+/// supports (opus-4.7, opus-4.8, ...) instead of a hardcoded whitelist. A provider-side 400
+/// safety net strips `output_config` and retries once if a specific upstream model still
+/// rejects the field, so "exists upstream" is a safe放行 predicate.
+///
+/// `claude-opus-4.6` keeps its historical quirk: it only accepts the field on the
+/// adaptive-thinking path, so it is gated separately regardless of upstream presence.
+///
+/// `pub(crate)` so the trace side (handlers `trace_efforts`) can call this single source of
+/// truth instead of duplicating the gate — eliminating the twin-drift class of bug.
+pub(crate) fn should_emit_output_config(req: &MessagesRequest, model_id: &str) -> bool {
+    // opus-4.6：历史上仅 adaptive-thinking 路径接受该字段（上游怪癖，单独门控）。
+    if model_id == "claude-opus-4.6" {
+        return req
             .thinking
             .as_ref()
-            .is_some_and(|t| t.thinking_type == "adaptive"),
-        // opus-4.8：抓包实证真实 Kiro CLI v3 在 runtime.kiro.dev 上发送
-        // additionalModelRequestFields.output_config.effort=max → 200,故在此解锁。
-        // 调用方已校验 effort 非空 + 顶档 xhigh→max 映射 → 解锁 opus-4.8 的 Max 思考深度。
-        "claude-opus-4.8" => true,
-        _ => false,
+            .is_some_and(|t| t.thinking_type == "adaptive");
     }
+
+    // 其余模型：上游真实存在即放行。缓存未热(启动初期还没拉到上游清单)时 fallback=false——
+    // 宁可这几秒不发 effort，也绝不给「上游不存在的模型」(如虚标 sonnet-4.8) 发 output_config
+    // 触发 400 / 污染 trace。启动时会立即拉一次上游清单，热身窗口极短。
+    crate::kiro::upstream_models::contains_or(model_id, false)
 }
 
 fn build_additional_model_request_fields(
@@ -897,34 +906,6 @@ fn convert_tools(
         .collect()
 }
 
-/// 生成thinking标签前缀
-fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
-    if let Some(t) = &req.thinking {
-        if t.thinking_type == "enabled" {
-            return Some(format!(
-                "<thinking_mode>enabled</thinking_mode><max_thinking_length>{}</max_thinking_length>",
-                t.budget_tokens
-            ));
-        } else if t.thinking_type == "adaptive" {
-            let effort = req
-                .output_config
-                .as_ref()
-                .map(|c| c.effort.as_str())
-                .unwrap_or("high");
-            return Some(format!(
-                "<thinking_mode>adaptive</thinking_mode><thinking_effort>{}</thinking_effort>",
-                effort
-            ));
-        }
-    }
-    None
-}
-
-/// 检查内容是否已包含thinking标签
-fn has_thinking_tags(content: &str) -> bool {
-    content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
-}
-
 /// 构建历史消息
 ///
 /// # Arguments
@@ -941,9 +922,6 @@ fn build_history(
 ) -> Result<Vec<Message>, ConversionError> {
     let mut history = Vec::new();
 
-    // 生成thinking前缀（如果需要）
-    let thinking_prefix = generate_thinking_prefix(req);
-
     // 1. 处理系统消息
     if let Some(ref system) = req.system {
         let system_content: String = system
@@ -956,31 +934,15 @@ fn build_history(
             // 追加分块写入策略到系统消息
             let system_content = format!("{}\n{}", system_content, SYSTEM_CHUNKED_POLICY);
 
-            // 注入thinking标签到系统消息最前面（如果需要且不存在）
-            let final_content = if let Some(ref prefix) = thinking_prefix {
-                if !has_thinking_tags(&system_content) {
-                    format!("{}\n{}", prefix, system_content)
-                } else {
-                    system_content
-                }
-            } else {
-                system_content
-            };
-
             // 系统消息作为 user + assistant 配对
-            let user_msg = HistoryUserMessage::new(final_content, model_id);
+            // thinking 深度仅由结构化 output_config.effort 承载（对齐真实 Kiro CLI wire）；
+            // 不再注入任何 <thinking_mode>/<thinking_effort>/<max_thinking_length> 伪协议标签。
+            let user_msg = HistoryUserMessage::new(system_content, model_id);
             history.push(Message::User(user_msg));
 
             let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
             history.push(Message::Assistant(assistant_msg));
         }
-    } else if let Some(ref prefix) = thinking_prefix {
-        // 没有系统消息但有thinking配置，插入新的系统消息
-        let user_msg = HistoryUserMessage::new(prefix.clone(), model_id);
-        history.push(Message::User(user_msg));
-
-        let assistant_msg = HistoryAssistantMessage::new("I will follow these instructions.");
-        history.push(Message::Assistant(assistant_msg));
     }
 
     // 2. 处理常规消息历史
@@ -1337,13 +1299,24 @@ mod tests {
 
     #[test]
     fn test_output_config_does_not_emit_unsupported_additional_fields() {
+        let _g = crate::kiro::upstream_models::lock_test();
+        // sonnet-4.8 is NOT a real upstream model (it was a kiro-rs virtual/虚标 id).
+        // Seed the cache with the real upstream list (no sonnet-4.8) so the dynamic gate
+        // (Task 2) correctly withholds output_config for a model the upstream does not expose.
+        crate::kiro::upstream_models::set_cache_for_test(
+            ["claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6", "claude-sonnet-4.6"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
         let req = minimal_request_with_output_config("claude-sonnet-4-8-thinking");
         let result = convert_request(&req).unwrap();
 
         assert!(
             result.additional_model_request_fields.is_none(),
-            "sonnet 4.8 rejects additionalModelRequestFields even when the client sends output_config"
+            "sonnet 4.8 is absent from upstream → must not emit additionalModelRequestFields"
         );
+        crate::kiro::upstream_models::clear_cache_for_test();
     }
 
     #[test]
@@ -2343,5 +2316,115 @@ mod tests {
             Some("file content"),
             "text-only tool_result content should be preserved as-is"
         );
+    }
+
+    /// Task 3 (delete `<thinking_mode>` pseudo-protocol): real Kiro CLI never emits
+    /// `<thinking_mode>/<thinking_effort>/<max_thinking_length>` on the wire (proven by
+    /// real-machine captures across v2/v3 x social/apikey). kiro-rs must not inject these
+    /// self-invented tags into the system message; effort is carried only by the structured
+    /// `output_config` field.
+    fn collect_history_user_text(result: &ConversionResult) -> String {
+        let mut buf = String::new();
+        for msg in &result.conversation_state.history {
+            if let Message::User(u) = msg {
+                buf.push_str(&u.user_input_message.content);
+                buf.push('\n');
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn test_adaptive_thinking_does_not_inject_thinking_mode_pseudo_protocol() {
+        let req = minimal_adaptive_thinking_request_with_output_config("claude-opus-4-8-thinking");
+        let result = convert_request(&req).unwrap();
+
+        let text = collect_history_user_text(&result);
+        assert!(
+            !text.contains("<thinking_mode>"),
+            "adaptive thinking must not inject <thinking_mode> pseudo-protocol; real Kiro CLI never sends it"
+        );
+        assert!(
+            !text.contains("<thinking_effort>"),
+            "adaptive thinking must not inject <thinking_effort> pseudo-protocol"
+        );
+    }
+
+    #[test]
+    fn test_enabled_thinking_does_not_inject_thinking_mode_pseudo_protocol() {
+        let mut req = minimal_thinking_request("claude-opus-4-8-thinking", "enabled");
+        req.system = Some(vec![super::super::types::SystemMessage {
+            text: "You are a helpful assistant.".to_string(),
+            cache_control: None,
+        }]);
+        let result = convert_request(&req).unwrap();
+
+        let text = collect_history_user_text(&result);
+        assert!(
+            !text.contains("<thinking_mode>"),
+            "enabled thinking must not inject <thinking_mode> pseudo-protocol; real Kiro CLI never sends it"
+        );
+        assert!(
+            !text.contains("<max_thinking_length>"),
+            "enabled thinking must not inject <max_thinking_length> pseudo-protocol"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_thinking_still_emits_output_config_after_pseudo_protocol_removal() {
+        let _g = crate::kiro::upstream_models::lock_test();
+        // Deleting the pseudo-protocol must NOT affect the real effort carrier.
+        crate::kiro::upstream_models::set_cache_for_test(
+            ["claude-opus-4.8"].iter().map(|s| s.to_string()).collect(),
+        );
+        let req = minimal_adaptive_thinking_request_with_output_config("claude-opus-4-8");
+        let result = convert_request(&req).unwrap();
+
+        let fields = result
+            .additional_model_request_fields
+            .expect("opus 4.8 adaptive thinking must still carry output_config.effort");
+        assert_eq!(fields.output_config.unwrap().effort, "high");
+        crate::kiro::upstream_models::clear_cache_for_test();
+    }
+
+    /// Task 2 (effort gate dynamization): high-end models that the upstream truly exposes
+    /// (e.g. opus-4.7) must be allowed to carry `output_config.effort`, not hardcoded to
+    /// only 4.6/4.8. The gate = "effort present + mapped model_id exists upstream".
+    #[test]
+    fn test_effort_gate_allows_opus_4_7() {
+        let _g = crate::kiro::upstream_models::lock_test();
+        // Seed the upstream model cache so the dynamic gate sees opus-4.7 as a real model.
+        crate::kiro::upstream_models::set_cache_for_test(
+            ["claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        let req = minimal_request_with_output_config("claude-opus-4-7-thinking");
+        let result = convert_request(&req).unwrap();
+
+        let fields = result
+            .additional_model_request_fields
+            .expect("opus 4.7 exists upstream → effort must be emitted (was hardcoded-blocked)");
+        assert_eq!(fields.output_config.unwrap().effort, "high");
+        crate::kiro::upstream_models::clear_cache_for_test();
+    }
+
+    #[test]
+    fn test_effort_gate_blocks_model_not_in_upstream() {
+        let _g = crate::kiro::upstream_models::lock_test();
+        // A model the upstream does NOT expose must not get output_config (avoid 400).
+        crate::kiro::upstream_models::set_cache_for_test(
+            ["claude-opus-4.8"].iter().map(|s| s.to_string()).collect(),
+        );
+        // map_model maps this to claude-opus-4.5, which is absent from the seeded cache.
+        let req = minimal_request_with_output_config("claude-opus-4-5");
+        let result = convert_request(&req).unwrap();
+
+        assert!(
+            result.additional_model_request_fields.is_none(),
+            "opus 4.5 absent from upstream cache → must not emit output_config"
+        );
+        crate::kiro::upstream_models::clear_cache_for_test();
     }
 }

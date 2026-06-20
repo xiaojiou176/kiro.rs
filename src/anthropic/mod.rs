@@ -37,3 +37,4 @@ mod websearch_loop;
 #[allow(unused_imports)]
 pub use router::create_router_with_provider;
 pub use router::create_router;
+pub use handlers::bare_catalog_upstream_ids;

@@ -130,6 +130,10 @@ pub(crate) struct RequestTracer {
     model: String,
     is_stream: bool,
     conversation_id: Option<String>,
+    /// 客户端请求的 effort 档位（映射前原值，可空）
+    effort_requested: Option<String>,
+    /// 实际发往上游的 effort 档位（映射后值，可空）
+    effort_sent: Option<String>,
     started_at: Instant,
     /// 首个上游 chunk 到达时刻（仅流式标记；取第一次）
     first_token_at: parking_lot::Mutex<Option<Instant>>,
@@ -137,13 +141,15 @@ pub(crate) struct RequestTracer {
 }
 
 /// 本次请求的用量快照（落入 trace 行，与 usage_log 同源）
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct TraceUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_creation_tokens: u64,
     pub cache_read_tokens: u64,
     pub credits: f64,
+    /// 思考 token（单独计数，不从 output_tokens 扣除）
+    pub reasoning_tokens: u64,
 }
 
 impl TraceUsage {
@@ -158,6 +164,8 @@ struct RequestTraceOptions {
     model: String,
     is_stream: bool,
     conversation_id: Option<String>,
+    effort_requested: Option<String>,
+    effort_sent: Option<String>,
 }
 
 impl RequestTracer {
@@ -171,6 +179,8 @@ impl RequestTracer {
             model: options.model,
             is_stream: options.is_stream,
             conversation_id: options.conversation_id,
+            effort_requested: options.effort_requested,
+            effort_sent: options.effort_sent,
             started_at: Instant::now(),
             first_token_at: parking_lot::Mutex::new(None),
             attempts: parking_lot::Mutex::new(Vec::new()),
@@ -221,6 +231,9 @@ impl RequestTracer {
             cache_creation_tokens: usage.cache_creation_tokens,
             cache_read_tokens: usage.cache_read_tokens,
             credits: usage.credits,
+            reasoning_tokens: usage.reasoning_tokens,
+            effort_requested: self.effort_requested.clone(),
+            effort_sent: self.effort_sent.clone(),
             first_token_ms,
             conversation_id: self.conversation_id.clone(),
             attempts,
@@ -233,6 +246,60 @@ impl TraceSink for RequestTracer {
     fn on_attempt(&self, attempt: TraceAttempt) {
         self.attempts.lock().push(attempt);
     }
+}
+
+/// 把客户端请求的 effort 档位映射为实际发往上游的值（trace 记录用）。
+///
+/// 与 converter 的请求→上游映射保持一致：顶档 `xhigh` → Kiro 线值 `max`，
+/// 其余档位原样透传。converter 拥有真正的发送逻辑；这里是 trace 侧的本地只读副本，
+/// 只为把"我们实际会发什么档位"落进 trace 行，不依赖也不修改 converter。
+fn trace_effort_sent(effort: &str) -> String {
+    match effort {
+        "xhigh" => "max".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// 从客户端请求里取出 trace 用的 (effort_requested, effort_sent)。
+///
+/// `effort_requested` = 客户端 `output_config.effort`（去空白后非空才记，否则 None）。
+/// `effort_sent` = 我们**实际会发往上游的** effort 档位。只有当上游真的会收到
+/// `output_config.effort`（即 converter 的发送门控放行该模型）时，才记映射后的值；
+/// 否则（output_config 被 converter skip 掉，上游根本收不到 effort 覆盖）记 None，
+/// 绝不虚标一个并未下发的 `max`，以免 downgrade 检测被假信号污染。
+///
+/// trace 侧「effort 实际是否发往上游」的判定，直接复用 converter 的**单一真相源**
+/// `should_emit_output_config`，避免 trace 副本与真实发送逻辑漂移（Task 2 根治：
+/// effort 门改为「上游真实存在即放行」的动态判定后，旧的硬编码 4.6/4.8 副本会误判，
+/// 例如 opus-4.7 实际会发 effort 但旧副本记 None、污染降智检测）。
+///
+/// `model_id` 必须是 **已映射** 的上游模型 ID（与 converter 门控同口径）：调用方先用
+/// `converter::map_model` 把客户端别名（如 `claude-opus-4-8` / `…-thinking`）归一到
+/// `claude-opus-4.8` 再传入，否则会与 converter 的点号形态错配、误判主模型。
+fn trace_effort_sent_emitted(payload: &MessagesRequest, mapped_model_id: &str) -> bool {
+    crate::anthropic::converter::should_emit_output_config(payload, mapped_model_id)
+}
+
+fn trace_efforts(payload: &MessagesRequest, model_id: &str) -> (Option<String>, Option<String>) {
+    let requested = payload
+        .output_config
+        .as_ref()
+        .map(|c| c.effort.trim())
+        .filter(|e| !e.is_empty())
+        .map(|e| e.to_string());
+    // 与 converter 同口径：先把客户端模型别名映射成上游模型 ID 再做门控判断。
+    // 映射失败（未知模型）时按"不发 output_config"处理，sent 记 None。
+    let mapped = super::converter::map_model(model_id);
+    let emitted = mapped
+        .as_deref()
+        .is_some_and(|m| trace_effort_sent_emitted(payload, m));
+    // effort_sent 只在上游真会收到 output_config 时才有值，且为映射后的线值。
+    let sent = if emitted {
+        requested.as_deref().map(trace_effort_sent)
+    } else {
+        None
+    };
+    (requested, sent)
 }
 
 /// 取追踪器里最后一跳的 outcome（用于把 provider 的失败分类提升到 record.error_type）。
@@ -441,153 +508,104 @@ fn resolve_usage_input_tokens(
     context_total_input_tokens.unwrap_or(fallback_total_input_tokens)
 }
 
+/// 裸模型目录（id / display / created / max_tokens）。
+///
+/// Task 4 根治：只列 **裸模型**，零 `*-thinking` 虚标变体——上游 AWS 没有任何 `-thinking`
+/// 模型 ID，thinking 深度由 `output_config.effort` 驱动、服务端自动决定。
+///
+/// 每条带一个 `upstream_id`（点号形态，对齐 `map_model` 输出 + 上游 `ListAvailableModels`），
+/// 用于与上游真实清单做交集过滤。
+struct BareModelDef {
+    /// 对外暴露的模型 ID（dash 形态，Codex/客户端可见）
+    exposed_id: &'static str,
+    /// 与上游对齐的归一化 ID（dot 形态 = `map_model` 输出 / 上游 model_id）
+    upstream_id: &'static str,
+    display_name: &'static str,
+    created: i64,
+}
+
+/// 裸模型目录。冷启动（上游缓存未热）时直接用它；热启动时与上游真实清单取交集。
+/// 顺序即对外列表顺序（高端在前）。
+const BARE_MODEL_CATALOG: &[BareModelDef] = &[
+    BareModelDef {
+        exposed_id: "claude-opus-4-8",
+        upstream_id: "claude-opus-4.8",
+        display_name: "Claude Opus 4.8",
+        created: 1779897600, // May 28, 2026
+    },
+    BareModelDef {
+        exposed_id: "claude-opus-4-7",
+        upstream_id: "claude-opus-4.7",
+        display_name: "Claude Opus 4.7",
+        created: 1776276000, // Apr 16, 2026
+    },
+    BareModelDef {
+        exposed_id: "claude-opus-4-6",
+        upstream_id: "claude-opus-4.6",
+        display_name: "Claude Opus 4.6",
+        created: 1770163200, // Feb 4, 2026
+    },
+    BareModelDef {
+        exposed_id: "claude-sonnet-4-6",
+        upstream_id: "claude-sonnet-4.6",
+        display_name: "Claude Sonnet 4.6",
+        created: 1771286400, // Feb 17, 2026
+    },
+    BareModelDef {
+        exposed_id: "claude-opus-4-5-20251101",
+        upstream_id: "claude-opus-4.5",
+        display_name: "Claude Opus 4.5",
+        created: 1763942400, // Nov 24, 2025
+    },
+    BareModelDef {
+        exposed_id: "claude-sonnet-4-5-20250929",
+        upstream_id: "claude-sonnet-4.5",
+        display_name: "Claude Sonnet 4.5",
+        created: 1759104000, // Sep 29, 2025
+    },
+    BareModelDef {
+        exposed_id: "claude-haiku-4-5-20251001",
+        upstream_id: "claude-haiku-4.5",
+        display_name: "Claude Haiku 4.5",
+        created: 1760486400, // Oct 15, 2025
+    },
+];
+
+fn bare_def_to_model(def: &BareModelDef) -> Model {
+    Model {
+        id: def.exposed_id.to_string(),
+        object: "model".to_string(),
+        created: def.created,
+        owned_by: "anthropic".to_string(),
+        display_name: def.display_name.to_string(),
+        model_type: "chat".to_string(),
+        max_tokens: 64000,
+    }
+}
+
+/// 裸模型目录的上游归一化 ID（点号形态）。供启动期 bootstrap 种子用——这些都是有
+/// 抓包/清单证据的真实上游模型，在 refresher 拉到真实清单前作为 effort 门/模型列表的默认。
+pub fn bare_catalog_upstream_ids() -> Vec<&'static str> {
+    BARE_MODEL_CATALOG.iter().map(|d| d.upstream_id).collect()
+}
+
+/// 对外可用模型列表（Task 4 动态化）。
+///
+/// - 上游模型缓存**已热**：返回「裸目录 ∩ 上游真实清单」——只暴露上游真实存在的模型，
+///   未来上游加/减模型自动跟随，零虚标。
+/// - 上游缓存**未热**（启动初期或拉取失败）：回退到裸目录全集（仍零 `*-thinking`），
+///   保证服务可用、且任何状态下都不暴露虚标变体。
 fn available_models() -> Vec<Model> {
-    vec![
-        Model {
-            id: "claude-opus-4-8".to_string(),
-            object: "model".to_string(),
-            created: 1779897600, // May 28, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.8".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-8-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1779897600, // May 28, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.8 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-8".to_string(),
-            object: "model".to_string(),
-            created: 1779897600, // May 28, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.8".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-8-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1779897600, // May 28, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.8 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-7".to_string(),
-            object: "model".to_string(),
-            created: 1776276000, // Apr 16, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-7-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1776276000, // Apr 16, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.7 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1770163200, // Feb 4, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-6-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1771286400, // Feb 17, 2026
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.6 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-opus-4-5-20251101-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1763942400, // Nov 24, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Opus 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-sonnet-4-5-20250929-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1759104000, // Sep 29, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Sonnet 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-        Model {
-            id: "claude-haiku-4-5-20251001-thinking".to_string(),
-            object: "model".to_string(),
-            created: 1760486400, // Oct 15, 2025
-            owned_by: "anthropic".to_string(),
-            display_name: "Claude Haiku 4.5 (Thinking)".to_string(),
-            model_type: "chat".to_string(),
-            max_tokens: 64000,
-        },
-    ]
+    match crate::kiro::upstream_models::cached() {
+        Some(_) => BARE_MODEL_CATALOG
+            .iter()
+            .filter(|def| {
+                crate::kiro::upstream_models::contains_normalized(def.upstream_id)
+            })
+            .map(bare_def_to_model)
+            .collect(),
+        None => BARE_MODEL_CATALOG.iter().map(bare_def_to_model).collect(),
+    }
 }
 
 /// GET /v1/models
@@ -757,6 +775,9 @@ pub async fn post_messages(
         .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
         .unwrap_or_default();
 
+    // trace 侧的 effort 快照：客户端请求档位 + 实际发往上游档位（映射后）。
+    let (effort_requested, effort_sent) = trace_efforts(&payload, &payload.model);
+
     if payload.stream {
         // 流式响应
         let tracer = std::sync::Arc::new(RequestTracer::new(
@@ -766,6 +787,8 @@ pub async fn post_messages(
                 model: payload.model.clone(),
                 is_stream: true,
                 conversation_id: Some(conversation_id_for_trace.clone()),
+                effort_requested: effort_requested.clone(),
+                effort_sent: effort_sent.clone(),
             },
         ));
         handle_stream_request(
@@ -793,6 +816,8 @@ pub async fn post_messages(
                 model: payload.model.clone(),
                 is_stream: false,
                 conversation_id: Some(conversation_id_for_trace.clone()),
+                effort_requested,
+                effort_sent,
             },
         ));
         handle_non_stream_request(
@@ -1051,6 +1076,7 @@ fn stream_trace_usage(ctx: &StreamContext) -> TraceUsage {
         cache_creation_tokens: cache_creation.max(0) as u64,
         cache_read_tokens: cache_read.max(0) as u64,
         credits: if ctx.credits.is_finite() && ctx.credits > 0.0 { ctx.credits } else { 0.0 },
+        reasoning_tokens: ctx.reasoning_tokens.max(0) as u64,
     }
 }
 
@@ -1257,6 +1283,22 @@ async fn handle_non_stream_request(
     // 估算输出 tokens（上游不下发 token，全部走估算）
     let output_tokens = token::estimate_output_tokens(&content);
 
+    // 思考 token 单独计数（与 stream 路径口径一致：thinking 文本走 estimate_tokens，
+    // 加密 redacted 块固定 +8）。output_tokens 已包含 thinking，这里是额外的独立计数，
+    // 不从 output_tokens 中扣减。
+    let reasoning_tokens: i32 = content
+        .iter()
+        .map(|block| match block.get("type").and_then(|t| t.as_str()) {
+            Some("thinking") => block
+                .get("thinking")
+                .and_then(|t| t.as_str())
+                .map(super::stream::estimate_tokens)
+                .unwrap_or(0),
+            Some("redacted_thinking") => 8,
+            _ => 0,
+        })
+        .sum();
+
     // 输入 tokens：contextUsage 真实值优先，否则用客户端估算
     let total_input_tokens = resolve_usage_input_tokens(input_tokens, context_input_tokens);
     // 互斥分摊：input + cache_creation + cache_read == total
@@ -1300,6 +1342,7 @@ async fn handle_non_stream_request(
             cache_creation_tokens: cache_creation_tokens.max(0) as u64,
             cache_read_tokens: cache_read_tokens.max(0) as u64,
             credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+            reasoning_tokens: reasoning_tokens.max(0) as u64,
         },
     );
     (StatusCode::OK, Json(response_body)).into_response()
@@ -1382,25 +1425,35 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
         return;
     }
 
-    let is_opus_4_6 = model_lower.contains("opus")
-        && (model_lower.contains("4-6") || model_lower.contains("4.6"));
-
-    let thinking_type = if is_opus_4_6 { "adaptive" } else { "enabled" };
+    // 根治 P0：带 `-thinking` 后缀的请求（老会话/历史 thread 里选过 "… Thinking" 的）
+    // 统一走 **adaptive**，thinking 深度由 `output_config.effort` 驱动、上游服务端自动决定。
+    // 旧逻辑把非 opus-4.6 的 -thinking 强制 `enabled` + budget_tokens 且不设 effort，
+    // 会把 opus-4.8-thinking 打回老 budget 路径、丢掉 effort=max——这里彻底改掉。
+    //
+    // effort 兜底：客户端已带 `output_config.effort` 则尊重客户端；否则默认补 `xhigh`
+    // （经 converter 的 `xhigh→max` 映射拿到上游最强 max；绝不依赖 `default_effort()`，
+    // 它只返回 `high` 拿不到 max）。是否真发往上游仍由 converter 的
+    // `should_emit_output_config` 门控（上游存在即放行），这里只负责补默认值。
+    let client_supplied_effort = payload
+        .output_config
+        .as_ref()
+        .map(|oc| oc.effort.trim())
+        .is_some_and(|e| !e.is_empty());
 
     tracing::info!(
         model = %payload.model,
-        thinking_type = thinking_type,
-        "模型名包含 thinking 后缀，覆写 thinking 配置"
+        client_effort = client_supplied_effort,
+        "模型名包含 thinking 后缀，归一为 adaptive + effort 兜底"
     );
 
     payload.thinking = Some(Thinking {
-        thinking_type: thinking_type.to_string(),
+        thinking_type: "adaptive".to_string(),
         budget_tokens: 20000,
     });
 
-    if is_opus_4_6 {
+    if !client_supplied_effort {
         payload.output_config = Some(OutputConfig {
-            effort: "high".to_string(),
+            effort: "xhigh".to_string(),
         });
     }
 }
@@ -1572,6 +1625,9 @@ pub async fn post_messages_cc(
         .map(|cache| super::cache_metering::compute_cache_usage(cache, &payload, key_ctx.key_id))
         .unwrap_or_default();
 
+    // trace 侧的 effort 快照：客户端请求档位 + 实际发往上游档位（映射后）。
+    let (effort_requested, effort_sent) = trace_efforts(&payload, &payload.model);
+
     if payload.stream {
         // 流式响应（缓冲模式）
         let tracer = std::sync::Arc::new(RequestTracer::new(
@@ -1581,6 +1637,8 @@ pub async fn post_messages_cc(
                 model: payload.model.clone(),
                 is_stream: true,
                 conversation_id: Some(conversation_id_for_trace.clone()),
+                effort_requested: effort_requested.clone(),
+                effort_sent: effort_sent.clone(),
             },
         ));
         handle_stream_request_buffered(
@@ -1608,6 +1666,8 @@ pub async fn post_messages_cc(
                 model: payload.model.clone(),
                 is_stream: false,
                 conversation_id: Some(conversation_id_for_trace.clone()),
+                effort_requested,
+                effort_sent,
             },
         ));
         handle_non_stream_request(
@@ -1782,6 +1842,7 @@ fn create_buffered_sse_stream(
                                         cache_creation_tokens: cc.max(0) as u64,
                                         cache_read_tokens: cr.max(0) as u64,
                                         credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+                                        reasoning_tokens: ctx.reasoning_tokens().max(0) as u64,
                                     },
                                 );
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
@@ -1806,6 +1867,7 @@ fn create_buffered_sse_stream(
                                         cache_creation_tokens: cc.max(0) as u64,
                                         cache_read_tokens: cr.max(0) as u64,
                                         credits: if credits.is_finite() && credits > 0.0 { credits } else { 0.0 },
+                                        reasoning_tokens: ctx.reasoning_tokens().max(0) as u64,
                                     },
                                 );
                                 let bytes: Vec<Result<Bytes, Infallible>> = all_events
@@ -1985,11 +2047,14 @@ mod tests {
 
     #[test]
     fn available_models_include_opus_4_7_variants() {
+        let _g = crate::kiro::upstream_models::lock_test();
+        crate::kiro::upstream_models::clear_cache_for_test();
         let models = available_models();
         let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
 
+        // Task 4: -thinking variants are gone; bare opus-4.7 remains (thinking is driven by effort).
         assert!(ids.contains(&"claude-opus-4-7"));
-        assert!(ids.contains(&"claude-opus-4-7-thinking"));
+        assert!(!ids.contains(&"claude-opus-4-7-thinking"));
     }
 
     #[test]
@@ -2044,12 +2109,178 @@ mod tests {
 
     #[test]
     fn available_models_include_4_8_variants() {
+        let _g = crate::kiro::upstream_models::lock_test();
+        crate::kiro::upstream_models::clear_cache_for_test();
         let models = available_models();
         let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
 
+        // Task 4: opus-4.8 bare stays; all -thinking variants removed; sonnet-4.8 was a
+        // 虚标 (upstream has no sonnet-4.8) and must not appear by default.
         assert!(ids.contains(&"claude-opus-4-8"));
-        assert!(ids.contains(&"claude-opus-4-8-thinking"));
-        assert!(ids.contains(&"claude-sonnet-4-8"));
-        assert!(ids.contains(&"claude-sonnet-4-8-thinking"));
+        assert!(!ids.contains(&"claude-opus-4-8-thinking"));
+        assert!(!ids.contains(&"claude-sonnet-4-8-thinking"));
+    }
+
+    /// Task 4 (dynamic model list): the exposed model list must contain ZERO `*-thinking`
+    /// virtual variants — upstream AWS exposes no such id; thinking depth is driven by effort.
+    #[test]
+    fn available_models_have_no_thinking_variants() {
+        let _g = crate::kiro::upstream_models::lock_test();
+        crate::kiro::upstream_models::clear_cache_for_test();
+        let models = available_models();
+        for m in &models {
+            assert!(
+                !m.id.ends_with("-thinking"),
+                "model list must not expose virtual -thinking variant: {}",
+                m.id
+            );
+        }
+        // sanity: the core bare models are still present
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert!(ids.contains(&"claude-opus-4-8"));
+    }
+
+    /// Task 4: when the upstream cache is warm, the list is filtered to only models the
+    /// upstream truly exposes (bare-id catalog ∩ upstream snapshot).
+    #[test]
+    fn available_models_filtered_by_upstream_when_warm() {
+        let _g = crate::kiro::upstream_models::lock_test();
+        crate::kiro::upstream_models::set_cache_for_test(
+            ["claude-opus-4.8", "claude-opus-4.7"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        let models = available_models();
+        let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
+        assert!(ids.contains(&"claude-opus-4-8".to_string()));
+        assert!(ids.contains(&"claude-opus-4-7".to_string()));
+        // opus-4.6 is in the bare catalog but NOT in the upstream snapshot → filtered out.
+        assert!(
+            !ids.contains(&"claude-opus-4-6".to_string()),
+            "warm cache must filter out catalog models the upstream does not expose"
+        );
+        // still zero -thinking
+        assert!(models.iter().all(|m| !m.id.ends_with("-thinking")));
+        crate::kiro::upstream_models::clear_cache_for_test();
+    }
+
+    #[test]
+    fn trace_effort_sent_pins_xhigh_to_max() {
+        // 顶档 xhigh 必须映射成 Kiro 线值 max；其余档位原样透传。
+        assert_eq!(trace_effort_sent("xhigh"), "max");
+        assert_eq!(trace_effort_sent("high"), "high");
+        assert_eq!(trace_effort_sent("medium"), "medium");
+        assert_eq!(trace_effort_sent("low"), "low");
+        assert_eq!(trace_effort_sent("max"), "max");
+    }
+
+    #[test]
+    fn trace_efforts_extracts_requested_and_mapped_sent() {
+        let _g = crate::kiro::upstream_models::lock_test();
+        // Task 2 (dynamic effort gate): trace_effort_sent_emitted now delegates to converter's
+        // upstream-existence gate. Seed the upstream cache with the real list (opus-4.8 present,
+        // sonnet-4.8 absent — it was a 虚标) so the trace mirrors真实 send behavior.
+        crate::kiro::upstream_models::set_cache_for_test(
+            ["claude-opus-4.8", "claude-opus-4.7", "claude-opus-4.6"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        );
+        // 用 JSON 反序列化构造请求，避免与 MessagesRequest 字段集硬耦合。
+        let parse = |model: &str, oc: Option<&str>| -> MessagesRequest {
+            let mut v = serde_json::json!({
+                "model": model,
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "hi"}]
+            });
+            if let Some(effort) = oc {
+                v["output_config"] = serde_json::json!({ "effort": effort });
+            }
+            serde_json::from_value(v).expect("valid MessagesRequest")
+        };
+        // 主模型 opus-4.8（别名 hyphenated，需经 map_model 归一为 4.8）：output_config 会下发。
+        let opus = |oc: Option<&str>| parse("claude-opus-4-8", oc);
+        let pm = |m: &str, oc: Option<&str>| parse(m, oc);
+
+        // opus-4.8 + xhigh → (xhigh, max)：上游确实收到 output_config，sent 记映射后线值。
+        let (req, sent) = trace_efforts(&opus(Some("xhigh")), "claude-opus-4-8");
+        assert_eq!(req.as_deref(), Some("xhigh"));
+        assert_eq!(sent.as_deref(), Some("max"));
+
+        // opus-4.8 + high 原样透传
+        let (req, sent) = trace_efforts(&opus(Some("high")), "claude-opus-4-8");
+        assert_eq!(req.as_deref(), Some("high"));
+        assert_eq!(sent.as_deref(), Some("high"));
+
+        // 无 output_config → 两者皆 None
+        let (req, sent) = trace_efforts(&opus(None), "claude-opus-4-8");
+        assert_eq!(req, None);
+        assert_eq!(sent, None);
+
+        // 空白 effort → 视作未指定（None）
+        let (req, sent) = trace_efforts(&opus(Some("   ")), "claude-opus-4-8");
+        assert_eq!(req, None);
+        assert_eq!(sent, None);
+
+        // 门控关键用例：sonnet + xhigh —— converter 不发 output_config，
+        // 故 effort_requested 仍记 xhigh（客户端确实要了），但 effort_sent 必须是 None，
+        // 绝不虚标 max（否则 downgrade 检测会被假信号污染）。
+        let (req, sent) = trace_efforts(&pm("claude-sonnet-4-8", Some("xhigh")), "claude-sonnet-4-8");
+        assert_eq!(req.as_deref(), Some("xhigh"));
+        assert_eq!(sent, None, "non-gated model must NOT fabricate effort_sent");
+
+        // opus-4.8-thinking 别名也应被 map_model 归一并放行。
+        let (req, sent) = trace_efforts(&pm("claude-opus-4.8-thinking", Some("xhigh")), "claude-opus-4.8-thinking");
+        assert_eq!(req.as_deref(), Some("xhigh"));
+        assert_eq!(sent.as_deref(), Some("max"));
+        crate::kiro::upstream_models::clear_cache_for_test();
+    }
+
+    // ---- P0: override_thinking_from_model_name 不再把 -thinking 打回老 budget 路径 ----
+    // 历史 bug：带 `-thinking` 后缀的非 opus-4.6 模型被强制 thinking_type="enabled"+budget，
+    // 且不设 output_config.effort → effort=max 丢失。根治后：一律走 adaptive，且 effort 兜底
+    // 到 xhigh（经 converter xhigh→max 拿满），裸模型不受影响。
+    fn req_with(model: &str, effort: Option<&str>) -> MessagesRequest {
+        let mut v = serde_json::json!({
+            "model": model,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        if let Some(e) = effort {
+            v["output_config"] = serde_json::json!({ "effort": e });
+        }
+        serde_json::from_value(v).expect("valid MessagesRequest")
+    }
+
+    #[test]
+    fn override_thinking_opus48_thinking_no_effort_defaults_to_adaptive_xhigh() {
+        // 老会话/历史 thread 里选过 "Opus 4.8 Thinking" 的请求：model 带 -thinking、无 output_config。
+        // 根治后必须走 adaptive 且兜底补 effort=xhigh（→ converter 映射成上游 max）。
+        let mut payload = req_with("claude-opus-4-8-thinking", None);
+        override_thinking_from_model_name(&mut payload);
+        let thinking = payload.thinking.expect("thinking must be set for -thinking model");
+        assert_eq!(thinking.thinking_type, "adaptive", "-thinking must use adaptive, not enabled");
+        let oc = payload.output_config.expect("effort must be backfilled when client sent none");
+        assert_eq!(oc.effort, "xhigh", "no-effort -thinking must default to xhigh (→max), not high");
+    }
+
+    #[test]
+    fn override_thinking_opus48_thinking_keeps_client_effort() {
+        // 客户端自带 effort 时不覆盖（尊重显式选择）。
+        let mut payload = req_with("claude-opus-4-8-thinking", Some("high"));
+        override_thinking_from_model_name(&mut payload);
+        let oc = payload.output_config.expect("client output_config must be preserved");
+        assert_eq!(oc.effort, "high", "client-supplied effort must not be overwritten");
+        assert_eq!(payload.thinking.unwrap().thinking_type, "adaptive");
+    }
+
+    #[test]
+    fn override_thinking_bare_opus48_is_untouched() {
+        // 裸 claude-opus-4.8（无 -thinking 后缀）不被此函数改动。
+        let mut payload = req_with("claude-opus-4-8", None);
+        override_thinking_from_model_name(&mut payload);
+        assert!(payload.thinking.is_none(), "bare model must not get thinking injected");
+        assert!(payload.output_config.is_none(), "bare model must not get output_config injected");
     }
 }

@@ -203,6 +203,34 @@ async fn main() {
         config.default_endpoint.clone(),
     );
 
+    // 启动上游可用模型缓存自动刷新（Task 4）：从上游 ListAvailableModels 拉真实模型清单，
+    // 供 effort 门动态判定（converter::should_emit_output_config）+ 模型列表动态生成
+    // （handlers::available_models）。失败仅告警、保留旧缓存，不阻塞服务。
+    {
+        let tm_for_models = token_manager.clone();
+        // 启动期 bootstrap：先用裸模型目录（已知真实上游模型）填充缓存，保证 effort 门 /
+        // 模型列表在 refresher 第一次拉到上游清单之前就能正常工作（不退化）。
+        kiro::upstream_models::bootstrap_if_empty(
+            crate::anthropic::bare_catalog_upstream_ids(),
+        );
+        let fetch: kiro::upstream_models::FetchFn = Box::new(move || {
+            let tm = tm_for_models.clone();
+            Box::pin(async move {
+                // 选一个当前可用（未禁用/未限流）的凭据来查询上游模型清单。
+                let snap = tm.snapshot();
+                let id = snap
+                    .entries
+                    .iter()
+                    .find(|e| !e.disabled)
+                    .or_else(|| snap.entries.first())
+                    .map(|e| e.id)
+                    .ok_or_else(|| anyhow::anyhow!("无可用凭据以查询上游模型清单"))?;
+                tm.get_available_models_for(id).await
+            })
+        });
+        kiro::upstream_models::spawn_refresher(fetch, std::time::Duration::from_secs(12 * 3600));
+    }
+
     // 初始化 count_tokens 配置
     token::init_config(token::CountTokensConfig {
         api_url: config.count_tokens_api_url.clone(),

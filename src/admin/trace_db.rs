@@ -122,6 +122,15 @@ pub struct TraceRecord {
     /// 费用（上游 meteringEvent 累计的 credits）
     #[serde(default)]
     pub credits: f64,
+    /// 思考 token（单独计数，不从 output_tokens 中扣除）
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+    /// 客户端请求的 effort 档位（映射前的原值，可空）
+    #[serde(default)]
+    pub effort_requested: Option<String>,
+    /// 实际发往上游的 effort 档位（映射后的值，可空）
+    #[serde(default)]
+    pub effort_sent: Option<String>,
     /// 首 Token 延迟（毫秒，仅流式有值；非流式为 None）
     #[serde(default)]
     pub first_token_ms: Option<u64>,
@@ -257,7 +266,7 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 8] = [
+        let columns: [(&str, &str); 11] = [
             ("conversation_id", "TEXT"),
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -266,6 +275,9 @@ impl TraceStore {
             ("credits", "REAL NOT NULL DEFAULT 0"),
             ("first_token_ms", "INTEGER"),
             ("key_source", "TEXT"),
+            ("reasoning_tokens", "INTEGER NOT NULL DEFAULT 0"),
+            ("effort_requested", "TEXT"),
+            ("effort_sent", "TEXT"),
         ];
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
@@ -330,8 +342,9 @@ impl TraceStore {
                  is_stream, final_status, final_credential_id, error_type, error_message, \
                  total_attempts, duration_ms, interrupted_after_bytes, \
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
-                 credits, first_token_ms, conversation_id) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+                 credits, first_token_ms, conversation_id, \
+                 reasoning_tokens, effort_requested, effort_sent) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -354,6 +367,9 @@ impl TraceStore {
                     rec.credits,
                     rec.first_token_ms.map(|v| v as i64),
                     rec.conversation_id.clone(),
+                    rec.reasoning_tokens as i64,
+                    rec.effort_requested.clone(),
+                    rec.effort_sent.clone(),
                 ],
             )?;
             for a in &rec.attempts {
@@ -484,7 +500,8 @@ impl TraceStore {
         let sql = format!(
             "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
-             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, conversation_id \
+             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, conversation_id, \
+             reasoning_tokens, effort_requested, effort_sent \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -512,6 +529,9 @@ impl TraceStore {
                 credits: row.get::<_, f64>(17)?,
                 first_token_ms: row.get::<_, Option<i64>>(18)?.map(|v| v as u64),
                 conversation_id: row.get::<_, Option<String>>(19)?,
+                reasoning_tokens: row.get::<_, i64>(20)? as u64,
+                effort_requested: row.get::<_, Option<String>>(21)?,
+                effort_sent: row.get::<_, Option<String>>(22)?,
                 attempts: Vec::new(),
             })
         })?;
@@ -651,7 +671,10 @@ CREATE TABLE IF NOT EXISTS traces (
     cache_read_tokens INTEGER NOT NULL DEFAULT 0,
     credits           REAL NOT NULL DEFAULT 0,
     first_token_ms    INTEGER,
-    conversation_id   TEXT
+    conversation_id   TEXT,
+    reasoning_tokens  INTEGER NOT NULL DEFAULT 0,
+    effort_requested  TEXT,
+    effort_sent       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
@@ -710,6 +733,9 @@ mod tests {
             cache_creation_tokens: 0,
             cache_read_tokens: 101760,
             credits: 0.0,
+            reasoning_tokens: 256,
+            effort_requested: Some("xhigh".to_string()),
+            effort_sent: Some("max".to_string()),
             first_token_ms: None,
             conversation_id: Some("test-conv".to_string()),
             attempts: vec![
@@ -772,6 +798,11 @@ mod tests {
         assert_eq!(out[0].output_tokens, 779);
         assert_eq!(out[0].cache_read_tokens, 101760);
         assert_eq!(out[0].cache_creation_tokens, 0);
+        // 新增 4 字段往返：reasoning_tokens 单独计数（不从 output_tokens 扣除），
+        // effort_requested / effort_sent 原样回放。
+        assert_eq!(out[0].reasoning_tokens, 256);
+        assert_eq!(out[0].effort_requested.as_deref(), Some("xhigh"));
+        assert_eq!(out[0].effort_sent.as_deref(), Some("max"));
     }
 
     #[test]
@@ -883,6 +914,92 @@ mod tests {
         });
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].trace_id, "recent");
+    }
+
+    #[test]
+    fn migrate_adds_new_trace_columns_and_old_rows_read_defaults() {
+        // 模拟"老库"：建一张缺少本任务 4 个新列的 traces 表（其余列与现行 SCHEMA 一致），
+        // 插一条老行，再跑 migrate()，确认新列被幂等补齐、老行读出默认值。
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE traces (
+                trace_id          TEXT PRIMARY KEY,
+                ts                TEXT NOT NULL,
+                ts_epoch          INTEGER NOT NULL,
+                key_id            INTEGER NOT NULL,
+                key_source        TEXT,
+                model             TEXT NOT NULL,
+                is_stream         INTEGER NOT NULL,
+                final_status      TEXT NOT NULL,
+                final_credential_id INTEGER NOT NULL,
+                error_type        TEXT,
+                error_message     TEXT,
+                total_attempts    INTEGER NOT NULL,
+                duration_ms       INTEGER NOT NULL,
+                interrupted_after_bytes INTEGER,
+                input_tokens      INTEGER NOT NULL DEFAULT 0,
+                output_tokens     INTEGER NOT NULL DEFAULT 0,
+                cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                credits           REAL NOT NULL DEFAULT 0,
+                first_token_ms    INTEGER,
+                conversation_id   TEXT
+            );
+            CREATE TABLE trace_attempts (
+                trace_id      TEXT NOT NULL,
+                attempt       INTEGER NOT NULL,
+                credential_id INTEGER NOT NULL,
+                endpoint      TEXT NOT NULL,
+                http_status   INTEGER,
+                outcome       TEXT NOT NULL,
+                error_snippet TEXT,
+                duration_ms   INTEGER NOT NULL,
+                PRIMARY KEY (trace_id, attempt)
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO traces (trace_id, ts, ts_epoch, key_id, key_source, model, is_stream, \
+             final_status, final_credential_id, total_attempts, duration_ms) \
+             VALUES ('old-row','2020',1,0,'masterApiKey','m',1,'success',1,1,1)",
+            [],
+        )
+        .unwrap();
+
+        // migrate 必须把新列幂等补齐。
+        TraceStore::migrate(&conn).unwrap();
+
+        let cols: std::collections::HashSet<String> = {
+            let mut stmt = conn.prepare("PRAGMA table_info(traces)").unwrap();
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        for c in [
+            "reasoning_tokens",
+            "effort_requested",
+            "effort_sent",
+        ] {
+            assert!(cols.contains(c), "migrate 应补齐列 {c}");
+        }
+
+        // 老行能被查询读出，新列取默认值：reasoning_tokens=0，文本列=None。
+        let store = TraceStore {
+            conn: Mutex::new(conn),
+            enabled: AtomicBool::new(true),
+            retention_days: AtomicU64::new(DEFAULT_RETENTION_DAYS),
+        };
+        let out = store.query(&TraceQuery {
+            limit: 50,
+            ..Default::default()
+        });
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].trace_id, "old-row");
+        assert_eq!(out[0].reasoning_tokens, 0);
+        assert_eq!(out[0].effort_requested, None);
+        assert_eq!(out[0].effort_sent, None);
+
+        // 再跑一次 migrate 必须幂等（不报错、不重复加列）。
+        TraceStore::migrate(&store.conn.lock()).unwrap();
     }
 
     #[test]

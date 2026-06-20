@@ -1049,6 +1049,9 @@ pub struct StreamContext {
     pub context_input_tokens: Option<i32>,
     /// 输出 tokens 累计
     pub output_tokens: i32,
+    /// 思考（reasoning）token 累计。与 `output_tokens` 并行累加，单独计数，
+    /// 不从 `output_tokens` 中扣除（output_tokens 口径保持不回归）。
+    pub reasoning_tokens: i32,
     /// 工具块索引映射 (tool_id -> block_index)
     pub tool_block_indices: HashMap<String, i32>,
     /// 工具名称反向映射（短名称 → 原始名称），用于响应时还原
@@ -1122,6 +1125,7 @@ impl StreamContext {
             input_tokens,
             context_input_tokens: None,
             output_tokens: 0,
+            reasoning_tokens: 0,
             tool_block_indices: HashMap::new(),
             tool_name_map,
             known_tool_names,
@@ -1836,7 +1840,10 @@ impl StreamContext {
         if let Some(text) = reasoning.text.as_deref()
             && !text.is_empty()
         {
-            self.output_tokens += estimate_tokens(text);
+            let t = estimate_tokens(text);
+            self.output_tokens += t;
+            // 思考 token 单独计数（与 output_tokens 并行累加，不互相扣减）。
+            self.reasoning_tokens += t;
             events.extend(self.ensure_thinking_block());
             if let Some(idx) = self.thinking_block_index {
                 events.push(self.create_thinking_delta_event(idx, text));
@@ -1847,6 +1854,8 @@ impl StreamContext {
             && !redacted.is_empty()
         {
             self.output_tokens += 8;
+            // 加密思考块同样计入 reasoning（与 output_tokens 口径一致：固定 8）。
+            self.reasoning_tokens += 8;
             events.extend(self.create_redacted_thinking_events(redacted));
         }
 
@@ -2266,6 +2275,11 @@ impl BufferedStreamContext {
             read,
             self.inner.credits,
         )
+    }
+
+    /// 思考 token 累计（单独计数，不含在 [`Self::final_usage`] 的 output_tokens 里）。
+    pub fn reasoning_tokens(&self) -> i32 {
+        self.inner.reasoning_tokens
     }
 }
 
@@ -4146,5 +4160,91 @@ mod tests {
                 && e.data["content_block"]["type"] == "redacted_thinking"
                 && e.data["content_block"]["data"] == "encrypted-thinking"
         }));
+    }
+
+    #[test]
+    fn test_reasoning_tokens_counted_separately_without_shrinking_output_tokens() {
+        // thinking 启用：一段 reasoning 文本既要计入 output_tokens（口径不回归），
+        // 又要独立累加到 reasoning_tokens。两者来自同一段文本、相等且 > 0。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let _ = ctx.generate_initial_events();
+
+        let baseline_output = ctx.output_tokens;
+        assert_eq!(ctx.reasoning_tokens, 0, "初始 reasoning_tokens 应为 0");
+
+        let reasoning_text = "let me think about this step by step";
+        let expected = estimate_tokens(reasoning_text);
+        assert!(expected > 0, "测试文本应能估算出 >0 token");
+
+        let _ = ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: Some(reasoning_text.to_string()),
+                signature: Some("sig".to_string()),
+                redacted_content: None,
+            },
+        ));
+
+        // reasoning_tokens 单独累计这段思考的 token。
+        assert_eq!(ctx.reasoning_tokens, expected);
+        // output_tokens 仍然把思考 token 算进去（不回归）：增量等于同一段文本的估算。
+        assert_eq!(ctx.output_tokens, baseline_output + expected);
+    }
+
+    #[test]
+    fn test_redacted_reasoning_adds_to_both_counters() {
+        // 加密思考块：output_tokens 与 reasoning_tokens 都固定 +8。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            true,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let _ = ctx.generate_initial_events();
+        let baseline_output = ctx.output_tokens;
+
+        let _ = ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: None,
+                signature: None,
+                redacted_content: Some("encrypted".to_string()),
+            },
+        ));
+
+        assert_eq!(ctx.reasoning_tokens, 8);
+        assert_eq!(ctx.output_tokens, baseline_output + 8);
+    }
+
+    #[test]
+    fn test_disabled_thinking_reasoning_text_is_output_only_not_reasoning() {
+        // thinking 关闭：reasoning 文本降级为可见正文，只计 output_tokens，
+        // reasoning_tokens 保持 0。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let _ = ctx.generate_initial_events();
+        let baseline_output = ctx.output_tokens;
+
+        let visible = "this is visible fallback text";
+        let _ = ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: Some(visible.to_string()),
+                signature: None,
+                redacted_content: None,
+            },
+        ));
+
+        assert_eq!(ctx.reasoning_tokens, 0, "降级为正文不应计入 reasoning");
+        assert!(ctx.output_tokens > baseline_output, "正文仍应计入 output");
     }
 }
