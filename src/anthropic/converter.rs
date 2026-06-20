@@ -227,11 +227,18 @@ pub fn get_context_window_size(model: &str) -> i32 {
 /// Sending it to other models causes upstream 400 responses such as
 /// `additionalModelRequestFields is not supported for this model`.
 fn should_emit_output_config(req: &MessagesRequest, model_id: &str) -> bool {
-    model_id == "claude-opus-4.6"
-        && req
+    match model_id {
+        // opus-4.6：历史上仅 adaptive-thinking 路径接受该字段。
+        "claude-opus-4.6" => req
             .thinking
             .as_ref()
-            .is_some_and(|t| t.thinking_type == "adaptive")
+            .is_some_and(|t| t.thinking_type == "adaptive"),
+        // opus-4.8：抓包实证真实 Kiro CLI v3 在 runtime.kiro.dev 上发送
+        // additionalModelRequestFields.output_config.effort=max → 200,故在此解锁。
+        // 调用方已校验 effort 非空 + 顶档 xhigh→max 映射 → 解锁 opus-4.8 的 Max 思考深度。
+        "claude-opus-4.8" => true,
+        _ => false,
+    }
 }
 
 fn build_additional_model_request_fields(
