@@ -669,6 +669,9 @@ pub async fn post_messages(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    // 裸高阶 opus（无 -thinking 后缀、客户端又没给 effort）兜底默认 xhigh→max（见函数注释，
+    // 根因 2026-06-20：删 CPA -thinking 后全部走裸模型，无此兜底会让 Opus 丢掉 effort 降智）。
+    apply_default_effort_floor(&mut payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -1458,6 +1461,34 @@ fn override_thinking_from_model_name(payload: &mut MessagesRequest) {
     }
 }
 
+/// 兜底：客户端没给 effort 时，给高阶推理模型（opus）补默认 `xhigh`（经 converter 映射成上游 `max`）。
+///
+/// 根因（2026-06-20）：`override_thinking_from_model_name` 只兜 `-thinking` 后缀的老会话；而新会话
+/// 用的是**裸** `claude-opus-4-8`，Codex App 的辅助/auto 调用常常不带 `reasoning.effort` → CPA 原样
+/// 透传 → 这里若不兜底，请求就带着**空 effort** 打到上游，Opus 跑在内置（低）推理档而非用户期望的顶档。
+/// 实测：删 CPA `-thinking` 后全部流量走裸模型，这个兜底是「Opus 永远拿满 Max」的最后保证。
+/// catalog 里 `kiro-api/claude-opus-4-8` 的 `default_reasoning_level` 也是 xhigh，此处与之对齐。
+///
+/// 是否真发往上游仍由 converter 的 `should_emit_output_config` 门控（上游真实存在才放行 + opus-4.6
+/// 的 adaptive 怪癖），故非 opus / 上游不存在的模型不受影响；显式客户端 effort 一律尊重不覆盖。
+fn apply_default_effort_floor(payload: &mut MessagesRequest) {
+    let has_effort = payload
+        .output_config
+        .as_ref()
+        .map(|oc| !oc.effort.trim().is_empty())
+        .unwrap_or(false);
+    if has_effort {
+        return; // 尊重客户端显式选择
+    }
+    // 只对高阶推理 opus 兜底（与 catalog 的 xhigh 默认一致）；其余模型保持原样。
+    if !payload.model.to_lowercase().contains("opus") {
+        return;
+    }
+    payload.output_config = Some(OutputConfig {
+        effort: "xhigh".to_string(),
+    });
+}
+
 /// POST /v1/messages/count_tokens
 ///
 /// 计算消息的 token 数量
@@ -1521,6 +1552,9 @@ pub async fn post_messages_cc(
 
     // 检测模型名是否包含 "thinking" 后缀，若包含则覆写 thinking 配置
     override_thinking_from_model_name(&mut payload);
+    // 裸高阶 opus（无 -thinking 后缀、客户端又没给 effort）兜底默认 xhigh→max（见函数注释，
+    // 根因 2026-06-20：删 CPA -thinking 后全部走裸模型，无此兜底会让 Opus 丢掉 effort 降智）。
+    apply_default_effort_floor(&mut payload);
 
     // 检查是否为 WebSearch 请求
     if websearch::has_web_search_tool(&payload) {
@@ -2282,5 +2316,33 @@ mod tests {
         override_thinking_from_model_name(&mut payload);
         assert!(payload.thinking.is_none(), "bare model must not get thinking injected");
         assert!(payload.output_config.is_none(), "bare model must not get output_config injected");
+    }
+
+    #[test]
+    fn default_effort_floor_bare_opus_no_effort_defaults_xhigh() {
+        // 根因修复（2026-06-20）：裸 opus 无客户端 effort 时必须 server 端兜底 xhigh（→max），
+        // 否则删 CPA -thinking 后裸模型请求会丢 effort 降智。
+        let mut payload = req_with("claude-opus-4-8", None);
+        apply_default_effort_floor(&mut payload);
+        let oc = payload.output_config.expect("裸 opus 无 effort 必须被兜底");
+        assert_eq!(oc.effort, "xhigh", "裸 opus 无 effort → 默认 xhigh(→max)");
+    }
+
+    #[test]
+    fn default_effort_floor_respects_explicit_client_effort() {
+        let mut payload = req_with("claude-opus-4-8", Some("high"));
+        apply_default_effort_floor(&mut payload);
+        assert_eq!(
+            payload.output_config.unwrap().effort,
+            "high",
+            "显式客户端 effort 不被覆盖"
+        );
+    }
+
+    #[test]
+    fn default_effort_floor_skips_non_opus() {
+        let mut payload = req_with("claude-haiku-4-5", None);
+        apply_default_effort_floor(&mut payload);
+        assert!(payload.output_config.is_none(), "非 opus 模型不应被兜底 effort");
     }
 }

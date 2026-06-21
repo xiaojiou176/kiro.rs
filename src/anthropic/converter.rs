@@ -265,6 +265,12 @@ fn build_additional_model_request_fields(
             // Kiro's top tier (faithful Kiro CLI Max mode); other tiers pass through literally.
             let mapped_effort = match oc.effort.as_str() {
                 "xhigh" => "max".to_string(),
+                // Footgun guard (2026-06-20): the upstream AWS Q backend mishandles the lower
+                // effort tiers — `low` triggers ~286s stalls + 502, `medium` triggers a backend
+                // anomaly (see README effort table). The Codex catalog still offers low/medium,
+                // so clamp them UP to the safe `high` tier: a client can never drive a request
+                // onto the broken path. Remove this once upstream low/medium are fixed.
+                "low" | "medium" => "high".to_string(),
                 other => other.to_string(),
             };
             Some(KiroOutputConfig {
@@ -2407,6 +2413,37 @@ mod tests {
             .additional_model_request_fields
             .expect("opus 4.7 exists upstream → effort must be emitted (was hardcoded-blocked)");
         assert_eq!(fields.output_config.unwrap().effort, "high");
+        crate::kiro::upstream_models::clear_cache_for_test();
+    }
+
+    #[test]
+    fn test_low_medium_effort_clamped_to_high() {
+        // Footgun 回归（2026-06-20）：low/medium 已知触发上游 502/异常（见 README effort 表），
+        // 必须 clamp 到安全的 high；high 原样、xhigh→max 不受影响。
+        let _g = crate::kiro::upstream_models::lock_test();
+        crate::kiro::upstream_models::set_cache_for_test(
+            ["claude-opus-4.8"].iter().map(|s| s.to_string()).collect(),
+        );
+        for (input, expected) in [
+            ("low", "high"),
+            ("medium", "high"),
+            ("high", "high"),
+            ("xhigh", "max"),
+        ] {
+            let mut req = minimal_request_with_output_config("claude-opus-4-8");
+            req.output_config = Some(super::super::types::OutputConfig {
+                effort: input.to_string(),
+            });
+            let result = convert_request(&req).unwrap();
+            let fields = result
+                .additional_model_request_fields
+                .unwrap_or_else(|| panic!("effort {input} 应发 output_config"));
+            assert_eq!(
+                fields.output_config.unwrap().effort,
+                expected,
+                "effort {input} 应映射成 {expected}"
+            );
+        }
         crate::kiro::upstream_models::clear_cache_for_test();
     }
 

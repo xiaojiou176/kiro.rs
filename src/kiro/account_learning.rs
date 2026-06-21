@@ -238,7 +238,15 @@ impl LearningStore {
                 p.safe_rps_hi = p.safe_rps_hi.min(sample.send_rate_rps * 0.85);
                 p.safe_rps_lo = p.safe_rps_lo.min(sample.send_rate_rps * 0.7);
             } else {
-                p.safe_rps_lo = p.safe_rps_lo * (1.0 - alpha) + sample.send_rate_rps * alpha;
+                // 成功只能「向上」学习（根因修复 2026-06-20）：一次成功发送只能证明安全率
+                // **至少**有 `send_rate_rps` 这么高。而 `send_rate_rps` 取的是限速器自己（常被压到
+                // 地板的）当前 rate——轻流量/app-limited 的号上它贴着 floor。旧实现用裸 EWMA 在
+                // **每次成功**都把 `safe_rps_lo` 往这个 idle 低速率拉，于是几百次 idle 成功把学到的
+                // 安全天花板侵蚀到趋近 0 ——这正是「号没被推就莫名其妙变特别低」的 429 天花板根因。
+                // 安全带只允许被 429（上面分支）下调；低速率的成功绝不能把它拉低。
+                if sample.send_rate_rps > p.safe_rps_lo {
+                    p.safe_rps_lo = p.safe_rps_lo * (1.0 - alpha) + sample.send_rate_rps * alpha;
+                }
                 if sample.send_rate_rps > p.safe_rps_hi * 0.95 {
                     p.safe_rps_hi = p.safe_rps_hi * (1.0 - alpha * 0.5) + sample.send_rate_rps * alpha * 0.5;
                 }
@@ -532,6 +540,60 @@ mod tests {
         let path = temp_dir().join(format!("account_learning_test_{}.json", std::process::id()));
         let _ = std::fs::remove_file(&path);
         LearningStore::new(LearningConfig::default(), Some(path))
+    }
+
+    #[test]
+    fn test_idle_low_rate_success_does_not_erode_safe_rate() {
+        // 根因回归（2026-06-20，「莫名其妙特别低的 429 天花板」）：成功路径曾用裸 EWMA 把
+        // safe_rps_lo 拉向当前（常为 idle 低）发送率，轻流量号几百次 idle 成功会把学到的安全
+        // 天花板侵蚀到趋近 0。修复后：低于已知 safe_lo 的成功发送率不得拉低安全带，只有 429 才能下调。
+        let s = store();
+        // 先用 2.0 rps 的成功把安全率学上去。
+        for _ in 0..40 {
+            s.record_sample(
+                77,
+                SendContextSample {
+                    inflight: 8,
+                    sends_last_1s: 2,
+                    rpm_last_60s: 100,
+                    send_rate_rps: 2.0,
+                    was_429: false,
+                },
+            );
+        }
+        let (lo_before, _) = s.learned_safe_rps(77);
+        assert!(lo_before > 1.0, "2.0 rps 成功后 safe_lo 应抬到 >1.0，实际 {lo_before}");
+        // 再灌 300 次 idle/app-limited 的低速成功（0.1 rps）——绝不能侵蚀安全带。
+        for _ in 0..300 {
+            s.record_sample(
+                77,
+                SendContextSample {
+                    inflight: 0,
+                    sends_last_1s: 0,
+                    rpm_last_60s: 1,
+                    send_rate_rps: 0.1,
+                    was_429: false,
+                },
+            );
+        }
+        let (lo_after, _) = s.learned_safe_rps(77);
+        assert!(
+            lo_after >= lo_before - 1e-9,
+            "idle 低速成功不得侵蚀 safe_lo: {lo_before} -> {lo_after}"
+        );
+        // 但 429 仍必须能把安全率下调（保留向下学习能力，不能矫枉过正）。
+        s.record_sample(
+            77,
+            SendContextSample {
+                inflight: 8,
+                sends_last_1s: 1,
+                rpm_last_60s: 50,
+                send_rate_rps: lo_after,
+                was_429: true,
+            },
+        );
+        let (lo_429, _) = s.learned_safe_rps(77);
+        assert!(lo_429 < lo_after, "429 仍应下调 safe_lo: {lo_after} -> {lo_429}");
     }
 
     #[test]
