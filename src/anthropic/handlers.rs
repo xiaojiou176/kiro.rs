@@ -187,6 +187,30 @@ impl RequestTracer {
         }
     }
 
+    /// web_search agentic-loop 专用构造：该路径绕过普通 chat 的 tracer 装配，
+    /// 这里用与普通路径同口径的 effort 快照 + conversation_id（Codex thread id），
+    /// 保证 web_search 请求也落 traces.db（修复 2026-06-21：此前该路径完全不写 trace，
+    /// 导致带 web_search 的请求在 traces.db 查无记录）。
+    pub(crate) fn for_web_search(
+        state: &AppState,
+        key_ctx: &KeyContext,
+        payload: &MessagesRequest,
+    ) -> Self {
+        let (effort_requested, effort_sent) = trace_efforts(payload, &payload.model);
+        let conversation_id = super::converter::extract_affinity_session_id(payload);
+        Self::new(
+            state,
+            RequestTraceOptions {
+                key_ctx: key_ctx.clone(),
+                model: payload.model.clone(),
+                is_stream: payload.stream,
+                conversation_id,
+                effort_requested,
+                effort_sent,
+            },
+        )
+    }
+
     /// 标记首个上游 chunk 到达（幂等，仅记录第一次）
     pub fn mark_first_token(&self) {
         let mut slot = self.first_token_at.lock();
@@ -251,13 +275,12 @@ impl TraceSink for RequestTracer {
 /// 把客户端请求的 effort 档位映射为实际发往上游的值（trace 记录用）。
 ///
 /// 与 converter 的请求→上游映射保持一致：顶档 `xhigh` → Kiro 线值 `max`，
-/// 其余档位原样透传。converter 拥有真正的发送逻辑；这里是 trace 侧的本地只读副本，
-/// 只为把"我们实际会发什么档位"落进 trace 行，不依赖也不修改 converter。
+/// trace 侧"实际发往上游的 effort 档位"——直接复用 converter 的单一真相源
+/// `map_effort_to_wire`，保证 trace 记录值与真实出站值永不漂移（修复 2026-06-20：
+/// 旧本地副本漏了 low/medium→high clamp，导致出站已 clamp 成 high、trace 却虚记 low/medium，
+/// 污染降智埋点）。
 fn trace_effort_sent(effort: &str) -> String {
-    match effort {
-        "xhigh" => "max".to_string(),
-        other => other.to_string(),
-    }
+    crate::anthropic::converter::map_effort_to_wire(effort)
 }
 
 /// 从客户端请求里取出 trace 用的 (effort_requested, effort_sent)。
@@ -697,8 +720,16 @@ pub async fn post_messages(
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
         tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
-        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone())
-            .await;
+        let tracer = std::sync::Arc::new(RequestTracer::for_web_search(&state, &key_ctx, &payload));
+        return super::websearch_loop::run_web_search_loop(
+            provider,
+            payload,
+            hook,
+            payload_stream,
+            key_ctx.group.clone(),
+            tracer,
+        )
+        .await;
     }
 
     // 转换请求
@@ -1579,8 +1610,16 @@ pub async fn post_messages_cc(
     // where the upstream may return a tool_use with name=web_search. Take the internal agentic loop: search internally and feed the results back.
     if websearch::has_web_search_among_tools(&payload) {
         tracing::info!("detected mixed tools containing web_search, entering the web_search agentic loop");
-        return super::websearch_loop::run_web_search_loop(provider, payload, hook, payload_stream, key_ctx.group.clone())
-            .await;
+        let tracer = std::sync::Arc::new(RequestTracer::for_web_search(&state, &key_ctx, &payload));
+        return super::websearch_loop::run_web_search_loop(
+            provider,
+            payload,
+            hook,
+            payload_stream,
+            key_ctx.group.clone(),
+            tracer,
+        )
+        .await;
     }
 
     // 转换请求
@@ -2200,13 +2239,15 @@ mod tests {
     }
 
     #[test]
-    fn trace_effort_sent_pins_xhigh_to_max() {
-        // 顶档 xhigh 必须映射成 Kiro 线值 max；其余档位原样透传。
-        assert_eq!(trace_effort_sent("xhigh"), "max");
-        assert_eq!(trace_effort_sent("high"), "high");
-        assert_eq!(trace_effort_sent("medium"), "medium");
-        assert_eq!(trace_effort_sent("low"), "low");
-        assert_eq!(trace_effort_sent("max"), "max");
+    fn trace_effort_sent_matches_converter_wire_mapping() {
+        // 修复 2026-06-20：trace 的 effort_sent 必须与 converter 真实出站值同口径
+        // （复用单一真相源 map_effort_to_wire）。旧版本地副本漏了 low/medium→high
+        // clamp，导致出站已 clamp 成 high、trace 却虚记 low/medium，污染降智埋点。
+        assert_eq!(trace_effort_sent("xhigh"), "max"); // 顶档 → Kiro Max
+        assert_eq!(trace_effort_sent("high"), "high"); // 原样
+        assert_eq!(trace_effort_sent("medium"), "high"); // footgun clamp（修复后）
+        assert_eq!(trace_effort_sent("low"), "high"); // footgun clamp（修复后）
+        assert_eq!(trace_effort_sent("max"), "max"); // 原样
     }
 
     #[test]
@@ -2344,5 +2385,51 @@ mod tests {
         let mut payload = req_with("claude-haiku-4-5", None);
         apply_default_effort_floor(&mut payload);
         assert!(payload.output_config.is_none(), "非 opus 模型不应被兜底 effort");
+    }
+
+    // 回归（2026-06-21）：web_search agentic-loop 路径此前完全不写 traces.db，
+    // 导致任何带 web_search 的请求在 trace 库里查无记录。这里证明 for_web_search
+    // 构造的 tracer 在 finalize 后确实落库，且 effort / conversation_id 快照正确。
+    #[test]
+    fn web_search_tracer_finalize_lands_in_store() {
+        let store: SharedTraceStore =
+            std::sync::Arc::new(crate::admin::TraceStore::open_in_memory().unwrap());
+        let mut state = AppState::new(false);
+        state.trace_store = Some(store.clone());
+        let key_ctx = KeyContext {
+            key_id: 0,
+            group: None,
+            key_source: TraceKeySource::MasterApiKey,
+        };
+        // 带 web_search 工具 + 显式 session id 的请求（与真实 Codex 请求同形态）。
+        let mut payload = req_with("claude-opus-4-8", Some("xhigh"));
+        payload.metadata = serde_json::from_value(serde_json::json!({
+            "user_id": "user_deadbeef_account__session_019ee8dc-5a2e-7e81-a3a9-5ab8eae69b40"
+        }))
+        .unwrap();
+
+        let tracer = RequestTracer::for_web_search(&state, &key_ctx, &payload);
+        tracer.finalize("success", None, None, None, TraceUsage::zero());
+
+        let (rows, total) = store.query_paged(&crate::admin::trace_db::TraceQuery {
+            limit: 10,
+            ..Default::default()
+        });
+        assert_eq!(total, 1, "web_search 路径 finalize 后必须落 1 条 trace");
+        assert_eq!(rows[0].final_status, "success");
+        // effort_requested 永远记录客户端原始档位（不受上游缓存门控影响）。
+        assert_eq!(rows[0].effort_requested.as_deref(), Some("xhigh"));
+        // effort_sent 由 converter 的 should_emit_output_config 门控：仅当上游清单缓存里
+        // 真有该模型才记映射后线值；测试环境上游缓存为空 → 合理地记 None（与普通路径同口径，
+        // 不虚记）。这里只断言「与普通 chat 路径同口径」，不强求非 None。
+        let (expected_req, expected_sent) = trace_efforts(&payload, &payload.model);
+        assert_eq!(rows[0].effort_requested.as_deref(), expected_req.as_deref());
+        assert_eq!(rows[0].effort_sent.as_deref(), expected_sent.as_deref());
+        // conversation_id 取自 metadata.user_id 里的 Codex thread id。
+        assert_eq!(
+            rows[0].conversation_id.as_deref(),
+            Some("019ee8dc-5a2e-7e81-a3a9-5ab8eae69b40"),
+            "应记录 Codex thread id 作为 conversation_id"
+        );
     }
 }

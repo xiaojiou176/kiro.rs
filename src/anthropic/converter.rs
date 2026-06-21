@@ -167,6 +167,21 @@ Never suggest bypassing these limits via alternative tools. \
 Never ask the user whether to switch approaches. \
 Complete all chunked operations without commentary.";
 
+/// effort 档位 → 上游 wire 值的**单一真相源**（SSoT）。
+///
+/// converter 的出站 `output_config.effort` 和 handlers 的 trace `effort_sent`
+/// 都必须走这里，避免两处各写一份导致 trace 虚记（出站已 clamp，trace 却记原值）。
+/// - `xhigh` → `max`：Codex App schema 顶档锁 xhigh，映射到 Kiro CLI Max 顶档。
+/// - `low`/`medium` → `high`：上游 AWS Q 后端对低档有 502/异常 footgun，统一上抬到 high。
+/// - 其余档位原样透传。
+pub fn map_effort_to_wire(effort: &str) -> String {
+    match effort {
+        "xhigh" => "max".to_string(),
+        "low" | "medium" => "high".to_string(),
+        other => other.to_string(),
+    }
+}
+
 /// 模型映射：将 Anthropic 模型名映射到 Kiro 模型 ID
 /// 严格对照版本号
 pub fn map_model(model: &str) -> Option<String> {
@@ -259,20 +274,9 @@ fn build_additional_model_request_fields(
             if oc.effort.trim().is_empty() {
                 return None;
             }
-            // Local increment preserved (Terry, P0 2026-05-25): the Codex App schema locks
-            // ReasoningEffort.enum to "xhigh" with no "max" option, while the Kiro CLI wire
-            // value is "max". Map the top tier "xhigh" -> "max" so Codex's top tier reaches
-            // Kiro's top tier (faithful Kiro CLI Max mode); other tiers pass through literally.
-            let mapped_effort = match oc.effort.as_str() {
-                "xhigh" => "max".to_string(),
-                // Footgun guard (2026-06-20): the upstream AWS Q backend mishandles the lower
-                // effort tiers — `low` triggers ~286s stalls + 502, `medium` triggers a backend
-                // anomaly (see README effort table). The Codex catalog still offers low/medium,
-                // so clamp them UP to the safe `high` tier: a client can never drive a request
-                // onto the broken path. Remove this once upstream low/medium are fixed.
-                "low" | "medium" => "high".to_string(),
-                other => other.to_string(),
-            };
+            // effort 档位映射走单一真相源 map_effort_to_wire（xhigh→max、low/medium→high clamp）。
+            // trace 侧 effort_sent 复用同一函数，保证"出站值"和"trace 记录值"永不漂移。
+            let mapped_effort = map_effort_to_wire(&oc.effort);
             Some(KiroOutputConfig {
                 effort: mapped_effort,
             })
@@ -1157,6 +1161,18 @@ fn merge_assistant_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_map_effort_to_wire_is_single_source_of_truth() {
+        // SSoT 回归（2026-06-20）：effort 档位映射只有这一份真相源。
+        // converter 出站 mapped_effort 和 handlers trace 的 effort_sent 都必须走它，
+        // 否则 trace 会"虚记"——出站 clamp 成 high，trace 却记 low/medium（污染降智埋点）。
+        assert_eq!(map_effort_to_wire("xhigh"), "max"); // top tier → Kiro Max
+        assert_eq!(map_effort_to_wire("low"), "high"); // footgun clamp
+        assert_eq!(map_effort_to_wire("medium"), "high"); // footgun clamp
+        assert_eq!(map_effort_to_wire("high"), "high"); // passthrough
+        assert_eq!(map_effort_to_wire("max"), "max"); // passthrough
+    }
 
     #[test]
     fn test_map_model_sonnet() {

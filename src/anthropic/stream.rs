@@ -1820,13 +1820,30 @@ impl StreamContext {
         reasoning: &crate::kiro::model::events::ReasoningContentEvent,
     ) -> Vec<SseEvent> {
         if !self.thinking_enabled {
+            // thinking 关闭（典型场景：Codex 经反代——只发 output_config.effort、不带 Anthropic
+            // `thinking` 字段 → thinking_enabled=false）。客户端契约保持不变：reasoning 文本仍降级
+            // 为可见正文发出、加密块不发。但 reasoning_tokens 是「上游真实思考量」遥测（只进
+            // traces.db、不进客户端 usage），必须如实反映模型确实思考了——否则降智检测器对 Codex
+            // 这类不带 thinking 字段的 max 流量永远拿不到 reasoning 信号（实测 max 146/151 条=0）。
+            // 根因修复 2026-06-21：把「计量」与「是否以 thinking 块呈现」解耦。
+            let mut events = Vec::new();
             if let Some(text) = reasoning.text.as_deref()
                 && !text.is_empty()
             {
-                self.output_tokens += estimate_tokens(text);
-                return self.create_text_delta_events(text);
+                let t = estimate_tokens(text);
+                self.output_tokens += t;
+                // 思考 token 单独计数（与启用路径口径一致），即便此处降级为可见正文。
+                self.reasoning_tokens += t;
+                events = self.create_text_delta_events(text);
             }
-            return Vec::new();
+            if let Some(redacted) = reasoning.redacted_content.as_deref()
+                && !redacted.is_empty()
+            {
+                // 加密块无明文可见：保持「thinking 关闭不发 redacted_thinking 块」的客户端契约，
+                // 也不计 output_tokens（无可见内容），但仍计入 reasoning 遥测（固定 +8，口径一致）。
+                self.reasoning_tokens += 8;
+            }
+            return events;
         }
 
         let mut events = Vec::new();
@@ -4222,9 +4239,11 @@ mod tests {
     }
 
     #[test]
-    fn test_disabled_thinking_reasoning_text_is_output_only_not_reasoning() {
-        // thinking 关闭：reasoning 文本降级为可见正文，只计 output_tokens，
-        // reasoning_tokens 保持 0。
+    fn test_disabled_thinking_reasoning_text_still_counted_as_reasoning_telemetry() {
+        // 根因修复 2026-06-21（计量与呈现解耦）：thinking 关闭时（Codex 经反代场景），
+        // reasoning 文本仍降级为可见正文（客户端契约不变）+ 计入 output_tokens；
+        // 但 reasoning_tokens 遥测必须如实记录上游思考量（不再恒为 0），
+        // 否则降智检测器对 Codex（不带 thinking 字段）的 max 流量永远拿不到 reasoning 信号。
         let mut ctx = StreamContext::new_with_thinking(
             "test-model",
             1,
@@ -4236,7 +4255,9 @@ mod tests {
         let baseline_output = ctx.output_tokens;
 
         let visible = "this is visible fallback text";
-        let _ = ctx.process_kiro_event(&Event::ReasoningContent(
+        let expected = estimate_tokens(visible);
+        assert!(expected > 0, "测试文本应能估算出 >0 token");
+        let evs = ctx.process_kiro_event(&Event::ReasoningContent(
             crate::kiro::model::events::ReasoningContentEvent {
                 text: Some(visible.to_string()),
                 signature: None,
@@ -4244,7 +4265,49 @@ mod tests {
             },
         ));
 
-        assert_eq!(ctx.reasoning_tokens, 0, "降级为正文不应计入 reasoning");
-        assert!(ctx.output_tokens > baseline_output, "正文仍应计入 output");
+        // 客户端行为不变：仍作为可见正文发出 + 计入 output_tokens（不回归）。
+        assert!(
+            collect_text_content(&evs).contains("visible fallback"),
+            "reasoning 文本仍应降级为可见正文"
+        );
+        assert_eq!(ctx.output_tokens, baseline_output + expected, "正文仍计入 output");
+        // 遥测修复：reasoning_tokens 现在如实记录上游思考量（修复前恒为 0）。
+        assert_eq!(
+            ctx.reasoning_tokens, expected,
+            "thinking 关闭时 reasoning 遥测也应记上游思考量（根因修复后）"
+        );
+    }
+
+    #[test]
+    fn test_disabled_thinking_redacted_counted_as_reasoning_but_not_emitted() {
+        // thinking 关闭时收到加密思考块：不向客户端发 redacted_thinking 块（契约不变），
+        // 但仍计入 reasoning 遥测（固定 +8）；output_tokens 不变（无可见内容）。
+        let mut ctx = StreamContext::new_with_thinking(
+            "test-model",
+            1,
+            false,
+            HashMap::new(),
+            std::collections::HashSet::new(),
+        );
+        let _ = ctx.generate_initial_events();
+        let baseline_output = ctx.output_tokens;
+
+        let evs = ctx.process_kiro_event(&Event::ReasoningContent(
+            crate::kiro::model::events::ReasoningContentEvent {
+                text: None,
+                signature: None,
+                redacted_content: Some("encrypted".to_string()),
+            },
+        ));
+
+        assert!(
+            !evs.iter().any(|e| {
+                e.event == "content_block_start"
+                    && e.data["content_block"]["type"] == "redacted_thinking"
+            }),
+            "thinking 关闭时不应向客户端发 redacted_thinking 块"
+        );
+        assert_eq!(ctx.output_tokens, baseline_output, "加密块无可见内容，不计 output");
+        assert_eq!(ctx.reasoning_tokens, 8, "加密块仍计入 reasoning 遥测（固定 +8）");
     }
 }

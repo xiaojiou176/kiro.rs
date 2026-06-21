@@ -27,7 +27,7 @@ use crate::kiro::provider::KiroProvider;
 use crate::token;
 
 use super::converter::{ConversionError, convert_request, get_context_window_size};
-use super::handlers::{UsageRecordHook, map_provider_error};
+use super::handlers::{RequestTracer, TraceUsage, UsageRecordHook, map_provider_error};
 use super::stream::SseEvent;
 use super::types::{ErrorResponse, Message, MessagesRequest};
 use super::websearch::{self, WebSearchResults};
@@ -206,6 +206,7 @@ async fn run_round(
     hook: &UsageRecordHook,
     fallback_input_tokens: i32,
     group: Option<&str>,
+    tracer: &RequestTracer,
 ) -> Result<(RoundOutcome, u64), Response> {
     let conversion = match convert_request(payload) {
         Ok(c) => c,
@@ -244,7 +245,7 @@ async fn run_round(
     // 否则单个会话会被拆到多个号 = 同机跨号同会话，触发风控。用真实 session id 做锚点。
     let session_key = conversion.affinity_session_id.clone();
     let call_result = match provider
-        .call_api_stream(&request_body, None, group, session_key.as_deref())
+        .call_api_stream(&request_body, Some(tracer as _), group, session_key.as_deref())
         .await
     {
         Ok(r) => r,
@@ -254,6 +255,9 @@ async fn run_round(
         }
     };
     let credential_id = call_result.credential_id;
+    // 首个上游 chunk 到达：标记 first_token（与普通流式路径同口径），
+    // 用于 traces.db 的 first_token_ms（含限流等待，因为 started_at 在闸门之前）。
+    tracer.mark_first_token();
     let mut outcome =
         decode_round(call_result.response, &payload.model, &conversion.tool_name_map).await;
     // Carry the declared tool names (original + shortened) so the flush step can run the
@@ -531,6 +535,7 @@ pub(super) async fn run_web_search_loop(
     hook: UsageRecordHook,
     stream_client: bool,
     group: Option<String>,
+    tracer: Arc<RequestTracer>,
 ) -> Response {
     let fallback_input_tokens = token::count_all_tokens(
         payload.model.clone(),
@@ -550,9 +555,18 @@ pub(super) async fn run_web_search_loop(
 
     for round_idx in 0..=MAX_WEB_SEARCH_ROUNDS {
         let (round, credential_id) =
-            match run_round(&provider, &payload, &hook, fallback_input_tokens, group.as_deref()).await {
+            match run_round(&provider, &payload, &hook, fallback_input_tokens, group.as_deref(), &tracer).await {
                 Ok(v) => v,
-                Err(resp) => return resp,
+                Err(resp) => {
+                    tracer.finalize(
+                        "error",
+                        Some("websearch_round_failed"),
+                        None,
+                        None,
+                        TraceUsage::zero(),
+                    );
+                    return resp;
+                }
             };
         last_credential_id = credential_id;
         last_context_input = round.context_input_tokens.or(last_context_input);
@@ -575,6 +589,13 @@ pub(super) async fn run_web_search_loop(
                             0,
                             total_credits,
                             "error",
+                        );
+                        tracer.finalize(
+                            "error",
+                            Some("websearch_mcp_failed"),
+                            None,
+                            None,
+                            TraceUsage::zero(),
                         );
                         return map_provider_error(e);
                     }
@@ -617,6 +638,13 @@ pub(super) async fn run_web_search_loop(
                             total_credits,
                             "error",
                         );
+                        tracer.finalize(
+                            "error",
+                            Some("websearch_mcp_failed"),
+                            None,
+                            None,
+                            TraceUsage::zero(),
+                        );
                         return map_provider_error(e);
                     }
                 }
@@ -653,6 +681,19 @@ pub(super) async fn run_web_search_loop(
             "success",
         );
 
+        tracer.finalize(
+            "success",
+            None,
+            None,
+            None,
+            TraceUsage {
+                input_tokens: final_input.max(0) as u64,
+                output_tokens: output_tokens.max(0) as u64,
+                credits: total_credits,
+                ..TraceUsage::zero()
+            },
+        );
+
         return if stream_client {
             render_sse(&payload.model, content, &stop_reason, final_input, output_tokens)
         } else {
@@ -662,6 +703,13 @@ pub(super) async fn run_web_search_loop(
 
     // Theoretically unreachable (the loop always returns)
     hook.record(last_credential_id, fallback_input_tokens, 0, 0, 0, total_credits, "error");
+    tracer.finalize(
+        "error",
+        Some("websearch_loop_exited_unexpectedly"),
+        None,
+        None,
+        TraceUsage::zero(),
+    );
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorResponse::new("internal_error", "web_search loop exited unexpectedly")),
