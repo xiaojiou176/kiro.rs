@@ -49,7 +49,11 @@ pub fn build_client(
     timeout_secs: u64,
     tls_backend: TlsBackend,
 ) -> anyhow::Result<Client> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(timeout_secs));
+    // 指纹对齐真实 Kiro CLI：原生 CLI 发 `accept-encoding: gzip` 并接受 gzip 回包。
+    // 开启 reqwest gzip：自动加 `accept-encoding: gzip` 出站头 + 自动解压上游 gzip 响应。
+    let mut builder = Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .gzip(true);
 
     match tls_backend {
         TlsBackend::Rustls => {
@@ -113,5 +117,21 @@ mod tests {
         let config = ProxyConfig::new("http://127.0.0.1:7890");
         let client = build_client(Some(&config), 30, TlsBackend::Rustls);
         assert!(client.is_ok());
+    }
+
+    // 指纹对齐回归：reqwest 必须开 `gzip` feature，否则 build_client 的 .gzip(true)
+    // 不会自动加 `accept-encoding: gzip` 出站头（真实 Kiro CLI V3 发 gzip）。
+    // 直接读 Cargo.toml 防 feature 被删回退。
+    #[test]
+    fn fingerprint_reqwest_gzip_feature_enabled() {
+        let manifest = include_str!("../Cargo.toml");
+        let reqwest_line = manifest
+            .lines()
+            .find(|l| l.trim_start().starts_with("reqwest = "))
+            .expect("Cargo.toml 应有 reqwest 依赖行");
+        assert!(
+            reqwest_line.contains("\"gzip\""),
+            "reqwest 必须开 gzip feature（accept-encoding 指纹对齐）: {reqwest_line}"
+        );
     }
 }

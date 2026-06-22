@@ -243,11 +243,6 @@ impl RequestTracer {
             .first_token_at
             .lock()
             .map(|t| t.duration_since(self.started_at).as_millis() as u64);
-        // T-C4 占位：throttle_count 列/插入/读取已在 trace_db.rs 落地，但
-        // RequestTracer 侧的 429 计数源尚未接线（依赖 B 阶段抓包确认 web_search
-        // agentic-loop 内首次被重试吸收的 429 落点）。先按 0 记，解除编译阻塞；
-        // 真正埋点在 T-C4 完成时把此处换成实计数（如从 attempts 里统计 429）。
-        let throttle_count: u32 = 0;
         let rec = TraceRecord {
             trace_id: self.trace_id.clone(),
             ts: self.ts.clone(),
