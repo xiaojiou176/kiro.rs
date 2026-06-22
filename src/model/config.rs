@@ -571,6 +571,17 @@ pub struct LearningConfig {
     /// 让旧 429 随时间被遗忘——避免某号几小时前撞过墙就被永久按慢号对待。
     #[serde(default = "default_bucket_decay_half_life_secs")]
     pub bucket_decay_half_life_secs: u64,
+    /// 轻流量恢复速率（每次「未撞 429 的成功」让 safe_rps 安全带朝出厂默认
+    /// (`DEFAULT_SAFE_RPS_LO/HI`) 方向乘性回升的比例，0~1）。
+    ///
+    /// 根因（2026-06-22）：safe_rps 只在「429 下砍」和「高速成功上抬」时变；而高速成功
+    /// 的前提是发送率 > 当前 safe_rps，但 rate_limiter 的爬升上限又被 safe_rps_hi 卡住
+    /// → 两者互相钳制，一旦被 429 砍到地板，轻流量（发送率贴着低 safe_rps）下永远爬不回来，
+    /// 号被永久按慢号对待（实测 6 号 429=0% 却全趴在 0.2~0.5 rps）。
+    /// 这个温和回升给安全带一条「没撞墙就慢慢往回松」的出路：撞 429 仍立刻被砍（保护不变），
+    /// 只是不再「一被砍就永久趴底」。设 0 即关闭（回到旧行为）。
+    #[serde(default = "default_recovery_per_sample")]
+    pub recovery_per_sample: f64,
 }
 
 impl Default for LearningConfig {
@@ -580,6 +591,7 @@ impl Default for LearningConfig {
             persist_path: default_learning_persist_path(),
             ewma_alpha: default_ewma_alpha(),
             bucket_decay_half_life_secs: default_bucket_decay_half_life_secs(),
+            recovery_per_sample: default_recovery_per_sample(),
         }
     }
 }
@@ -786,6 +798,13 @@ fn default_bucket_decay_half_life_secs() -> u64 {
     // 1800s = 30min 半衰期：约 30 分钟后旧 429 的权重减半，2-3 小时基本淡出。
     // 既能让被打狠的号在白天逐步恢复，又不会快到「刚撞墙就忘」失去保护意义。
     1800
+}
+fn default_recovery_per_sample() -> f64 {
+    // 0.01 = 每次「未撞 429 的成功」让安全带朝出厂默认回升 1% 的剩余差距（乘性逼近）。
+    // 很温和：约 70 次连续无 429 成功才把差距收掉一半；轻流量号几百次 idle 成功能在
+    // 几十分钟~数小时内从地板缓慢爬回默认，而一旦撞 429 立刻被既有 `min(send_rate*0.85)`
+    // 砍回去，保护强度不变。设 0 关闭（回到「一被砍永久趴底」的旧行为）。
+    0.01
 }
 
 impl Default for Config {

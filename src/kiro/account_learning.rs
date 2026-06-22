@@ -250,6 +250,23 @@ impl LearningStore {
                 if sample.send_rate_rps > p.safe_rps_hi * 0.95 {
                     p.safe_rps_hi = p.safe_rps_hi * (1.0 - alpha * 0.5) + sample.send_rate_rps * alpha * 0.5;
                 }
+
+                // 轻流量恢复（根因修复 2026-06-22「429=0% 却永久趴在 0.2~0.5 rps」）：
+                // 上面两条「高速成功上抬」要求 send_rate_rps 高于当前安全带，但 rate_limiter 的
+                // 爬升上限又被 safe_rps_hi 卡住（learned_probe_cap = safe_rps_hi）→ 互相钳制：
+                // 一旦被 429 砍到地板，轻流量下发送率贴着低 safe_rps，永远够不到上抬阈值，号被
+                // 永久按慢号对待。这里给安全带一条「没撞墙就朝出厂默认温和回升」的出路：每次未撞
+                // 429 的成功，把 lo/hi 朝 DEFAULT 方向乘性收掉 recovery 比例的剩余差距。撞 429 时
+                // 走上面分支立刻被 min(send_rate*0.85) 砍回去，保护强度不变——只是不再永久趴底。
+                let recovery = self.cfg.recovery_per_sample.clamp(0.0, 1.0);
+                if recovery > 0.0 {
+                    if p.safe_rps_hi < DEFAULT_SAFE_RPS_HI {
+                        p.safe_rps_hi += (DEFAULT_SAFE_RPS_HI - p.safe_rps_hi) * recovery;
+                    }
+                    if p.safe_rps_lo < DEFAULT_SAFE_RPS_LO {
+                        p.safe_rps_lo += (DEFAULT_SAFE_RPS_LO - p.safe_rps_lo) * recovery;
+                    }
+                }
             }
 
             p.bottleneck_dimension = compute_bottleneck(p);
@@ -594,6 +611,81 @@ mod tests {
         );
         let (lo_429, _) = s.learned_safe_rps(77);
         assert!(lo_429 < lo_after, "429 仍应下调 safe_lo: {lo_after} -> {lo_429}");
+    }
+
+    #[test]
+    fn test_light_traffic_recovery_climbs_safe_band_back_toward_default() {
+        // 根因回归（2026-06-22「429=0% 却永久趴在 0.2~0.5 rps」）：被 429 砍到地板后，
+        // 轻流量下发送率贴着低 safe_rps，「高速成功上抬」永远不触发 → 永久趴底。
+        // recovery_per_sample 给安全带一条「没撞墙就朝默认温和回升」的出路。
+        let s = store();
+        // 先撞 429 把安全带砍到地板（模拟历史被打狠）。
+        s.record_sample(
+            55,
+            SendContextSample {
+                inflight: 4,
+                sends_last_1s: 1,
+                rpm_last_60s: 30,
+                send_rate_rps: 0.3,
+                was_429: true,
+            },
+        );
+        let (lo0, hi0) = s.learned_safe_rps(55);
+        assert!(hi0 < DEFAULT_SAFE_RPS_HI, "429 后 hi 应被砍到默认以下，实际 {hi0}");
+        // 现在灌一批「轻流量低速成功」（0.2 rps，远低于安全带）——旧逻辑下这绝不会抬安全带；
+        // 新恢复逻辑应让 lo/hi 朝默认 (0.5/1.0) 缓慢回升。
+        for _ in 0..300 {
+            s.record_sample(
+                55,
+                SendContextSample {
+                    inflight: 1,
+                    sends_last_1s: 0,
+                    rpm_last_60s: 2,
+                    send_rate_rps: 0.2,
+                    was_429: false,
+                },
+            );
+        }
+        let (lo1, hi1) = s.learned_safe_rps(55);
+        assert!(hi1 > hi0, "轻流量无 429 成功应让 hi 回升: {hi0} -> {hi1}");
+        assert!(lo1 > lo0, "轻流量无 429 成功应让 lo 回升: {lo0} -> {lo1}");
+        // 但不得越过出厂默认（恢复是「回到默认」，不是无限上涨）。
+        assert!(hi1 <= DEFAULT_SAFE_RPS_HI + 1e-9, "hi 不得超过默认上限: {hi1}");
+        assert!(lo1 <= DEFAULT_SAFE_RPS_LO + 1e-9, "lo 不得超过默认下限: {lo1}");
+    }
+
+    #[test]
+    fn test_recovery_does_not_block_429_cut() {
+        // 恢复机制绝不能削弱 429 保护：恢复回升一阵后，撞 429 仍必须立刻把安全带砍下去。
+        let s = store();
+        for _ in 0..200 {
+            s.record_sample(
+                56,
+                SendContextSample {
+                    inflight: 1,
+                    sends_last_1s: 0,
+                    rpm_last_60s: 2,
+                    send_rate_rps: 0.2,
+                    was_429: false,
+                },
+            );
+        }
+        let (_, hi_recovered) = s.learned_safe_rps(56);
+        s.record_sample(
+            56,
+            SendContextSample {
+                inflight: 4,
+                sends_last_1s: 1,
+                rpm_last_60s: 30,
+                send_rate_rps: 0.25,
+                was_429: true,
+            },
+        );
+        let (_, hi_after_429) = s.learned_safe_rps(56);
+        assert!(
+            hi_after_429 < hi_recovered,
+            "撞 429 必须砍安全带（恢复不能削弱保护）: {hi_recovered} -> {hi_after_429}"
+        );
     }
 
     #[test]
