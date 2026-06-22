@@ -1,6 +1,6 @@
 # kiro-web-search (delta: MCP wire 对齐 InvokeMCP)
 
-## MODIFIED Requirements
+## ADDED Requirements
 
 ### Requirement: web_search/MCP 出站对齐真实 Kiro CLI V3 InvokeMCP 形态
 cli 端点的 web_search/MCP 调用 MUST 对齐原生 Kiro CLI V3：走 runtime 根路径 /、带 x-amz-target=AmazonCodeWhispererStreamingService.InvokeMCP + x-amzn-codewhisperer-optout=true、profileArn 作为请求体顶层字段注入(非 header)。
