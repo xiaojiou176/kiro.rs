@@ -102,7 +102,9 @@ impl KiroEndpoint for IdeEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if let Some(arn) = ctx.credentials.effective_profile_arn() {
+        // MCP/web_search 路径：IdC/Builder ID 也必须带 profileArn（占位符上游接受，
+        // 不带则 400）。用 streaming_profile_arn()（含占位符）。API Key 返回 None，不受影响。
+        if let Some(arn) = ctx.credentials.streaming_profile_arn() {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
         if ctx.credentials.is_api_key_credential() {
@@ -117,7 +119,7 @@ impl KiroEndpoint for IdeEndpoint {
 }
 
 /// 将 profile_arn 注入到请求体 JSON 根对象
-fn inject_profile_arn(request_body: &str, profile_arn: Option<&str>) -> String {
+pub(crate) fn inject_profile_arn(request_body: &str, profile_arn: Option<&str>) -> String {
     if let Some(arn) = profile_arn {
         if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(request_body) {
             json["profileArn"] = serde_json::Value::String(arn.to_string());

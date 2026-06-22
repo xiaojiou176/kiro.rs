@@ -137,6 +137,10 @@ pub struct TraceRecord {
     /// Codex thread / 会话 id（从 metadata.user_id 提取的 conversationId，可空）
     #[serde(default)]
     pub conversation_id: Option<String>,
+    /// 本次请求（含 web_search agentic-loop 内部重试）累计撞到的上游 429 次数。
+    /// 即便最终 success，也如实计数——根治「traces.db 把被重试吸收的 429 隐身」(P2)。
+    #[serde(default)]
+    pub throttle_count: u32,
     /// 每跳明细
     pub attempts: Vec<TraceAttempt>,
 }
@@ -266,7 +270,7 @@ impl TraceStore {
         // (列名, 定义) —— 与 SCHEMA 中新增列保持一致
         // 注意 key_source 不带 NOT NULL：老库已有行需先以 NULL 添加再回填（SQLite ALTER ADD COLUMN
         // NOT NULL 不带常量 DEFAULT 时无法对已有行赋值）。新插入永远写入合法值。
-        let columns: [(&str, &str); 11] = [
+        let columns: [(&str, &str); 12] = [
             ("conversation_id", "TEXT"),
             ("input_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("output_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -278,6 +282,7 @@ impl TraceStore {
             ("reasoning_tokens", "INTEGER NOT NULL DEFAULT 0"),
             ("effort_requested", "TEXT"),
             ("effort_sent", "TEXT"),
+            ("throttle_count", "INTEGER NOT NULL DEFAULT 0"),
         ];
         let key_source_added = !existing.contains("key_source");
         for (name, def) in columns {
@@ -343,8 +348,8 @@ impl TraceStore {
                  total_attempts, duration_ms, interrupted_after_bytes, \
                  input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, \
                  credits, first_token_ms, conversation_id, \
-                 reasoning_tokens, effort_requested, effort_sent) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
+                 reasoning_tokens, effort_requested, effort_sent, throttle_count) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
                 rusqlite::params![
                     rec.trace_id,
                     rec.ts,
@@ -370,6 +375,7 @@ impl TraceStore {
                     rec.reasoning_tokens as i64,
                     rec.effort_requested.clone(),
                     rec.effort_sent.clone(),
+                    rec.throttle_count as i64,
                 ],
             )?;
             for a in &rec.attempts {
@@ -500,8 +506,8 @@ impl TraceStore {
         let sql = format!(
             "SELECT trace_id, ts, key_id, key_source, model, is_stream, final_status, final_credential_id, \
              error_type, error_message, total_attempts, duration_ms, interrupted_after_bytes, \
-             input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, conversation_id, \
-             reasoning_tokens, effort_requested, effort_sent \
+            input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, credits, first_token_ms, conversation_id, \
+             reasoning_tokens, effort_requested, effort_sent, throttle_count \
              FROM traces {} ORDER BY ts_epoch DESC LIMIT {} OFFSET {}",
             where_sql, limit, q.offset
         );
@@ -532,6 +538,7 @@ impl TraceStore {
                 reasoning_tokens: row.get::<_, i64>(20)? as u64,
                 effort_requested: row.get::<_, Option<String>>(21)?,
                 effort_sent: row.get::<_, Option<String>>(22)?,
+                throttle_count: row.get::<_, i64>(23)? as u32,
                 attempts: Vec::new(),
             })
         })?;
@@ -674,7 +681,8 @@ CREATE TABLE IF NOT EXISTS traces (
     conversation_id   TEXT,
     reasoning_tokens  INTEGER NOT NULL DEFAULT 0,
     effort_requested  TEXT,
-    effort_sent       TEXT
+    effort_sent       TEXT,
+    throttle_count    INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_traces_ts ON traces(ts_epoch DESC);
 CREATE INDEX IF NOT EXISTS idx_traces_status ON traces(final_status);
@@ -738,6 +746,7 @@ mod tests {
             effort_sent: Some("max".to_string()),
             first_token_ms: None,
             conversation_id: Some("test-conv".to_string()),
+            throttle_count: 0,
             attempts: vec![
                 TraceAttempt {
                     attempt: 0,

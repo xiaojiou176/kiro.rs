@@ -240,6 +240,121 @@ pub fn capture_outbound(
     }
 }
 
+/// Redact only credential-bearing headers; everything else (incl. `x-amz-target`,
+/// which is an API operation name, not a secret) is preserved verbatim so the
+/// capture stays analysis-complete.
+fn redact_headers(headers: &[(String, String)]) -> Vec<serde_json::Value> {
+    headers
+        .iter()
+        .map(|(k, v)| {
+            let lk = k.to_ascii_lowercase();
+            let value = if lk == "authorization"
+                || lk == "x-api-key"
+                || lk == "cookie"
+                || lk == "set-cookie"
+            {
+                format!("<redacted:len={}>", v.len())
+            } else {
+                v.clone()
+            };
+            json!({"name": k, "value": value})
+        })
+        .collect()
+}
+
+/// Parse a body string into JSON when possible, else keep it as a raw string so
+/// nothing is lost (100% complete capture).
+fn body_to_value(body: &str) -> serde_json::Value {
+    serde_json::from_str::<serde_json::Value>(body)
+        .unwrap_or_else(|_| serde_json::Value::String(body.to_string()))
+}
+
+/// Dump an INBOUND HTTP request (client/CPA -> kiro-rs) when capture is enabled.
+///
+/// Same shape/redaction/atomic-write contract as [`capture_outbound`], only the
+/// semantic direction differs. Writes `<captures>/{ts}-{rid}-{direction}.json`.
+pub fn capture_inbound(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+    direction: &str,
+) {
+    if !capture_enabled() {
+        return;
+    }
+    let Some(d) = OBS_DIRS.get() else { return };
+    let rid = current_request_id();
+    let ts = Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
+    let path = d.captures_dir.join(format!("{ts}-{rid}-{direction}.json"));
+
+    let payload = json!({
+        "ts": Utc::now().to_rfc3339(),
+        "request_id": rid,
+        "traceparent": current_traceparent(),
+        "direction": direction,
+        "method": method,
+        "url": url,
+        "headers": redact_headers(headers),
+        "body": body_to_value(body),
+    });
+
+    if let Err(e) = write_atomic(&path, payload.to_string().as_bytes()) {
+        tracing::warn!(target: "observability", error = %e, path = %path.display(), "capture_inbound failed");
+    }
+}
+
+/// Dump an HTTP RESPONSE body (Amazon -> kiro-rs upstream reply, or the
+/// kiro-rs -> client SSE aggregate) when capture is enabled. No method/url; a
+/// `status` code instead. Same redaction/atomic-write contract.
+pub fn capture_response(status: u16, headers: &[(String, String)], body: &str, direction: &str) {
+    if !capture_enabled() {
+        return;
+    }
+    let Some(d) = OBS_DIRS.get() else { return };
+    let rid = current_request_id();
+    let ts = Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
+    let path = d.captures_dir.join(format!("{ts}-{rid}-{direction}.json"));
+
+    let payload = json!({
+        "ts": Utc::now().to_rfc3339(),
+        "request_id": rid,
+        "traceparent": current_traceparent(),
+        "direction": direction,
+        "status": status,
+        "headers": redact_headers(headers),
+        "body": body_to_value(body),
+    });
+
+    if let Err(e) = write_atomic(&path, payload.to_string().as_bytes()) {
+        tracing::warn!(target: "observability", error = %e, path = %path.display(), "capture_response failed");
+    }
+}
+
+/// Like [`capture_response`] but with an explicit request id, for callers (e.g.
+/// a `Drop` impl after a streaming response finishes) where the task-local
+/// `REQUEST_ID` may no longer be in scope. No headers (SSE aggregate has none).
+pub fn capture_sse_with_rid(rid: &str, status: u16, body: &str, direction: &str) {
+    if !capture_enabled() {
+        return;
+    }
+    let Some(d) = OBS_DIRS.get() else { return };
+    let ts = Utc::now().format("%Y%m%dT%H%M%S%.3fZ");
+    let path = d.captures_dir.join(format!("{ts}-{rid}-{direction}.json"));
+
+    let payload = json!({
+        "ts": Utc::now().to_rfc3339(),
+        "request_id": rid,
+        "direction": direction,
+        "status": status,
+        "body": body_to_value(body),
+    });
+
+    if let Err(e) = write_atomic(&path, payload.to_string().as_bytes()) {
+        tracing::warn!(target: "observability", error = %e, path = %path.display(), "capture_sse_with_rid failed");
+    }
+}
+
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     if let Some(parent) = path.parent() {
@@ -457,5 +572,77 @@ mod tests {
             "authorization not redacted"
         );
         assert!(body.contains("\"effort\":\"max\""), "body not preserved");
+    }
+
+    #[test]
+    fn capture_inbound_response_redact_and_preserve() {
+        // SAFETY: serialized via --test-threads=1 in CI; restore env after.
+        unsafe { std::env::set_var("KIRO_RS_CAPTURE", "1") };
+        let tmp = std::env::temp_dir()
+            .join(format!("kiro-rs-cap-inresp-{}", Utc::now().format("%s%9f")));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let dirs = ObsDirs {
+            log_dir: tmp.clone(),
+            structured_dir: tmp.join("structured"),
+            errors_dir: tmp.join("errors"),
+            captures_dir: tmp.join("captures"),
+        };
+        std::fs::create_dir_all(&dirs.captures_dir).unwrap();
+        let _ = OBS_DIRS.set(dirs.clone());
+
+        // inbound: authorization redacted, x-amz-target preserved, body kept
+        capture_inbound(
+            "POST",
+            "https://kiro-rs/v1/messages",
+            &[
+                ("authorization".to_string(), "Bearer secret-inbound".to_string()),
+                ("x-amz-target".to_string(), "AmazonQ.GenerateAssistantResponse".to_string()),
+            ],
+            r#"{"model":"claude-opus-4.8"}"#,
+            "smoke-inbound",
+        );
+        // response: status carried, set-cookie redacted, body kept
+        capture_response(
+            429,
+            &[("set-cookie".to_string(), "sess=abc".to_string())],
+            r#"{"__type":"TooManyRequests"}"#,
+            "smoke-resp",
+        );
+        unsafe { std::env::remove_var("KIRO_RS_CAPTURE") };
+
+        let cdir = &OBS_DIRS.get().unwrap().captures_dir;
+        let read = |needle: &str| -> String {
+            let e: Vec<_> = std::fs::read_dir(cdir)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().contains(needle))
+                .collect();
+            assert!(!e.is_empty(), "no capture file for {needle}");
+            std::fs::read_to_string(e[0].path()).unwrap()
+        };
+
+        let inb = read("smoke-inbound");
+        assert!(inb.contains("<redacted:len="), "inbound authorization not redacted");
+        assert!(
+            inb.contains("AmazonQ.GenerateAssistantResponse"),
+            "x-amz-target must NOT be redacted (it is an op name, not a secret)"
+        );
+        assert!(inb.contains("claude-opus-4.8"), "inbound body not preserved");
+        assert!(inb.contains("\"direction\":\"smoke-inbound\""));
+
+        let resp = read("smoke-resp");
+        assert!(resp.contains("\"status\":429"), "response status not recorded");
+        assert!(resp.contains("<redacted:len="), "set-cookie not redacted");
+        assert!(resp.contains("TooManyRequests"), "response body not preserved");
+    }
+
+    #[test]
+    fn capture_inbound_noop_when_disabled() {
+        unsafe { std::env::remove_var("KIRO_RS_CAPTURE") };
+        // capture_enabled() is false -> must early-return without touching disk.
+        // We only assert it does not panic and writes nothing observable here.
+        capture_inbound("POST", "https://x/y", &[], "{}", "disabled-probe");
+        capture_response(200, &[], "{}", "disabled-probe");
+        assert!(!capture_enabled(), "capture must be disabled in this test");
     }
 }

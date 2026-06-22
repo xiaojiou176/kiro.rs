@@ -564,6 +564,21 @@ impl KiroProvider {
                 }
                 let headers = response.headers().clone();
                 let body = response.text().await.unwrap_or_default();
+                // KIRO_RS_CAPTURE=1: 抓 Amazon -> kiro-rs 的 MCP 成功回包（已物化，不破坏流程）。
+                if observability::capture_enabled() {
+                    let captured: Vec<(String, String)> = headers
+                        .iter()
+                        .map(|(k, v)| {
+                            (k.as_str().to_string(), v.to_str().unwrap_or("<binary>").to_string())
+                        })
+                        .collect();
+                    observability::capture_response(
+                        status.as_u16(),
+                        &captured,
+                        &body,
+                        "upstream-response-kiro-mcp",
+                    );
+                }
                 let mut builder = http::Response::builder().status(status);
                 for (name, value) in headers.iter() {
                     if let Ok(v) = value.to_str() {
@@ -579,7 +594,26 @@ impl KiroProvider {
             }
 
             // 失败响应
+            let capture_hdrs: Option<Vec<(String, String)>> = observability::capture_enabled()
+                .then(|| {
+                    response
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| {
+                            (k.as_str().to_string(), v.to_str().unwrap_or("<binary>").to_string())
+                        })
+                        .collect()
+                });
             let body = response.text().await.unwrap_or_default();
+            // KIRO_RS_CAPTURE=1: 抓 Amazon -> kiro-rs 的 MCP 失败回包（含 429）。
+            if let Some(hdrs) = capture_hdrs.as_ref() {
+                observability::capture_response(
+                    status.as_u16(),
+                    hdrs,
+                    &body,
+                    "upstream-response-kiro-mcp-error",
+                );
+            }
 
             // 限速器 429 回写
             if status.as_u16() == 429 && self.limiters.enabled() {
@@ -997,7 +1031,26 @@ impl KiroProvider {
                     "AWS 429 响应头采样（用于确认上游是否返回 Retry-After / 限流头）"
                 );
             }
+            let capture_hdrs: Option<Vec<(String, String)>> = observability::capture_enabled()
+                .then(|| {
+                    response
+                        .headers()
+                        .iter()
+                        .map(|(k, v)| {
+                            (k.as_str().to_string(), v.to_str().unwrap_or("<binary>").to_string())
+                        })
+                        .collect()
+                });
             let body = response.text().await.unwrap_or_default();
+            // KIRO_RS_CAPTURE=1: 抓 Amazon -> kiro-rs 的 API 失败回包（含 429）。
+            if let Some(hdrs) = capture_hdrs.as_ref() {
+                observability::capture_response(
+                    status.as_u16(),
+                    hdrs,
+                    &body,
+                    "upstream-response-kiro-api-error",
+                );
+            }
 
             // 限速器 429 回写：乘性减速 + 冷却（AWS 实证不返回 Retry-After，故传 None）。
             if status.as_u16() == 429 && self.limiters.enabled() {

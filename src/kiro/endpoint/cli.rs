@@ -102,7 +102,10 @@ impl KiroEndpoint for CliEndpoint {
             .header("amz-sdk-request", "attempt=1; max=3")
             .header("Authorization", format!("Bearer {}", ctx.token));
 
-        if let Some(arn) = ctx.credentials.effective_profile_arn() {
+        // MCP/web_search 路径：IdC/Builder ID 也必须带 profileArn（占位符 AAAACCCCXXXX 上游接受，
+        // 不带则 400 `profileArn is required`）。用 streaming_profile_arn()（含占位符）而非
+        // effective_profile_arn()（占位符→None→漏注入）。API Key 凭据返回 None，不受影响。
+        if let Some(arn) = ctx.credentials.streaming_profile_arn() {
             req = req.header("x-amzn-kiro-profile-arn", arn);
         }
         if ctx.credentials.is_api_key_credential() {
@@ -111,8 +114,16 @@ impl KiroEndpoint for CliEndpoint {
         req
     }
 
-    fn transform_api_body(&self, body: &str, _ctx: &RequestContext<'_>) -> String {
-        set_origin_kiro_cli(body)
+    fn transform_api_body(&self, body: &str, ctx: &RequestContext<'_>) -> String {
+        let body = set_origin_kiro_cli(body);
+        // Builder ID / IdC 凭据：cli 端点也必须把 profileArn 注入请求体——上游
+        // runtime 要求带 profileArn（占位符 AAAACCCCXXXX 也接受，原生 Kiro CLI 实测照发占位符即成功）。
+        // 不发会被上游以 400 `profileArn is required` 拒。
+        // API Key 凭据：streaming_profile_arn() 返回 None → inject_profile_arn 原样返回，不受影响。
+        crate::kiro::endpoint::ide::inject_profile_arn(
+            &body,
+            ctx.credentials.streaming_profile_arn().as_deref(),
+        )
     }
 }
 

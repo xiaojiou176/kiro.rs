@@ -230,12 +230,24 @@ impl RequestTracer {
     ) {
         let Some(store) = &self.store else { return };
         let attempts = std::mem::take(&mut *self.attempts.lock());
+        // P2：本次请求累计撞到的上游 429 次数（即便最终 success 也如实计数）。
+        // 从每跳 attempt 的 http_status 数 429——主路径每次 429 重试都记一跳。
+        // 根治「被重试吸收的 429 在 traces.db 隐身」。
+        let throttle_count = attempts
+            .iter()
+            .filter(|a| a.http_status == Some(429))
+            .count() as u32;
         // 最终凭据：最后一跳的命中凭据（成功跳即命中凭据，失败跳即最后尝试的凭据）
         let final_credential_id = attempts.last().map(|a| a.credential_id).unwrap_or(0);
         let first_token_ms = self
             .first_token_at
             .lock()
             .map(|t| t.duration_since(self.started_at).as_millis() as u64);
+        // T-C4 占位：throttle_count 列/插入/读取已在 trace_db.rs 落地，但
+        // RequestTracer 侧的 429 计数源尚未接线（依赖 B 阶段抓包确认 web_search
+        // agentic-loop 内首次被重试吸收的 429 落点）。先按 0 记，解除编译阻塞；
+        // 真正埋点在 T-C4 完成时把此处换成实计数（如从 attempts 里统计 429）。
+        let throttle_count: u32 = 0;
         let rec = TraceRecord {
             trace_id: self.trace_id.clone(),
             ts: self.ts.clone(),
@@ -260,6 +272,7 @@ impl RequestTracer {
             effort_sent: self.effort_sent.clone(),
             first_token_ms,
             conversation_id: self.conversation_id.clone(),
+            throttle_count,
             attempts,
         };
         store.insert(&rec);
@@ -655,6 +668,11 @@ pub async fn post_messages(
 ) -> Response {
     // Count the image budget on inbound to provide precise diagnostics for later context-window-full errors
     let img_stats = count_image_budget(&payload);
+    // KIRO_RS_CAPTURE=1: 抓 client/CPA -> kiro-rs 的入站请求体（payload 最原始态，override 之前）。
+    if crate::observability::capture_enabled() {
+        let body = serde_json::to_string(&payload).unwrap_or_default();
+        crate::observability::capture_inbound("POST", "/v1/messages", &[], &body, "inbound-anthropic");
+    }
     tracing::info!(
         model = %payload.model,
         max_tokens = %payload.max_tokens,
@@ -944,6 +962,9 @@ struct PermitHoldingStream {
     inner: std::pin::Pin<Box<dyn Stream<Item = Result<Bytes, Infallible>> + Send>>,
     // 持有到 drop；非流式/shadow 模式为 None。下划线：仅靠 Drop 释放，不主动读。
     _permit: Option<crate::kiro::rate_limiter::LimiterPermit>,
+    // KIRO_RS_CAPTURE=1 时旁路累加发给客户端的 SSE 全文，Drop（流结束/断连）时落盘。
+    // None = 抓包关闭，零开销。(rid, direction, accumulated_bytes)
+    sse_capture: Option<(String, String, Vec<u8>)>,
 }
 
 impl PermitHoldingStream {
@@ -954,6 +975,13 @@ impl PermitHoldingStream {
         Self {
             inner: Box::pin(inner),
             _permit: permit,
+            sse_capture: crate::observability::capture_enabled().then(|| {
+                (
+                    crate::observability::current_request_id(),
+                    "client-sse".to_string(),
+                    Vec::new(),
+                )
+            }),
         }
     }
 }
@@ -964,7 +992,25 @@ impl Stream for PermitHoldingStream {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.inner.as_mut().poll_next(cx)
+        let polled = self.inner.as_mut().poll_next(cx);
+        if let std::task::Poll::Ready(Some(Ok(ref bytes))) = polled {
+            if let Some((_, _, buf)) = self.sse_capture.as_mut() {
+                buf.extend_from_slice(bytes);
+            }
+        }
+        polled
+    }
+}
+
+impl Drop for PermitHoldingStream {
+    fn drop(&mut self) {
+        if let Some((rid, direction, buf)) = self.sse_capture.take() {
+            if !buf.is_empty() {
+                let text = String::from_utf8_lossy(&buf).to_string();
+                // Drop 处 task-local REQUEST_ID 可能已出 scope，故用构造时抓好的 rid 直写。
+                crate::observability::capture_sse_with_rid(&rid, 200, &text, &direction);
+            }
+        }
     }
 }
 
@@ -1562,6 +1608,17 @@ pub async fn post_messages_cc(
         message_count = %payload.messages.len(),
         "Received POST /cc/v1/messages request"
     );
+    // KIRO_RS_CAPTURE=1: 抓 client/CPA -> kiro-rs 的 /cc 入站请求体。
+    if crate::observability::capture_enabled() {
+        let body = serde_json::to_string(&payload).unwrap_or_default();
+        crate::observability::capture_inbound(
+            "POST",
+            "/cc/v1/messages",
+            &[],
+            &body,
+            "inbound-anthropic-cc",
+        );
+    }
     let hook = UsageRecordHook::from_state(&state, key_ctx.key_id, payload.model.clone());
 
     // 检查 KiroProvider 是否可用
