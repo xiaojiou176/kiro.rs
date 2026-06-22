@@ -39,6 +39,14 @@ const MAX_WEB_SEARCH_ROUNDS: usize = 5;
 struct RoundOutcome {
     /// Accumulated assistant text
     text: String,
+    /// Accumulated native thinking/reasoning text for this round (from
+    /// `Event::ReasoningContent`). Empty when the upstream emitted no thinking.
+    /// Without this, the web_search loop path silently dropped reasoning that the
+    ///普通 chat 路径 (`stream.rs` `process_reasoning_content`) would have surfaced.
+    thinking: String,
+    /// Signature of the thinking block (Anthropic clients echo it back next turn).
+    /// None -> a placeholder signature is used when emitting the thinking block.
+    thinking_signature: Option<String>,
     /// The complete tool_use for this round (name already restored via tool_name_map)
     tool_uses: Vec<DecodedToolUse>,
     /// Actual input tokens computed from contextUsageEvent
@@ -98,6 +106,13 @@ async fn decode_round(
     let mut decoder = EventStreamDecoder::new();
 
     let mut text = String::new();
+    // Native thinking/reasoning accumulated this round (Kiro `reasoningContentEvent`).
+    // The普通 chat 路径 collects this via `process_reasoning_content`; the web_search
+    // loop previously had no `Event::ReasoningContent` arm so it fell into `_ => {}`
+    // and the model's thinking was silently dropped — this is the root cause of
+    // "reasoning not shown" for any request carrying web_search tools.
+    let mut thinking = String::new();
+    let mut thinking_signature: Option<String> = None;
     // id -> (name, json_buffer), preserving the order of appearance
     let mut buffers: std::collections::HashMap<String, (String, String)> =
         std::collections::HashMap::new();
@@ -134,6 +149,19 @@ async fn decode_round(
             };
             match event {
                 Event::AssistantResponse(resp) => text.push_str(&resp.content),
+                Event::ReasoningContent(reasoning) => {
+                    // Mirror the普通 chat 路径: accumulate plaintext thinking and keep
+                    // the latest non-empty signature so the flushed thinking block can
+                    // be echoed back by Anthropic clients next turn.
+                    if let Some(t) = reasoning.text.as_deref() {
+                        thinking.push_str(t);
+                    }
+                    if let Some(sig) = reasoning.signature.as_deref() {
+                        if !sig.is_empty() {
+                            thinking_signature = Some(sig.to_string());
+                        }
+                    }
+                }
                 Event::ToolUse(tu) => {
                     let entry = buffers.entry(tu.tool_use_id.clone()).or_insert_with(|| {
                         order.push(tu.tool_use_id.clone());
@@ -185,6 +213,8 @@ async fn decode_round(
 
     RoundOutcome {
         text,
+        thinking,
+        thinking_signature,
         tool_uses,
         context_input_tokens,
         credits,
@@ -445,6 +475,8 @@ fn canonical_input_key(input: &Value) -> String {
 
 fn build_flush_content(
     presentation: Vec<Value>,
+    thinking: &str,
+    thinking_signature: Option<&str>,
     text: &str,
     tool_uses: &[DecodedToolUse],
     searched: &[Option<WebSearchResults>],
@@ -452,6 +484,21 @@ fn build_flush_content(
     tool_name_map: &std::collections::HashMap<String, String>,
 ) -> Vec<Value> {
     let mut content: Vec<Value> = presentation;
+    // INVARIANT (parity with普通 chat 路径 `build_anthropic_content`): when the upstream
+    // emitted native thinking, the thinking block MUST come first in `content` (Anthropic
+    // ordering: thinking precedes text/tool_use). Previously the web_search loop dropped
+    // thinking entirely (no `Event::ReasoningContent` arm + no `"thinking"` arm in
+    // build_sse_events), which is the root cause of "reasoning not shown" for web_search
+    // requests. We surface it here so CPA can translate it into a reasoning summary.
+    if !thinking.is_empty() {
+        content.push(json!({
+            "type": "thinking",
+            "thinking": thinking,
+            "signature": thinking_signature
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| super::stream::THINKING_SIGNATURE_PLACEHOLDER.to_string()),
+        }));
+    }
     if !text.is_empty() {
         // Run the shared one-shot `<invoke>` sniffer: splits `text` into a sequence of
         // text blocks + reclaimed structured tool_use blocks (same safety gates as the
@@ -654,6 +701,8 @@ pub(super) async fn run_web_search_loop(
         }
         let content = build_flush_content(
             presentation.clone(),
+            &round.thinking,
+            round.thinking_signature.as_deref(),
             &round.text,
             &round.tool_uses,
             &searched,
@@ -806,6 +855,32 @@ fn build_sse_events(
         let index = index as i32;
         let btype = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
         match btype {
+            "thinking" => {
+                // Emit the thinking block as a streaming Anthropic content_block so CPA's
+                // claude->responses translator (which keys on content_block_start{type:thinking}
+                // + thinking_delta) turns it into reasoning_summary events for the App.
+                // Without this arm, web_search-loop responses never surfaced reasoning.
+                let think = block.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
+                let signature = block
+                    .get("signature")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(super::stream::THINKING_SIGNATURE_PLACEHOLDER);
+                events.push(SseEvent::new("content_block_start", json!({
+                    "type": "content_block_start", "index": index,
+                    "content_block": {"type": "thinking", "thinking": ""}
+                })));
+                events.push(SseEvent::new("content_block_delta", json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "thinking_delta", "thinking": think}
+                })));
+                events.push(SseEvent::new("content_block_delta", json!({
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "signature_delta", "signature": signature}
+                })));
+                events.push(SseEvent::new("content_block_stop", json!({
+                    "type": "content_block_stop", "index": index
+                })));
+            }
             "text" => {
                 let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
                 events.push(SseEvent::new("content_block_start", json!({
@@ -968,6 +1043,88 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
+    // ---- REGRESSION (reasoning-not-shown root cause): the web_search loop path MUST
+    // surface native thinking. Historically decode_round had no Event::ReasoningContent
+    // arm and build_sse_events had no "thinking" arm, so any web_search-carrying request
+    // silently dropped the model's reasoning -> Codex App showed "正在思考" forever.
+    // These two tests are the fitness function locking the fix in place. ----
+
+    #[test]
+    fn flush_content_puts_thinking_block_first() {
+        // build_flush_content must place the thinking block before text (Anthropic ordering),
+        // so CPA's claude->responses translator emits a reasoning item ahead of the message.
+        let content = build_flush_content(
+            Vec::new(),
+            "Let me reason about this step by step.",
+            Some("sig-abc"),
+            "Here is the answer.",
+            &[],
+            &[],
+            &names(&["exec_command"]),
+            &nomap(),
+        );
+        assert_eq!(
+            content.first().and_then(|b| b.get("type")).and_then(|v| v.as_str()),
+            Some("thinking"),
+            "thinking block must be first in flushed content"
+        );
+        assert_eq!(content[0]["thinking"], "Let me reason about this step by step.");
+        assert_eq!(content[0]["signature"], "sig-abc");
+        // text must still be present, after thinking
+        assert!(content.iter().any(|b| b["type"] == "text"));
+    }
+
+    #[test]
+    fn flush_content_no_thinking_when_empty() {
+        // No native thinking -> no thinking block fabricated (don't invent reasoning).
+        let content = build_flush_content(
+            Vec::new(),
+            "",
+            None,
+            "plain answer",
+            &[],
+            &[],
+            &names(&["exec_command"]),
+            &nomap(),
+        );
+        assert!(
+            !content.iter().any(|b| b["type"] == "thinking"),
+            "must not fabricate a thinking block when upstream emitted none"
+        );
+    }
+
+    #[test]
+    fn sse_events_emit_thinking_block_as_streaming_reasoning() {
+        // A thinking content block must render to the Anthropic streaming shape that CPA's
+        // translator keys on: content_block_start{type:thinking} + thinking_delta + signature_delta.
+        let content = vec![json!({
+            "type": "thinking",
+            "thinking": "step-by-step reasoning",
+            "signature": "sig-xyz"
+        })];
+        let events = build_sse_events("claude-opus-4-8", content, "end_turn", 10, 5);
+
+        let has_thinking_start = events.iter().any(|e| {
+            e.event == "content_block_start"
+                && e.data["content_block"]["type"] == "thinking"
+        });
+        assert!(has_thinking_start, "must emit content_block_start{{type:thinking}}");
+
+        let has_thinking_delta = events.iter().any(|e| {
+            e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "thinking_delta"
+                && e.data["delta"]["thinking"] == "step-by-step reasoning"
+        });
+        assert!(has_thinking_delta, "must emit thinking_delta with the reasoning text");
+
+        let has_sig_delta = events.iter().any(|e| {
+            e.event == "content_block_delta"
+                && e.data["delta"]["type"] == "signature_delta"
+                && e.data["delta"]["signature"] == "sig-xyz"
+        });
+        assert!(has_sig_delta, "must emit signature_delta so clients can echo it back");
+    }
+
     // ---- build_sse_events: present server_tool_use + result, and the exec tool_use is not swallowed ----
 
     #[test]
@@ -1039,7 +1196,7 @@ mod tests {
         let tool_uses = vec![tu("web_search"), tu("exec")];
         let searched = vec![fake_results("rust 2026"), None];
         let content =
-            build_flush_content(Vec::new(), "answer", &tool_uses, &searched, &names(&["exec"]), &nomap());
+            build_flush_content(Vec::new(), "", None, "answer", &tool_uses, &searched, &names(&["exec"]), &nomap());
 
         let raw_web_search = content
             .iter()
@@ -1080,7 +1237,7 @@ mod tests {
     fn flush_content_client_tools_only_passthrough() {
         let tool_uses = vec![tu("exec")];
         let searched: Vec<Option<WebSearchResults>> = vec![None];
-        let content = build_flush_content(Vec::new(), "", &tool_uses, &searched, &names(&["exec"]), &nomap());
+        let content = build_flush_content(Vec::new(), "", None, "", &tool_uses, &searched, &names(&["exec"]), &nomap());
         assert!(
             content
                 .iter()
@@ -1112,6 +1269,7 @@ mod tests {
         let leaked = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">echo hi</parameter>\n</invoke>";
         let content = build_flush_content(
             Vec::new(),
+            "", None,
             leaked,
             &[],
             &[],
@@ -1142,7 +1300,7 @@ mod tests {
         // Narrative text before the leaked invoke must be preserved as a text block,
         // and the invoke still reclaimed.
         let leaked = "Here is the result.\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">ls</parameter>\n</invoke>";
-        let content = build_flush_content(Vec::new(), leaked, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(Vec::new(), "", None, leaked, &[], &[], &names(&["exec_command"]), &nomap());
         assert!(!leaks_literal_invoke(&content));
         assert!(
             content.iter().any(|c| c["type"] == "text"
@@ -1160,7 +1318,7 @@ mod tests {
         // An <invoke> shown inside a ``` code fence is a DISPLAY/discussion, not a real call.
         // It must stay as text, never become a tool_use.
         let text = "Look at this example:\n```\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">rm -rf /</parameter>\n</invoke>\n```";
-        let content = build_flush_content(Vec::new(), text, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(Vec::new(), "", None, text, &[], &[], &names(&["exec_command"]), &nomap());
         assert!(
             !content.iter().any(|c| c["type"] == "tool_use"),
             "fenced <invoke> must NOT be reclaimed (it's a display). content={:?}",
@@ -1172,7 +1330,7 @@ mod tests {
     fn flush_content_does_not_reclaim_invoke_mid_sentence() {
         // <invoke> embedded mid-sentence (not at line start) is discussion text, not a call.
         let text = "the tag <invoke name=\"exec_command\"><parameter name=\"cmd\">x</parameter></invoke> means a call";
-        let content = build_flush_content(Vec::new(), text, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(Vec::new(), "", None, text, &[], &[], &names(&["exec_command"]), &nomap());
         assert!(
             !content.iter().any(|c| c["type"] == "tool_use"),
             "mid-sentence <invoke> must NOT be reclaimed. content={:?}",
@@ -1185,7 +1343,7 @@ mod tests {
         // Tool-table guard: a clean line-start <invoke> whose name is NOT a declared tool
         // must NOT be reclaimed (never synthesize a call for an unknown tool).
         let leaked = "call\n<invoke name=\"definitely_not_a_tool\">\n<parameter name=\"x\">y</parameter>\n</invoke>";
-        let content = build_flush_content(Vec::new(), leaked, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(Vec::new(), "", None, leaked, &[], &[], &names(&["exec_command"]), &nomap());
         assert!(
             !content.iter().any(|c| c["type"] == "tool_use"),
             "unknown tool name must NOT be reclaimed. content={:?}",
@@ -1203,6 +1361,7 @@ mod tests {
         let leaked = "let me search\n<invoke name=\"web_search\">\n<parameter name=\"query\">latest news</parameter>\n</invoke>";
         let content = build_flush_content(
             Vec::new(),
+            "", None,
             leaked,
             &[],
             &[],
@@ -1235,6 +1394,7 @@ mod tests {
         let leaked = "<invoke name=\"exec_command\">\n<parameter name=\"cmd\">ls</parameter>\n</invoke>\n<invoke name=\"web_search\">\n<parameter name=\"query\">news</parameter>\n</invoke>";
         let content = build_flush_content(
             Vec::new(),
+            "", None,
             leaked,
             &[],
             &[],
@@ -1260,7 +1420,7 @@ mod tests {
     #[test]
     fn flush_content_clean_text_is_single_text_block() {
         // No <invoke> at all -> behavior identical to before: one text block, unchanged.
-        let content = build_flush_content(Vec::new(), "just a normal answer", &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(Vec::new(), "", None, "just a normal answer", &[], &[], &names(&["exec_command"]), &nomap());
         assert_eq!(content.len(), 1);
         assert_eq!(content[0]["type"], "text");
         assert_eq!(content[0]["text"], "just a normal answer");
@@ -1272,6 +1432,7 @@ mod tests {
         let leaked = "<invoke name=\"exec_command\">\n<parameter name=\"cmd\">a</parameter>\n</invoke>\n<invoke name=\"get_time\">\n<parameter name=\"tz\">utc</parameter>\n</invoke>";
         let content = build_flush_content(
             Vec::new(),
+            "", None,
             leaked,
             &[],
             &[],
@@ -1291,7 +1452,7 @@ mod tests {
     fn flush_content_unclosed_invoke_stays_text() {
         // An <invoke> with no closing tag in the complete text is not a clean call -> keep as text.
         let text = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">echo hi";
-        let content = build_flush_content(Vec::new(), text, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(Vec::new(), "", None, text, &[], &[], &names(&["exec_command"]), &nomap());
         assert!(
             !content.iter().any(|c| c["type"] == "tool_use"),
             "unclosed <invoke> must NOT be reclaimed. content={:?}",
@@ -1314,6 +1475,7 @@ mod tests {
         map.insert(short.to_string(), original.to_string());
         let content = build_flush_content(
             Vec::new(),
+            "", None,
             &leaked,
             &[],
             &[],
@@ -1339,7 +1501,7 @@ mod tests {
         // stop_reason="tool_use". This test pins that contract: a leaked invoke with an empty
         // tool_uses list still yields a client tool_use block in the content.
         let leaked = "call\n<invoke name=\"exec_command\">\n<parameter name=\"cmd\">echo hi</parameter>\n</invoke>";
-        let content = build_flush_content(Vec::new(), leaked, &[], &[], &names(&["exec_command"]), &nomap());
+        let content = build_flush_content(Vec::new(), "", None, leaked, &[], &[], &names(&["exec_command"]), &nomap());
         let has_client_tool_use = content
             .iter()
             .any(|c| c["type"] == "tool_use" && c["name"] != "web_search");
@@ -1410,7 +1572,7 @@ mod tests {
         // the search and emit NO raw tool_use at all -> the caller derives end_turn.
         let tool_uses = vec![tu("web_search")];
         let searched = vec![fake_results("q")];
-        let content = build_flush_content(Vec::new(), "", &tool_uses, &searched, &names(&[]), &nomap());
+        let content = build_flush_content(Vec::new(), "", None, "", &tool_uses, &searched, &names(&[]), &nomap());
         assert!(!content.iter().any(|c| c["type"] == "tool_use"));
         assert!(
             content
@@ -1437,6 +1599,7 @@ mod tests {
         }];
         let content = build_flush_content(
             Vec::new(),
+            "", None,
             leaked,
             &structured,
             &[],
@@ -1466,6 +1629,7 @@ mod tests {
         }];
         let content = build_flush_content(
             Vec::new(),
+            "", None,
             leaked,
             &structured,
             &[],
