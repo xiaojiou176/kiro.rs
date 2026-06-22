@@ -391,18 +391,14 @@ impl KiroProvider {
             let url = endpoint.mcp_url(&rctx);
             let body = endpoint.transform_mcp_body(request_body, &rctx);
 
-            let traceparent = observability::current_traceparent();
+            // 指纹对齐真实 Kiro CLI：原生 CLI 出站不发 traceparent（仅内部追踪用），
+            // 也不显式发 Connection（用 keep-alive 默认）。两者都会暴露"非原生客户端"指纹，
+            // 故出站到 Amazon 不带（内部 trace 仍走 task-local，不依赖出站头）。
             let base = self
                 .client_for(&ctx.credentials)?
                 .post(&url)
                 .body(body.clone())
-                .header("content-type", endpoint.content_type())
-                .header("Connection", "close");
-            let base = if !traceparent.is_empty() {
-                base.header("traceparent", traceparent)
-            } else {
-                base
-            };
+                .header("content-type", endpoint.content_type());
             let request = endpoint.decorate_mcp(base, &rctx);
 
             // KIRO_RS_CAPTURE=1 时也抓 MCP/WebSearch 出站包
@@ -812,18 +808,13 @@ impl KiroProvider {
             tracing::debug!("使用端点 [{}] POST {}", endpoint.name(), url);
             tracing::debug!("实际发送请求体: {}", body);
 
-            let traceparent = observability::current_traceparent();
+            // 指纹对齐真实 Kiro CLI：原生 CLI 出站不发 traceparent、不显式发 Connection。
+            // 出站到 Amazon 不带（内部 trace 仍走 task-local）。
             let base = self
                 .client_for(&ctx.credentials)?
                 .post(&url)
                 .body(body.clone())
-                .header("content-type", endpoint.content_type())
-                .header("Connection", "close");
-            let base = if !traceparent.is_empty() {
-                base.header("traceparent", traceparent)
-            } else {
-                base
-            };
+                .header("content-type", endpoint.content_type());
             let request = endpoint.decorate_api(base, &rctx);
 
             // 打印实际发送的请求头（RUST_LOG=debug 时输出，便于排查问题）

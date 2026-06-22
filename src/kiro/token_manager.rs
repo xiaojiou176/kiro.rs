@@ -572,6 +572,11 @@ pub(crate) async fn list_available_profiles(
 
     let mut last_error: Option<String> = None;
     let mut empty_seen = false;
+    // 确定性「此账号类型上游不支持解析 profile」信号（如纯个人 Builder ID 收到
+    // 403「... is not supported for this operation.」）。与「网络瞬态错」区分：
+    // 确定性不支持 → 回退占位符且让调用方标记已尝试（重启前不再重试）；
+    // 瞬态错 → bail! 让调用方下次再试。
+    let mut definitive_unsupported = false;
     for region in candidates.iter() {
         let host = format!("q.{}.amazonaws.com", region);
         let url = format!("https://{}/", host);
@@ -610,6 +615,9 @@ pub(crate) async fn list_available_profiles(
         }
 
         let body_text = response.text().await.unwrap_or_default();
+        if is_definitive_profile_unsupported(status, &body_text) {
+            definitive_unsupported = true;
+        }
         last_error = Some(format!("{} {}", status, body_text));
         // 403 等错误继续尝试下一个候选端点
     }
@@ -620,10 +628,37 @@ pub(crate) async fn list_available_profiles(
         return Ok(ListAvailableProfilesResponse::default());
     }
 
+    // 所有候选端点都以「确定性不支持」拒绝（纯个人 Builder ID 等）：这不是瞬态错，
+    // 而是上游对该账号类型的确定结论。返回空结果（=「无 Enterprise profile」），
+    // 让调用方 `ensure_profile_arn` 走 Ok(None) 分支标记已尝试、回退占位符、
+    // 不再每个请求重打一次 403。瞬态错仍走下面的 bail!。
+    if definitive_unsupported {
+        return Ok(ListAvailableProfilesResponse::default());
+    }
+
     bail!(
         "获取可用 profile 失败: {}",
         last_error.unwrap_or_else(|| "无可用端点".to_string())
     );
+}
+
+/// 判定一次 ListAvailableProfiles 响应是否是「确定性：上游不支持为此账号类型解析
+/// profile」——区别于网络瞬态错（超时/连接失败/5xx）。
+///
+/// 确定性条件：HTTP 403（Forbidden / AccessDenied 语义）或响应体明确含
+/// 「is not supported」「not supported for this operation」「Builder ID ... not
+/// supported」之类措辞。这类错误重试多少次结果都一样，应回退占位符且不再重试。
+pub(crate) fn is_definitive_profile_unsupported(
+    status: reqwest::StatusCode,
+    body: &str,
+) -> bool {
+    let lower = body.to_ascii_lowercase();
+    let says_unsupported = lower.contains("is not supported")
+        || lower.contains("not supported for this operation")
+        || (lower.contains("builder id") && lower.contains("not supported"));
+    // 403 = 上游确定性拒绝（个人 Builder ID 对该操作无权限）；或任意状态码但 body
+    // 明确说「不支持」。两者都属于「重试无意义」的确定性结论。
+    status == reqwest::StatusCode::FORBIDDEN || says_unsupported
 }
 
 /// 设置用户偏好（开启/关闭超额）
@@ -4293,6 +4328,47 @@ mod tests {
         let mut credentials = KiroCredentials::default();
         credentials.expires_at = Some("2020-01-01T00:00:00Z".to_string());
         assert!(is_token_expired(&credentials));
+    }
+
+    // ── B1: 个人 Builder ID profileArn 解析「确定性不支持 vs 瞬态错」区分 ──
+    #[test]
+    fn definitive_unsupported_true_on_403_forbidden() {
+        // 纯个人 Builder ID 上游返回 403 → 确定性不支持（重试无意义）
+        assert!(is_definitive_profile_unsupported(
+            reqwest::StatusCode::FORBIDDEN,
+            r#"{"message":"AWS Builder ID is not supported for this operation.","reason":null}"#,
+        ));
+    }
+
+    #[test]
+    fn definitive_unsupported_true_on_not_supported_body_any_status() {
+        // body 明确说「不支持」即使状态码非 403 也算确定性
+        assert!(is_definitive_profile_unsupported(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"message":"This operation is not supported for this credential type."}"#,
+        ));
+    }
+
+    #[test]
+    fn definitive_unsupported_false_on_transient_5xx() {
+        // 5xx 服务端瞬态错 → 不是确定性，应继续重试（不标已尝试）
+        assert!(!is_definitive_profile_unsupported(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"message":"internal error"}"#,
+        ));
+        assert!(!is_definitive_profile_unsupported(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "",
+        ));
+    }
+
+    #[test]
+    fn definitive_unsupported_false_on_429_throttle() {
+        // 429 限流是瞬态，不该被当成「确定性不支持」而永久回退占位符
+        assert!(!is_definitive_profile_unsupported(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"message":"Too many requests"}"#,
+        ));
     }
 
     #[test]
