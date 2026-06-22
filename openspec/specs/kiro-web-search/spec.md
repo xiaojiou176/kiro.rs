@@ -63,3 +63,8 @@ kiro-rs 调用 Amazon Q `/mcp` 执行 web_search MUST 复用现有 API Key 凭�
 - **WHEN** 当前 credentials.json 中的 api_key 凭据用于 web_search
 - **THEN** `/mcp` 调用鉴权通过，无需补充 profileArn 或其他字段
 
+#### Scenario: Builder ID / IdC 凭据需注入 profileArn（2026-06-21 T-C2 实抓修正）
+> 背景：上一版 spec 默认 web_search 只走 API Key（不需 profileArn）。后续真机抓包发现 Builder ID(IdC) 凭据走 `/mcp` 时，上游强制要求请求带 `profileArn` 字段（连占位符 `AAAACCCCXXXX` 都接受），漏发即 `400 profileArn is required`——原生 Kiro CLI 用 Builder ID 时就是照发占位符。
+- **WHEN** 当前 credentials.json 中的 Builder ID / IdC 凭据用于 web_search（cli/ide 两端点的 `decorate_mcp`）
+- **THEN** MUST 用 `streaming_profile_arn()`（含占位符也照发）注入 profileArn header；API Key 凭据仍返回 None 不注入（`streaming_profile_arn()` 对 api_key 返 None）→ API Key 路径行为不变。
+- 注：聊天主路径（`transform_api_body`）同此修正，对 Builder ID 注入 profileArn。证据层：runtime-verified（隔离 + live host-active）；改动在工作区已 commit `092ea80`，未 push。
