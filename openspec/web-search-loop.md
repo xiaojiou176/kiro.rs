@@ -1,3 +1,5 @@
+> ⚠️ **已被取代（2026-06-23 compress §9.5 文档漂移标注）**：本草稿内容已被正式 spec `openspec/specs/kiro-web-search/spec.md` 吸收，全仓零引用，仅作历史草稿留存，**勿据此施工**。
+
 # Spec: web_search 局部 agentic loop (kiro-rs)
 
 ## 1. 问题

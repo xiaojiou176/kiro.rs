@@ -1,7 +1,7 @@
 # kiro-web-search Specification
 
 ## Purpose
-TBD - created by archiving change kiro-native-web-search. Update Purpose after archive.
+让 Kiro lane（`kiro-api/` 前缀模型）经 CPA→kiro-rs 反代时，web_search 工具声明被正确放行并对齐真实 Kiro CLI V3 形态（InvokeMCP），由上游 AWS 后端代发搜索，而非被丢弃或走错端点。归档自 change `kiro-native-web-search` + `websearch-mcp-invokemcp-alignment`。（2026-06-23 compress §9.5 文档漂移修复：回填此前的 TBD 占位 Purpose。）
 ## Requirements
 ### Requirement: CPA 放行 Kiro lane 的 web_search 工具声明
 
@@ -79,4 +79,3 @@ cli 端点的 web_search/MCP 调用 MUST 对齐原生 Kiro CLI V3：走 runtime 
 #### Scenario: api_key web_search 不被破坏(G2 不变量)
 - WHEN api_key 凭据发 web_search
 - THEN 出站带 tokentype=API_KEY、body **永不**含 profileArn；上游回 200 真结果(R9-F20 坑不复现)
-

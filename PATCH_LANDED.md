@@ -1,3 +1,5 @@
+> ⚠️ **历史留档（2026-06-23 compress §9.5 标注）**：本文件是 2026-05-25 快照，内文部署路径 `vendors/kiro-rs/target/release/kiro-rs` 与 pid 均为当时值；**当前布局已是 `kiro-rs/src`**（顶层 `.proxies` gitignore 子仓），勿照此路径操作。
+
 # 🏆 kiro-rs P0+P1 变体 patch — 战果落定
 
 > 📅 完成时间: 2026-05-25 06:55 PST

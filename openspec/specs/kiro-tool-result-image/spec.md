@@ -1,7 +1,7 @@
 # kiro-tool-result-image Specification
 
 ## Purpose
-TBD - created by archiving change kiro-tool-result-image. Update Purpose after archive.
+让 Codex `view_image` 等工具结果里的图像在 CPA→kiro-rs 反代链路里不被拍平成文本：CPA 把 OpenAI Responses 的 `function_call_output.input_image` 转成 Anthropic `image` block 放进 `tool_result.content`，kiro-rs 再把该 image 上提成 Amazon Q 的 `KiroImage` 挂到 user 消息顶层 `images`，从而让多模态工具结果真正送达上游。归档自 change `kiro-tool-result-image`。（2026-06-23 compress §9.5 文档漂移修复：回填此前的 TBD 占位 Purpose。）
 ## Requirements
 ### Requirement: CPA 识别 function_call_output 里的图像
 
@@ -38,4 +38,3 @@ kiro-rs 处理 Anthropic `tool_result` 时，MUST 将其 content 里的 `image` 
 #### Scenario: GPT lane 不受影响
 - **WHEN** 请求模型为 gpt-5.x
 - **THEN** 不经过 claude 翻译路径，行为不变
-
