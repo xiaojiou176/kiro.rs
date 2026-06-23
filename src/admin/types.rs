@@ -418,6 +418,48 @@ pub struct SetLogGovernanceConfigRequest {
     pub usage_log_retention_days: Option<u32>,
 }
 
+// ============ 限速器运行时热改配置 ============
+
+/// overflow-on-busy 子配置（GET 响应的全量值）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverflowOnBusyConfigDto {
+    /// 是否开启整-Thread 健康度迁移
+    pub enabled: bool,
+    /// 触发门槛①：5 分钟上游 429 率阈值（0~1）
+    pub upstream429_rate_threshold: f64,
+    /// 触发门槛②：goodput 占健康上界比例阈值（0~1）
+    pub goodput_ratio_threshold: f64,
+    /// 迁移后防抖窗口（秒）
+    pub migrate_debounce_secs: u64,
+}
+
+/// 限速器运行时配置响应（GET /config/rate-limit + PUT 回显）。
+/// 暴露可热改的全部数值参数 + overflow 子配置。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitConfigResponse {
+    /// AIMD/goodput 加性增步长（rps）
+    pub additive_step_rps: f64,
+    /// 两次加速之间的最小间隔（秒）
+    pub increase_interval_secs: u64,
+    /// 触发一次加速所需累计成功数
+    pub successes_per_increase: u64,
+    /// 最高速率（rps）
+    pub max_rate_rps: f64,
+    /// goodput 429 硬上限（0~1）
+    pub goodput_hard_ceiling: f64,
+    /// goodput 失控保险丝：rate 绝对上限（rps）
+    pub goodput_sanity_max_rps: f64,
+    /// overflow-on-busy 子配置
+    pub overflow_on_busy: OverflowOnBusyConfigDto,
+    /// 信号量容量（只读，**不可热改**，仅供前端展示）。改它需重启。
+    pub hard_max_inflight: usize,
+    /// 本次返回是否已落盘 config.json（PUT 专用；GET 恒为 true）。
+    /// false = 仅内存生效，重启会丢。
+    pub persisted: bool,
+}
+
 // ============ 代理池 ============
 
 /// 代理池条目

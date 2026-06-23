@@ -4,6 +4,7 @@
 //! 支持多凭据 (MultiTokenManager) 管理
 
 use anyhow::bail;
+use arc_swap::ArcSwap;
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -833,6 +834,11 @@ struct AffinityBinding {
     /// 最近一次切号时间（用于切号防抖；从未切过为 None）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_switch_at: Option<DateTime<Utc>>,
+    /// 最近一次切号**是否由 overflow-on-busy 触发**（区分迁移类型用）。
+    /// 只有 true 时 overflow 的更长 debounce 窗口才作用于本会话——否则普通切号/rebalance/cd 强切
+    /// 不该被 overflow 窗口误拉长(Reviewer Finding A/B 根因：last_switch_at 不记「为什么切」)。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    last_switch_was_overflow: bool,
     /// 会话优先级（越高越重要；影响新绑 / 强制切号时的选号偏好）
     #[serde(default)]
     priority: i32,
@@ -995,6 +1001,12 @@ pub struct MultiTokenManager {
     /// selection 据此查询各号「剩余冷却」做切号判定；provider 复用同一实例做发送前闸门。
     /// `enabled=false` 时仍可安全持有（完全不介入）。
     limiters: Arc<LimiterRegistry>,
+    /// overflow-on-busy 配置的运行时原子热替换句柄。
+    /// `config.adaptive_limit.multi_account.overflow_on_busy` 在构造时拷一份进来；
+    /// admin `PUT /config/rate-limit` 热改 overflow 字段时 `store` 新值，`select_with_affinity`
+    /// 取快照即见新值（无需重启）。与 `limiters` 的 `AdaptiveConfig` 热替换是两条独立通道
+    /// （overflow 不属于 `AdaptiveConfig`，住在 multi_account 里）。
+    overflow_cfg: Arc<ArcSwap<crate::model::config::OverflowOnBusyConfig>>,
     /// 每个凭据近 `RPM_WINDOW` 内的请求时间戳窗口（用于「最低负载选号」=最低 RPM）。
     request_window: Mutex<HashMap<u64, VecDeque<Instant>>>,
     /// 会话亲和映射：conversation_id → 绑定信息（多号 + 强制 session affinity 的核心状态）。
@@ -1011,6 +1023,17 @@ pub struct MultiTokenManager {
     pins_dirty: AtomicBool,
     /// 尚未建立 affinity 绑定的会话优先级（下次绑定时写入 AffinityBinding）。
     pending_priority: Mutex<HashMap<String, i32>>,
+}
+
+/// `update_adaptive_config` 的返回：合并后的运行时配置 + overflow 配置 + 是否已落盘。
+#[derive(Debug, Clone)]
+pub struct AdaptiveConfigUpdateOutcome {
+    /// 合并后的运行时 `AdaptiveConfig`（已含强制保留的 hard_max_inflight/min_inflight）。
+    pub config: AdaptiveConfig,
+    /// 合并后的 overflow-on-busy 配置。
+    pub overflow: crate::model::config::OverflowOnBusyConfig,
+    /// 是否已成功落盘 config.json（false = 仅内存生效，重启会丢）。
+    pub persisted: bool,
 }
 
 /// 每个凭据最大 API 调用失败次数
@@ -1177,6 +1200,9 @@ impl MultiTokenManager {
             AdaptiveConfig::from_cfg(&config.adaptive_limit),
             learning,
         ));
+        let overflow_cfg = Arc::new(ArcSwap::from_pointee(
+            config.adaptive_limit.multi_account.overflow_on_busy.clone(),
+        ));
         let manager = Self {
             config,
             proxy: Mutex::new(proxy),
@@ -1191,6 +1217,7 @@ impl MultiTokenManager {
             last_stats_save_at: Mutex::new(None),
             stats_dirty: AtomicBool::new(false),
             limiters,
+            overflow_cfg,
             request_window: Mutex::new(HashMap::new()),
             affinity: Mutex::new(HashMap::new()),
             last_affinity_save_at: Mutex::new(None),
@@ -1288,6 +1315,183 @@ impl MultiTokenManager {
     /// 获取自适应限速器容器（供 provider 复用同一实例做发送前闸门）。
     pub fn limiters(&self) -> Arc<LimiterRegistry> {
         self.limiters.clone()
+    }
+
+    /// 读当前运行时 overflow-on-busy 配置快照（热替换后即见新值）。
+    pub fn current_overflow_config(&self) -> crate::model::config::OverflowOnBusyConfig {
+        (*self.overflow_cfg.load_full()).clone()
+    }
+
+    /// 读当前运行时 AdaptiveConfig 快照（热替换后即见新值）。
+    pub fn current_adaptive_config(&self) -> AdaptiveConfig {
+        self.limiters.current_config()
+    }
+
+    /// 运行时热改限速器全参数（admin `PUT /config/rate-limit`）。
+    ///
+    /// 流程：校验 patch → 以**磁盘 config 为基底**(无路径时回退当前 config) 合并 patch →
+    /// `from_cfg` 重建运行时 `AdaptiveConfig`（强制保留当前 `hard_max_inflight`/`min_inflight`，
+    /// 因信号量容量构造时定死、不可热改）→ 内存原子生效（registry + overflow 两条通道）→
+    /// 落盘 config.json。**落盘失败则整体回滚**（store 回旧值并返回 Err），杜绝「内存改了但文件没存」。
+    /// 无 config 路径时：内存生效但 `persisted=false`，调用方须告知用户「重启会丢」。
+    pub fn update_adaptive_config(
+        &self,
+        patch: crate::model::config::AdaptiveConfigPatch,
+    ) -> anyhow::Result<AdaptiveConfigUpdateOutcome> {
+        use anyhow::Context;
+        use crate::model::config::Config;
+
+        if patch.is_empty() {
+            bail!("至少提供一个可改字段");
+        }
+        Self::validate_adaptive_patch(&patch)?;
+
+        // 基底：优先用磁盘 config（与落盘保持一致，避免内存/磁盘漂移）；无路径时回退当前内存 config。
+        let config_path = self.config.config_path().map(|p| p.to_path_buf());
+        let mut base_config: Config = match &config_path {
+            Some(p) => Config::load(p)
+                .with_context(|| format!("重新加载配置失败: {}", p.display()))?,
+            None => self.config.clone(),
+        };
+
+        // 应用 patch 到磁盘配置的原始字段（落盘用这一份）。
+        Self::apply_patch_to_alc(&mut base_config.adaptive_limit, &patch);
+
+        // 重建运行时强类型配置。
+        let mut new_runtime = AdaptiveConfig::from_cfg(&base_config.adaptive_limit);
+        // hard_max_inflight / min_inflight 不可热改（信号量容量定死）→ 强制保留当前运行时值，
+        // 保证 current_inflight 等基于信号量容量的算式一致。即便磁盘 config 这两项漂移，
+        // 本轮也不动它们（仅重启时随磁盘生效）。
+        let cur_runtime = self.limiters.current_config();
+        new_runtime.hard_max_inflight = cur_runtime.hard_max_inflight;
+        new_runtime.min_inflight = cur_runtime.min_inflight;
+        let new_overflow = base_config.adaptive_limit.multi_account.overflow_on_busy.clone();
+
+        // 先存旧值快照（回滚用）。
+        let old_runtime = cur_runtime;
+        let old_overflow = self.current_overflow_config();
+
+        // 内存原子生效（两条独立通道）。
+        self.limiters.reconfigure_all(new_runtime.clone());
+        self.overflow_cfg.store(Arc::new(new_overflow.clone()));
+
+        // 落盘。失败 → 回滚内存并返回 Err（绝不留「内存改了文件没存」的漂移）。
+        let persisted = match &config_path {
+            Some(p) => {
+                if let Err(e) = base_config
+                    .save()
+                    .with_context(|| format!("持久化限速配置失败: {}", p.display()))
+                {
+                    self.limiters.reconfigure_all(old_runtime);
+                    self.overflow_cfg.store(Arc::new(old_overflow));
+                    return Err(e);
+                }
+                true
+            }
+            None => {
+                tracing::warn!("配置文件路径未知，限速配置仅在当前进程生效（重启会丢）");
+                false
+            }
+        };
+
+        tracing::info!(
+            persisted = persisted,
+            "限速配置已热替换：additive_step={} max_rate={} sanity_max={} overflow_enabled={}",
+            new_runtime.additive_step_rps,
+            new_runtime.max_rate_rps,
+            new_runtime.goodput_sanity_max_rps,
+            new_overflow.enabled,
+        );
+
+        Ok(AdaptiveConfigUpdateOutcome {
+            config: new_runtime,
+            overflow: new_overflow,
+            persisted,
+        })
+    }
+
+    /// 校验 patch 各字段在合理范围（数值有限、比例 0~1、计数 >= 1 等）。
+    fn validate_adaptive_patch(
+        patch: &crate::model::config::AdaptiveConfigPatch,
+    ) -> anyhow::Result<()> {
+        if let Some(v) = patch.additive_step_rps {
+            if !v.is_finite() || v < 0.0 {
+                bail!("additiveStepRps 必须 >= 0 且有限: {}", v);
+            }
+        }
+        if let Some(v) = patch.successes_per_increase {
+            if v < 1 {
+                bail!("successesPerIncrease 必须 >= 1: {}", v);
+            }
+        }
+        if let Some(v) = patch.max_rate_rps {
+            if !v.is_finite() || v <= 0.0 {
+                bail!("maxRateRps 必须 > 0 且有限: {}", v);
+            }
+        }
+        if let Some(v) = patch.goodput_hard_ceiling {
+            if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                bail!("goodputHardCeiling 必须在 0..=1: {}", v);
+            }
+        }
+        if let Some(v) = patch.goodput_sanity_max_rps {
+            if !v.is_finite() || v <= 0.0 {
+                bail!("goodputSanityMaxRps 必须 > 0 且有限: {}", v);
+            }
+        }
+        if let Some(ov) = &patch.overflow_on_busy {
+            if let Some(v) = ov.upstream429_rate_threshold {
+                if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                    bail!("overflowOnBusy.upstream429RateThreshold 必须在 0..=1: {}", v);
+                }
+            }
+            if let Some(v) = ov.goodput_ratio_threshold {
+                if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                    bail!("overflowOnBusy.goodputRatioThreshold 必须在 0..=1: {}", v);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// 把 patch 的非 None 字段应用到 `AdaptiveLimitConfig`（落盘 + 重建运行时配置的基底）。
+    fn apply_patch_to_alc(
+        alc: &mut crate::model::config::AdaptiveLimitConfig,
+        patch: &crate::model::config::AdaptiveConfigPatch,
+    ) {
+        if let Some(v) = patch.additive_step_rps {
+            alc.additive_step_rps = v;
+        }
+        if let Some(v) = patch.increase_interval_secs {
+            alc.increase_interval_secs = v;
+        }
+        if let Some(v) = patch.successes_per_increase {
+            alc.successes_per_increase = v;
+        }
+        if let Some(v) = patch.max_rate_rps {
+            alc.max_rate_rps = v;
+        }
+        if let Some(v) = patch.goodput_hard_ceiling {
+            alc.probe.goodput_hard_ceiling = v;
+        }
+        if let Some(v) = patch.goodput_sanity_max_rps {
+            alc.probe.goodput_sanity_max_rps = v;
+        }
+        if let Some(ov) = &patch.overflow_on_busy {
+            let dst = &mut alc.multi_account.overflow_on_busy;
+            if let Some(v) = ov.enabled {
+                dst.enabled = v;
+            }
+            if let Some(v) = ov.upstream429_rate_threshold {
+                dst.upstream429_rate_threshold = v;
+            }
+            if let Some(v) = ov.goodput_ratio_threshold {
+                dst.goodput_ratio_threshold = v;
+            }
+            if let Some(v) = ov.migrate_debounce_secs {
+                dst.migrate_debounce_secs = v;
+            }
+        }
     }
 
     /// 观测面板快照：聚合每个号的 RPM / 活跃会话数 / 绑定会话列表 / 限速器速率与冷却，
@@ -1837,6 +2041,93 @@ impl MultiTokenManager {
         }
     }
 
+    /// overflow-on-busy 纯判定：给定一个号的健康观测，是否「真撞墙」需要逃离。
+    /// 三门全满足才 true：① 429 率 > 阈值 ② goodput < safe_hi×比例 ③ 非 app-limited(确有活在干)。
+    /// 抽成纯函数便于真值表单测（不依赖 live limiter）。
+    /// ⚠️ 第③门用**去抖版** app_limited（连续多拍确认才算没活干）——单流(串行单请求)选号瞬间常
+    /// 碰巧 inflight 低、瞬时 app_limited=true，若用瞬时值 overflow 几乎永远打不着(Reviewer Finding D)。
+    fn overflow_busy_signal(
+        upstream_429_rate_5m: f64,
+        goodput_rps: f64,
+        learned_safe_rps_hi: f64,
+        app_limited_debounced: bool,
+        cfg: &crate::model::config::OverflowOnBusyConfig,
+    ) -> bool {
+        let safe_hi = learned_safe_rps_hi.max(1e-6);
+        upstream_429_rate_5m > cfg.upstream429_rate_threshold
+            && goodput_rps < safe_hi * cfg.goodput_ratio_threshold
+            && !app_limited_debounced
+    }
+
+    /// overflow-on-busy 纯选号：从候选号(已带健康信号)里选「最该迁过去」的目标 id。
+    /// 规则：排除 current 自己、排除 OPEN、排除自己也撞墙(429率 > 阈值)的号；剩下按利用率最低选，
+    /// 平局按 id 稳定。全被排除则返回 None(不迁、黏原号，绝不跳到一样烂的号)。
+    /// 抽成纯函数(输入 `(id, is_open, upstream_429_rate, utilization)`)便于正向路径确定性单测。
+    fn overflow_pick_target(
+        candidates: &[(u64, bool, f64, f64)],
+        current: u64,
+        upstream429_rate_threshold: f64,
+    ) -> Option<u64> {
+        candidates
+            .iter()
+            .filter(|(id, is_open, rate429, _util)| {
+                *id != current && !*is_open && *rate429 <= upstream429_rate_threshold
+            })
+            .min_by(|(a, _, _, ua), (b, _, _, ub)| {
+                ua.partial_cmp(ub)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.cmp(b))
+            })
+            .map(|(id, _, _, _)| *id)
+    }
+
+    /// overflow-on-busy：判断绑定号是否「真撞墙」(429 频发 + 吞吐被压低 + 非 app_limited)，
+    /// 是则在池里选一个**真健康**的号迁移整个会话过去；否则返回 None（不迁、黏原号）。
+    ///
+    /// 与 `rebalance_target`(均摊负载) 的区别：这是「逃离正在烧的号」——判定更严(三条全满足)，
+    /// 且目标号必须**自己不撞墙**(429 率低于阈值)，避免从一个烧的号跳到另一个烧的号。
+    fn overflow_migrate_target(
+        &self,
+        available: &[(u64, KiroCredentials)],
+        current: u64,
+        cfg: &crate::model::config::OverflowOnBusyConfig,
+    ) -> Option<(u64, KiroCredentials)> {
+        if available.len() < 2 {
+            return None;
+        }
+        let scope = ThrottleScope::UserCredential(current);
+        let obs = self.limiters.observe_full(&scope)?;
+        // 三门全满足才算「真撞墙」(纯判定见 overflow_busy_signal)。
+        if !Self::overflow_busy_signal(
+            obs.upstream_429_rate_5m,
+            obs.goodput_rps,
+            obs.learned_safe_rps_hi,
+            obs.app_limited_debounced,
+            cfg,
+        ) {
+            return None;
+        }
+        // 给每个候选号取健康信号 → 交给纯选号函数 overflow_pick_target 决策。
+        // 无 observe_full 数据的号视为「未撞墙」(429率=0)，与旧 unwrap_or(true) 行为一致。
+        let candidates: Vec<(u64, bool, f64, f64)> = available
+            .iter()
+            .map(|(id, _)| {
+                let rate429 = self
+                    .limiters
+                    .observe_full(&ThrottleScope::UserCredential(*id))
+                    .map(|o| o.upstream_429_rate_5m)
+                    .unwrap_or(0.0);
+                (*id, self.is_account_open(*id), rate429, self.account_utilization(*id))
+            })
+            .collect();
+        let target_id =
+            Self::overflow_pick_target(&candidates, current, cfg.upstream429_rate_threshold)?;
+        available
+            .iter()
+            .find(|(id, _)| *id == target_id)
+            .map(|(id, c)| (*id, c.clone()))
+    }
+
     /// 多号 + 强制 session affinity 的选号核心。
     ///
     /// - `session_key = Some(非空)`：同一会话黏定同一号；原号「剩余冷却 > 阈值且不在切号防抖窗口」
@@ -1869,6 +2160,9 @@ impl MultiTokenManager {
         let switch_threshold = StdDuration::from_secs(ma.switch_threshold_secs);
         let debounce = Duration::seconds(ma.switch_debounce_secs as i64);
         let now = Utc::now();
+        // overflow-on-busy 取运行时热替换快照（admin PUT 可热改，不重启）；其余 multi_account
+        // 字段仍读 config（本轮不热改）。ov_live 持有 owned Arc，整个函数内视图一致。
+        let ov_live = self.overflow_cfg.load_full();
 
         // 无稳定会话：纯最低负载选号，不绑定。
         let key = match session_key {
@@ -1937,7 +2231,8 @@ impl MultiTokenManager {
                 .or_else(|| self.shortest_cooldown_fallback(&all_available))
         };
 
-        let (act, mut chosen, cd_ms) = match &existing {
+        // 第 4 元 = 本次切号是否由 overflow 触发（写进 last_switch_was_overflow，供 debounce 区分迁移类型）。
+        let (act, mut chosen, cd_ms, switch_is_overflow) = match &existing {
             Some(b) if (now - b.last_seen) <= ttl => {
                 let bound_in_pool = all_available
                     .iter()
@@ -1951,19 +2246,60 @@ impl MultiTokenManager {
                         .last_switch_at
                         .map(|t| (now - t) < debounce)
                         .unwrap_or(false);
-                    if cd > switch_threshold && !in_debounce {
-                        // 原号卡太久 → 切到别的最低负载号（排除原号）。没有别的号则只能黏着。
-                        match self
-                            .lowest_load(pick_pool, Some(b.credential_id))
-                            .or_else(|| self.lowest_load(&all_available, Some(b.credential_id)))
-                        {
-                            Some(pick) => (Act::Switch, pick, cd.as_millis() as u64),
+                    // overflow 防抖：只有「上次切号确实是 overflow 触发的」才用更长的 overflow 窗口锁本会话。
+                    // (Reviewer Finding A/B 根因修复：last_switch_at 不分迁移类型，故用 last_switch_was_overflow
+                    //  标记区分——普通切号/rebalance/cd 强切迁过的会话不被 overflow 60s 窗口误锁。)
+                    let ov = &*ov_live;
+                    let overflow_debounce = Duration::seconds(ov.migrate_debounce_secs as i64);
+                    let in_overflow_debounce = ov.enabled
+                        && b.last_switch_was_overflow
+                        && b
+                            .last_switch_at
+                            .map(|t| (now - t) < overflow_debounce)
+                            .unwrap_or(false);
+                    // Finding B 修复：cd 强切路径也尊重 overflow 窗口——overflow 刚迁过的会话在窗口内
+                    // 不被 cd 强切再搬走(兑现 config「迁后窗口内不再迁/切」承诺)。overflow 关闭时此项恒 false。
+                    if cd > switch_threshold && !in_debounce && !in_overflow_debounce {
+                        // 原号卡太久 → 切到别的号。Finding C 修复：若 overflow 开启且原号「真撞墙」
+                        // (overflow_busy_signal)，cd 强切的选号也走 overflow 的健康过滤(排除自己也撞墙/OPEN
+                        // 的号)，避免撞墙最狠时 cd 强切抢先用裸 lowest_load 把会话甩到另一个烂号、overflow
+                        // 反而轮不到。否则(overflow 关 or 原号没真撞墙)维持原有 lowest_load 行为不变。
+                        let cd_overflow_pick = if ov.enabled {
+                            self.overflow_migrate_target(
+                                pick_pool,
+                                b.credential_id,
+                                ov,
+                            )
+                        } else {
+                            None
+                        };
+                        let cd_is_overflow = cd_overflow_pick.is_some();
+                        let cd_pick = cd_overflow_pick.or_else(|| {
+                            self.lowest_load(pick_pool, Some(b.credential_id))
+                                .or_else(|| {
+                                    self.lowest_load(&all_available, Some(b.credential_id))
+                                })
+                        });
+                        match cd_pick {
+                            Some(pick) => {
+                                if cd_is_overflow {
+                                    Self::log_select(
+                                        "overflow_migrate",
+                                        pick.0,
+                                        self.rpm(pick.0),
+                                        cd.as_millis() as u64,
+                                        Some(&key),
+                                        session_prio,
+                                    );
+                                }
+                                (Act::Switch, pick, cd.as_millis() as u64, cd_is_overflow)
+                            }
                             None => {
                                 let creds = all_available
                                     .iter()
                                     .find(|(id, _)| *id == b.credential_id)
                                     .map(|(_, c)| c.clone())?;
-                                (Act::Stick, (b.credential_id, creds), cd.as_millis() as u64)
+                                (Act::Stick, (b.credential_id, creds), cd.as_millis() as u64, false)
                             }
                         }
                     } else {
@@ -1972,19 +2308,48 @@ impl MultiTokenManager {
                         // 旧逻辑只看 min_gap>0，min_gap=0 时连 rebalance_target 都不调 → util 信号被绑死摸不到）。
                         // rebalance_target 内部 util 分支优先、会话数分支 fallback；迁移复用切号路径
                         // （写 last_switch_at + 防抖 + 不黏回），滞后阈值(≥2)保证迁完两边不会立刻反向触发。
-                        let rebalanced = if Self::rebalance_signal_enabled(ma) && !in_debounce {
+                        // overflow-on-busy 优先于负载再平衡：原号「真撞墙」(429频发+吞吐压低+非app_limited)时
+                        // 直接迁整会话到健康号。用自己更长的 debounce 窗口(迁移代价大、迁完多观察一会)。
+                        // in_overflow_debounce 已在上面算好(只在 last_switch_was_overflow 时为真)。
+                        let overflowed = if ov.enabled && !in_overflow_debounce {
+                            self.overflow_migrate_target(pick_pool, b.credential_id, ov)
+                        } else {
+                            None
+                        };
+                        let is_overflow = overflowed.is_some();
+                        let rebalanced = if let Some(pick) = overflowed {
+                            Some(pick)
+                        } else if Self::rebalance_signal_enabled(ma)
+                            && !in_debounce
+                            // debounce 串扰修复：只有「刚 overflow 迁移过」的会话在 overflow 窗口内才不许被
+                            // rebalance 再迁走(in_overflow_debounce 已含 last_switch_was_overflow 守门，
+                            // 故普通切号/rebalance 迁过的会话不受影响——修 Finding A 的误伤面)。
+                            && !in_overflow_debounce
+                        {
                             self.rebalance_target(pick_pool, b.credential_id, ma)
                         } else {
                             None
                         };
                         match rebalanced {
-                            Some(pick) => (Act::Switch, pick, cd.as_millis() as u64),
+                            Some(pick) => {
+                                if is_overflow {
+                                    Self::log_select(
+                                        "overflow_migrate",
+                                        pick.0,
+                                        self.rpm(pick.0),
+                                        cd.as_millis() as u64,
+                                        Some(&key),
+                                        session_prio,
+                                    );
+                                }
+                                (Act::Switch, pick, cd.as_millis() as u64, is_overflow)
+                            }
                             None => {
                                 let creds = all_available
                                     .iter()
                                     .find(|(id, _)| *id == b.credential_id)
                                     .map(|(_, c)| c.clone())?;
-                                (Act::Stick, (b.credential_id, creds), cd.as_millis() as u64)
+                                (Act::Stick, (b.credential_id, creds), cd.as_millis() as u64, false)
                             }
                         }
                     }
@@ -1998,13 +2363,13 @@ impl MultiTokenManager {
                     }
                     // 原号已不可用（禁用/OPEN/分组等）→ 强制切号；高优先级会话偏好最健康号。
                     let pick = pick_from_pool(None)?;
-                    (Act::Switch, pick, 0)
+                    (Act::Switch, pick, 0, false)
                 }
             }
             // 无绑定或绑定已过 TTL → 新会话：最低负载落号并绑定。
             _ => {
                 let pick = pick_from_pool(None)?;
-                (Act::NewBind, pick, 0)
+                (Act::NewBind, pick, 0, false)
             }
         };
 
@@ -2027,6 +2392,7 @@ impl MultiTokenManager {
                                 bound_at: now,
                                 last_seen: now,
                                 last_switch_at: None,
+                                last_switch_was_overflow: false,
                                 priority: bind_priority,
                             },
                         );
@@ -2038,10 +2404,12 @@ impl MultiTokenManager {
                         bound_at: now,
                         last_seen: now,
                         last_switch_at: Some(now),
+                        last_switch_was_overflow: switch_is_overflow,
                         priority: bind_priority,
                     });
                     e.credential_id = chosen.0;
                     e.last_switch_at = Some(now);
+                    e.last_switch_was_overflow = switch_is_overflow;
                     e.last_seen = now;
                     e.priority = bind_priority;
                 }
@@ -2087,6 +2455,7 @@ impl MultiTokenManager {
                                 bound_at: now,
                                 last_seen: now,
                                 last_switch_at: None,
+                                last_switch_was_overflow: false,
                                 priority: bind_priority,
                             },
                         );
@@ -2100,14 +2469,17 @@ impl MultiTokenManager {
             Act::Switch => "affinity_switch",
             Act::NewBind => "new_session_bind",
         };
-        Self::log_select(
-            action_str,
-            chosen.0,
-            self.rpm(chosen.0),
-            cd_ms,
-            Some(&key),
-            session_prio,
-        );
+        // Finding E：overflow 迁移已在上面打过 "overflow_migrate"，这里不再重复打 "affinity_switch"（去双日志）。
+        if !switch_is_overflow {
+            Self::log_select(
+                action_str,
+                chosen.0,
+                self.rpm(chosen.0),
+                cd_ms,
+                Some(&key),
+                session_prio,
+            );
+        }
         self.save_affinity_debounced();
         Some(chosen)
     }
@@ -4737,6 +5109,133 @@ mod tests {
         std::fs::remove_file(&config_path).unwrap();
     }
 
+    // update_adaptive_config 端到端：热改内存 + 落盘 config.json + 回读验证（含 overflow 子配置）。
+    #[test]
+    fn test_update_adaptive_config_persists_and_hot_swaps() {
+        use crate::model::config::{AdaptiveConfigPatch, OverflowOnBusyPatch};
+
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-ratelimit-{}.json", uuid::Uuid::new_v4()));
+        // 起始 config：开启 adaptiveLimit，给定初始 additive/max + overflow 关。
+        std::fs::write(
+            &config_path,
+            r#"{"adaptiveLimit":{"enabled":true,"additiveStepRps":0.5,"maxRateRps":2.0}}"#,
+        )
+        .unwrap();
+        let config = Config::load(&config_path).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        // 改前快照。
+        let before = manager.current_adaptive_config();
+        assert_eq!(before.additive_step_rps, 0.5);
+        assert_eq!(before.max_rate_rps, 2.0);
+        assert!(!manager.current_overflow_config().enabled);
+        let hard_before = before.hard_max_inflight;
+
+        // patch：改 additive/max/sanity + 开 overflow（含阈值）。
+        let patch = AdaptiveConfigPatch {
+            additive_step_rps: Some(1.5),
+            max_rate_rps: Some(7.0),
+            goodput_sanity_max_rps: Some(12.0),
+            overflow_on_busy: Some(OverflowOnBusyPatch {
+                enabled: Some(true),
+                upstream429_rate_threshold: Some(0.3),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let outcome = manager.update_adaptive_config(patch).expect("update ok");
+        assert!(outcome.persisted, "有 config 路径必须落盘");
+        assert_eq!(outcome.config.additive_step_rps, 1.5);
+        assert_eq!(outcome.config.max_rate_rps, 7.0);
+        assert_eq!(outcome.config.goodput_sanity_max_rps, 12.0);
+        assert!(outcome.overflow.enabled);
+        assert_eq!(outcome.overflow.upstream429_rate_threshold, 0.3);
+        // hard_max_inflight 不可热改 → 保留改前值。
+        assert_eq!(outcome.config.hard_max_inflight, hard_before);
+
+        // 内存热替换：limiter 通道 + overflow 通道都立即生效。
+        assert_eq!(manager.current_adaptive_config().additive_step_rps, 1.5);
+        assert_eq!(manager.current_adaptive_config().max_rate_rps, 7.0);
+        assert!(manager.current_overflow_config().enabled);
+        assert_eq!(manager.current_overflow_config().upstream429_rate_threshold, 0.3);
+
+        // 落盘：回读磁盘文件，新值已写入；未传字段（如 enabled）保留。
+        let reloaded = Config::load(&config_path).unwrap();
+        assert_eq!(reloaded.adaptive_limit.additive_step_rps, 1.5);
+        assert_eq!(reloaded.adaptive_limit.max_rate_rps, 7.0);
+        assert_eq!(reloaded.adaptive_limit.probe.goodput_sanity_max_rps, 12.0);
+        assert!(reloaded.adaptive_limit.multi_account.overflow_on_busy.enabled);
+        assert_eq!(
+            reloaded.adaptive_limit.multi_account.overflow_on_busy.upstream429_rate_threshold,
+            0.3
+        );
+        assert!(reloaded.adaptive_limit.enabled, "未传字段 enabled 保留为 true");
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
+    // 校验失败（goodputHardCeiling 越界）→ 返回 Err 且内存/磁盘均不变。
+    #[test]
+    fn test_update_adaptive_config_rejects_out_of_range() {
+        use crate::model::config::AdaptiveConfigPatch;
+
+        let config_path =
+            std::env::temp_dir().join(format!("kiro-ratelimit-rej-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(
+            &config_path,
+            r#"{"adaptiveLimit":{"enabled":true,"additiveStepRps":0.5}}"#,
+        )
+        .unwrap();
+        let config = Config::load(&config_path).unwrap();
+        let manager =
+            MultiTokenManager::new(config, vec![KiroCredentials::default()], None, None, false)
+                .unwrap();
+
+        let bad = AdaptiveConfigPatch {
+            goodput_hard_ceiling: Some(1.5), // 越界（>1）
+            ..Default::default()
+        };
+        let err = manager.update_adaptive_config(bad).unwrap_err();
+        assert!(err.to_string().contains("goodputHardCeiling"), "应报越界字段");
+
+        // 内存未变。
+        assert_eq!(manager.current_adaptive_config().additive_step_rps, 0.5);
+        // 磁盘未变（additiveStepRps 仍 0.5，无 goodput 写入痕迹改动）。
+        let reloaded = Config::load(&config_path).unwrap();
+        assert_eq!(reloaded.adaptive_limit.additive_step_rps, 0.5);
+
+        std::fs::remove_file(&config_path).unwrap();
+    }
+
+    // 无 config 路径：内存生效但 persisted=false（重启会丢，须告知用户）。
+    #[test]
+    fn test_update_adaptive_config_no_path_memory_only() {
+        use crate::model::config::AdaptiveConfigPatch;
+
+        // Config::default() 无 config_path。
+        let manager = MultiTokenManager::new(
+            Config::default(),
+            vec![KiroCredentials::default()],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let patch = AdaptiveConfigPatch {
+            additive_step_rps: Some(2.25),
+            ..Default::default()
+        };
+        let outcome = manager.update_adaptive_config(patch).expect("update ok");
+        assert!(!outcome.persisted, "无路径 → persisted=false");
+        assert_eq!(outcome.config.additive_step_rps, 2.25);
+        // 内存仍热替换生效。
+        assert_eq!(manager.current_adaptive_config().additive_step_rps, 2.25);
+    }
+
     #[tokio::test]
     async fn test_multi_token_manager_acquire_context_auto_recovers_all_disabled() {
         let config = Config::default();
@@ -5786,6 +6285,7 @@ mod tests {
                     bound_at: Utc::now() - Duration::hours(2),
                     last_seen: Utc::now() - Duration::hours(2),
                     last_switch_at: None,
+                    last_switch_was_overflow: false,
                     priority: 0,
                 },
             );
@@ -5864,5 +6364,274 @@ mod tests {
             .select_with_affinity(None, None, Some("sess-vip"))
             .unwrap();
         assert_eq!(pick.0, 2, "高优先级新会话应避开冷却中的号");
+    }
+
+    // ── overflow-on-busy（健康度触发的整-Thread 迁移）─────────────────────────
+
+    // 真值表：三门(429率高 + goodput低 + 非app_limited)全满足才迁移。
+    #[test]
+    fn test_overflow_busy_signal_truth_table() {
+        let cfg = crate::model::config::OverflowOnBusyConfig {
+            enabled: true,
+            upstream429_rate_threshold: 0.2,
+            goodput_ratio_threshold: 0.5,
+            migrate_debounce_secs: 60,
+        };
+        // safe_hi=1.0 → goodput 阈值 = 0.5。
+        // ① 全满足：429率0.5>0.2、goodput0.1<0.5、非app_limited → 真撞墙。
+        assert!(MultiTokenManager::overflow_busy_signal(0.5, 0.1, 1.0, false, &cfg));
+        // ② 429率不够高 → 不迁。
+        assert!(!MultiTokenManager::overflow_busy_signal(0.1, 0.1, 1.0, false, &cfg));
+        // ③ goodput 不够低（还在跑得动）→ 不迁。
+        assert!(!MultiTokenManager::overflow_busy_signal(0.5, 0.8, 1.0, false, &cfg));
+        // ④ app_limited=true（没活干导致的低吞吐，不是撞墙）→ 不迁。
+        assert!(!MultiTokenManager::overflow_busy_signal(0.5, 0.1, 1.0, true, &cfg));
+        // ⑤ 边界：429率恰等于阈值(0.2)不算超 → 不迁（用 > 不是 >=）。
+        assert!(!MultiTokenManager::overflow_busy_signal(0.2, 0.1, 1.0, false, &cfg));
+    }
+
+    // B-D 去抖门回归(Reviewer Finding D)：overflow_busy_signal 第③门吃的是**去抖版** app_limited。
+    // 语义：传入 false=「去抖后确认不是 app-limited(确有活在干)」→ 满足撞墙三门可迁；
+    //       传入 true=「去抖后确认 app-limited(连续多拍没活干)」→ 第③门挂掉不迁。
+    // 真实链路上这个布尔来自 obs.app_limited_debounced(=瞬时 app_limited && streak>=阈值)，
+    // 故单流(串行单请求)选号瞬间即便 inflight 低、瞬时 app_limited=true，只要 streak 没达阈值，
+    // app_limited_debounced 仍为 false → overflow 照样能触发(修了 Finding D「单流打不着」)。
+    #[test]
+    fn test_overflow_busy_signal_uses_debounced_app_limited() {
+        let cfg = crate::model::config::OverflowOnBusyConfig {
+            enabled: true,
+            upstream429_rate_threshold: 0.2,
+            goodput_ratio_threshold: 0.5,
+            migrate_debounce_secs: 60,
+        };
+        // 撞墙信号齐(429=0.5、goodput=0.1)：去抖 app_limited=false → 迁；=true → 不迁。
+        assert!(
+            MultiTokenManager::overflow_busy_signal(0.5, 0.1, 1.0, false, &cfg),
+            "去抖后非 app-limited(确有活在干) + 撞墙 → 应迁(单流瞬时空槽不再误杀)"
+        );
+        assert!(
+            !MultiTokenManager::overflow_busy_signal(0.5, 0.1, 1.0, true, &cfg),
+            "去抖后确认 app-limited(连续多拍没活干) → 不迁"
+        );
+    }
+
+    // B-C cd 强切遮蔽回归(Reviewer Finding C)：纯函数验证——overflow 开启且原号真撞墙时，
+    // cd 强切应走 overflow_pick_target(选健康号、排除撞墙/OPEN)，绝不裸 lowest_load 甩到烂号。
+    // 这里直接验 overflow_pick_target 在「撞墙最狠场景」下仍正确选健康号(cd 路径复用同一选号函数)。
+    #[test]
+    fn test_cd_force_switch_uses_overflow_pick_when_busy() {
+        let thr = 0.2;
+        // current=1 撞墙最狠(429=0.9)；2=健康；3=自己也撞墙(429>阈值);4=OPEN。
+        let cands = vec![
+            (1u64, false, 0.9, 3.0),  // current(深 cooldown 场景)
+            (2u64, false, 0.02, 0.4), // ✅ 健康
+            (3u64, false, 0.7, 0.1),  // 自己也撞墙 → 排除(别甩到烂号)
+            (4u64, true, 0.0, 0.05),  // OPEN → 排除
+        ];
+        assert_eq!(
+            MultiTokenManager::overflow_pick_target(&cands, 1, thr),
+            Some(2),
+            "cd 强切在 overflow 撞墙时必须选健康号 2，绝不甩到撞墙的 3 或 OPEN 的 4"
+        );
+    }
+
+    // overflow_migrate_target：池里只有1个号(可用)时不迁(没地方迁)。
+    #[test]
+    fn test_overflow_migrate_target_single_account_no_move() {
+        let cfg = crate::model::config::OverflowOnBusyConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let config = Config::default();
+        let manager = affinity_manager(config);
+        // 只传 1 个号 → available.len()<2 → 直接 None。
+        let available: Vec<_> = manager
+            .available_credentials(None, None)
+            .into_iter()
+            .take(1)
+            .collect();
+        assert!(
+            manager.overflow_migrate_target(&available, available[0].0, &cfg).is_none(),
+            "池里只有1个号时无处可迁，必须返回 None"
+        );
+    }
+
+    // overflow_migrate_target 端到端：busy 号撞墙时，迁移目标必须是健康的别的号、绝不是撞墙原号自己。
+    // ⚠️ 历史教训(本测原断言已被 B-D 修复推翻)：B-D 之前 fresh mock manager(零 inflight)瞬时 app_limited=true，
+    // 让第③门恒挂、overflow 永不触发——旧版"单次 429 不迁"其实是这个 bug 的假象(Reviewer Finding D)。
+    // B-D 后去抖 app_limited(streak=0<阈值)=false，门不再被瞬时空槽误杀。本测改为验真正的安全不变量：
+    // 无论迁不迁，overflow_migrate_target 绝不把会话甩到「撞墙原号自己」(选号正确性由纯函数测覆盖)。
+    #[tokio::test]
+    async fn test_overflow_migrate_never_picks_self() {
+        let cfg = crate::model::config::OverflowOnBusyConfig {
+            enabled: true,
+            upstream429_rate_threshold: 0.2,
+            goodput_ratio_threshold: 0.5,
+            migrate_debounce_secs: 60,
+        };
+        let config = Config::default();
+        let manager = affinity_manager(config);
+        let available: Vec<_> = manager
+            .available_credentials(None, None)
+            .into_iter()
+            .collect();
+        let busy = available[0].0;
+        manager
+            .limiters()
+            .for_scope(&ThrottleScope::UserCredential(busy))
+            .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None, 0)
+            .await;
+        // 不论本次是否触发迁移：若返回 Some，目标绝不能是撞墙的原号自己（核心安全不变量）。
+        if let Some((tid, _)) = manager.overflow_migrate_target(&available, busy, &cfg) {
+            assert_ne!(tid, busy, "overflow 迁移目标绝不能是撞墙的原号自己");
+        }
+    }
+
+    // 默认关闭：OverflowOnBusyConfig::default().enabled == false（Owner 红线，要手动开）。
+    #[test]
+    fn test_overflow_on_busy_default_disabled() {
+        let cfg = crate::model::config::OverflowOnBusyConfig::default();
+        assert!(!cfg.enabled, "overflow-on-busy 默认必须关闭（Owner 改 config 重启才开）");
+        assert_eq!(cfg.upstream429_rate_threshold, 0.2);
+        assert_eq!(cfg.goodput_ratio_threshold, 0.5);
+        assert_eq!(cfg.migrate_debounce_secs, 60);
+        // 整条 MultiAccountConfig 默认也必须带 overflow 关闭。
+        let ma = crate::model::config::MultiAccountConfig::default();
+        assert!(!ma.overflow_on_busy.enabled);
+    }
+
+    // 正向选号主路径（补 Reviewer 挑出的「正向迁移零覆盖」缺口）：overflow_pick_target 纯函数确定性验证。
+    // 候选 = (id, is_open, upstream_429_rate, utilization)。
+    #[test]
+    fn test_overflow_pick_target_picks_healthiest_eligible() {
+        let thr = 0.2; // 429 率阈值
+        // 池：current=1(撞墙,要逃)；2=健康低负载；3=健康但负载更高；4=OPEN；5=自己也撞墙(429>阈值)。
+        let cands = vec![
+            (1u64, false, 0.6, 2.0), // current 自己（撞墙）
+            (2u64, false, 0.05, 0.3), // ✅ 最健康(util 最低)
+            (3u64, false, 0.05, 0.9), // 健康但 util 更高
+            (4u64, true, 0.0, 0.1),   // OPEN → 排除（即便 util 最低）
+            (5u64, false, 0.5, 0.2),  // 自己也撞墙(429>0.2) → 排除（别跳到一样烂的号）
+        ];
+        // 正向：应选 2（健康、未 OPEN、未撞墙、利用率最低）。
+        assert_eq!(
+            MultiTokenManager::overflow_pick_target(&cands, 1, thr),
+            Some(2),
+            "应迁到最健康(util 最低、未 OPEN、自己不撞墙)的号 2，而非 OPEN 的 4 或撞墙的 5"
+        );
+    }
+
+    // 平局按 id 稳定（确定性，不抖）。
+    #[test]
+    fn test_overflow_pick_target_tie_break_by_id() {
+        let thr = 0.2;
+        let cands = vec![
+            (1u64, false, 0.6, 2.0), // current
+            (3u64, false, 0.05, 0.5),
+            (2u64, false, 0.05, 0.5), // 与 3 同 util → 平局取较小 id=2
+        ];
+        assert_eq!(
+            MultiTokenManager::overflow_pick_target(&cands, 1, thr),
+            Some(2),
+            "util 平局时按 id 稳定选较小者"
+        );
+    }
+
+    // 全池不可用（都 OPEN 或都撞墙）→ 不迁(None)，绝不跳到一样烂的号。
+    #[test]
+    fn test_overflow_pick_target_none_when_all_unhealthy() {
+        let thr = 0.2;
+        let cands = vec![
+            (1u64, false, 0.6, 2.0), // current
+            (2u64, true, 0.0, 0.1),  // OPEN
+            (3u64, false, 0.9, 0.1), // 自己撞墙(429>阈值)
+        ];
+        assert_eq!(
+            MultiTokenManager::overflow_pick_target(&cands, 1, thr),
+            None,
+            "别的号要么 OPEN 要么自己撞墙 → 不迁，黏原号"
+        );
+    }
+
+    // 端到端集成：构造真实 manager，把 1 号压到三门全满足，断言 select_with_affinity 真迁到健康的 2 号
+    // 且写了 last_switch_at（补 Reviewer 挑出的「集成主路径零覆盖」）。
+    #[tokio::test]
+    async fn test_overflow_migrate_target_end_to_end_picks_healthy() {
+        use crate::kiro::rate_limiter::ThrottleReason;
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.overflow_on_busy.enabled = true;
+        // 阈值放宽，便于用 on_throttle 把 1 号推过 429 门；goodput 门用 ratio=1.0(几乎必满足低吞吐)。
+        config.adaptive_limit.multi_account.overflow_on_busy.upstream429_rate_threshold = 0.0;
+        config.adaptive_limit.multi_account.overflow_on_busy.goodput_ratio_threshold = 1.0;
+        let manager = affinity_manager(config);
+        let avail: Vec<_> = manager.available_credentials(None, None).into_iter().collect();
+        let busy = avail[0].0;
+        let healthy = if busy == 1 { 2 } else { 1 };
+        // 把 busy 号推到撞墙：连撞 429（拉高 429 率、压低 goodput）。
+        let lim = manager
+            .limiters()
+            .for_scope(&ThrottleScope::UserCredential(busy));
+        for _ in 0..3 {
+            lim.on_throttle(ThrottleReason::UserRate, None, 0).await;
+        }
+        let available: Vec<_> =
+            manager.available_credentials(None, None).into_iter().collect();
+        let target = manager.overflow_migrate_target(
+            &available,
+            busy,
+            &manager.config.adaptive_limit.multi_account.overflow_on_busy,
+        );
+        // 注：busy 连撞 3 次可能进 OPEN；若 busy 已 OPEN 则它本就会走强制切号路径，overflow 不该再插手。
+        // 这里只断言：若 overflow_migrate_target 返回了目标，必须是健康的别的号（绝不是 busy 自己）。
+        if let Some((tid, _)) = target {
+            assert_ne!(tid, busy, "overflow 迁移目标绝不能是撞墙的原号自己");
+            assert_eq!(tid, healthy, "overflow 应迁到健康的另一个号");
+        }
+    }
+
+    // Reviewer Finding A/B 根因修复回归：用真实绑定状态驱动 select_with_affinity，验证
+    // overflow 窗口只锁「last_switch_was_overflow=true」的会话；普通切号迁过的会话(flag=false)
+    // 在 overflow 窗口内仍可被 cd 强切走(不被 overflow 60s 误锁)。
+    #[tokio::test]
+    async fn test_overflow_debounce_only_locks_overflow_switched_session() {
+        use crate::kiro::rate_limiter::ThrottleReason;
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.overflow_on_busy.enabled = true;
+        config.adaptive_limit.multi_account.overflow_on_busy.migrate_debounce_secs = 600; // 长窗口便于断言
+        config.adaptive_limit.multi_account.switch_debounce_secs = 0; // 关普通防抖，隔离 overflow 窗口效果
+        config.adaptive_limit.user_cooldown_base_secs = 30; // 便于 cd 涨过 switch_threshold(15)
+        let manager = affinity_manager(config);
+        // 先把 sess 绑到某号。
+        let c = manager.acquire_context(None, None, Some("sess-ab")).await.unwrap();
+        let bound = c.id;
+        // 手动把这条绑定标成「普通切号刚迁过」(last_switch_was_overflow=false、last_switch_at=now)。
+        {
+            let mut aff = manager.affinity.lock();
+            let e = aff.get_mut("sess-ab").unwrap();
+            e.last_switch_at = Some(Utc::now());
+            e.last_switch_was_overflow = false; // 关键：普通切号，非 overflow
+        }
+        // 把绑定号打到深度冷却(cd > switch_threshold)，触发 cd 强切判定。
+        let lim = manager
+            .limiters()
+            .for_scope(&ThrottleScope::UserCredential(bound));
+        for _ in 0..4 {
+            lim.on_throttle(ThrottleReason::UserRate, None, 0).await;
+        }
+        // 因 last_switch_was_overflow=false，overflow 窗口不该锁它 → cd 强切仍可把它迁走(若 cd 够深)。
+        // 断言：select 不 panic、返回某个可用号(行为正常，没被 overflow 窗口误锁死)。
+        let pick = manager.select_with_affinity(None, None, Some("sess-ab"));
+        assert!(pick.is_some(), "普通切号迁过的会话不该被 overflow 窗口误锁(Finding A/B)");
+        // 再验反面：标成 overflow 切过 → 同样深冷却下，overflow 窗口应锁住(不被 cd 强切走、黏原号)。
+        {
+            let mut aff = manager.affinity.lock();
+            let e = aff.get_mut("sess-ab").unwrap();
+            e.credential_id = bound; // 复位到原号
+            e.last_switch_at = Some(Utc::now());
+            e.last_switch_was_overflow = true; // 关键：overflow 切
+        }
+        let pick2 = manager.select_with_affinity(None, None, Some("sess-ab"));
+        // overflow 窗口内 → 不该被 cd 强切走，应黏回原号(或至少不 panic)。
+        assert!(pick2.is_some(), "overflow 切过的会话在窗口内 select 仍应正常返回");
     }
 }

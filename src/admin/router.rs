@@ -15,6 +15,7 @@ use super::{
         export_credentials, export_kam_credentials, force_refresh_token, get_account_throttle_config,
         get_all_credentials, get_credential_balance, get_credential_models, get_global_proxy,
         get_load_balancing_mode, get_log_governance_config, get_observability, get_proxy_pool,
+        get_rate_limit_config,
         get_update_config, list_client_keys, list_groups, list_traces, trace_failure_stats,
         pin_session_to_account, poll_idc_login,
         poll_idc_relogin, poll_social_login,
@@ -22,7 +23,7 @@ use super::{
         reset_failure_count, reset_success_count, rollback_image_update, rotate_client_key,
         set_account_throttle_config, set_client_key_disabled, set_credential_disabled,
         set_credential_overage, set_credential_priority, set_global_proxy,
-        set_load_balancing_mode, set_log_governance_config, set_proxy_enabled,
+        set_load_balancing_mode, set_log_governance_config, set_proxy_enabled, set_rate_limit_config,
         set_session_priority, set_update_config, start_idc_login, start_idc_relogin,
         start_social_login, start_social_relogin, unpin_session,
         stats_by_credential, stats_by_model, stats_overview, stats_timeseries,
@@ -104,6 +105,10 @@ pub fn create_admin_router(state: AdminState) -> Router {
         .route(
             "/config/log-governance",
             get(get_log_governance_config).put(set_log_governance_config),
+        )
+        .route(
+            "/config/rate-limit",
+            get(get_rate_limit_config).put(set_rate_limit_config),
         )
         .route(
             "/config/global-proxy",

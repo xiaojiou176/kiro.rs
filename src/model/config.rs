@@ -329,6 +329,44 @@ pub struct MultiAccountConfig {
     /// 默认 0.3。0 表示关闭按利用率再平衡（回退到纯会话数）。
     #[serde(default = "default_rebalance_utilization_gap")]
     pub rebalance_utilization_gap: f64,
+    /// overflow-on-busy：当**绑定号真撞墙**（429 频发 + 吞吐被压低且不是「没活干」）时，
+    /// 把**整个会话(Thread)** 迁移到池里更健康的号。与负载再平衡的区别：再平衡是「均摊负载」，
+    /// 这是「逃离正在烧的号」——优先级更高、判定更严（要同时满足 429 率高 + goodput 低 + 非 app_limited）。
+    /// 迁移走切号路径（写 last_switch_at + 防抖），迁后 `migrate_debounce_secs` 窗口内不再迁，防来回横跳。
+    /// 默认关闭（Owner 红线：同机多号风险；开了也只是「换健康号」非裸轮询）。
+    #[serde(default)]
+    pub overflow_on_busy: OverflowOnBusyConfig,
+}
+
+/// overflow-on-busy（健康度触发的整-Thread 迁移）配置。
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverflowOnBusyConfig {
+    /// 是否开启。默认 false——Owner 改 config + 重启 kiro-rs 才生效。
+    #[serde(default)]
+    pub enabled: bool,
+    /// 触发门槛①：绑定号 5 分钟上游 429 率超此值才算「真撞墙」。默认 0.2（20%）。
+    #[serde(default = "default_overflow_upstream429_rate_threshold")]
+    pub upstream429_rate_threshold: f64,
+    /// 触发门槛②：绑定号 goodput_rps 低于 `learned_safe_rps_hi × 此比例` 才算「吞吐被压低」。
+    /// 默认 0.5（被压到健康上界一半以下）。
+    #[serde(default = "default_overflow_goodput_ratio_threshold")]
+    pub goodput_ratio_threshold: f64,
+    /// 迁移后的防抖窗口（秒）：同一会话 overflow 迁移后此窗口内不再迁/切，防来回横跳。
+    /// 默认 60（比普通切号 debounce 30 长——撞墙迁移代价大，迁完多观察一会）。
+    #[serde(default = "default_overflow_migrate_debounce_secs")]
+    pub migrate_debounce_secs: u64,
+}
+
+impl Default for OverflowOnBusyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            upstream429_rate_threshold: default_overflow_upstream429_rate_threshold(),
+            goodput_ratio_threshold: default_overflow_goodput_ratio_threshold(),
+            migrate_debounce_secs: default_overflow_migrate_debounce_secs(),
+        }
+    }
 }
 
 impl Default for MultiAccountConfig {
@@ -341,6 +379,7 @@ impl Default for MultiAccountConfig {
             rebalance_active_window_secs: default_rebalance_active_window_secs(),
             rebalance_min_gap: default_rebalance_min_gap(),
             rebalance_utilization_gap: default_rebalance_utilization_gap(),
+            overflow_on_busy: OverflowOnBusyConfig::default(),
         }
     }
 }
@@ -432,6 +471,79 @@ pub struct AdaptiveLimitConfig {
     /// 在线学习引擎。
     #[serde(default)]
     pub learning: LearningConfig,
+}
+
+/// 限速器纯数值参数的运行时热改补丁（admin `PUT /config/rate-limit`）。
+/// 全 `Option`：只改传入的字段，其余保留当前值。**不含 `hard_max_inflight`**——
+/// 信号量容量构造时定死，无法原子热改（见 `LimiterRegistry::reconfigure_all` 注释）。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdaptiveConfigPatch {
+    /// AIMD/goodput 加性增步长（rps），>= 0。
+    #[serde(default)]
+    pub additive_step_rps: Option<f64>,
+    /// 两次加速之间的最小间隔（秒）。
+    #[serde(default)]
+    pub increase_interval_secs: Option<u64>,
+    /// 触发一次加速所需累计成功数，>= 1。
+    #[serde(default)]
+    pub successes_per_increase: Option<u64>,
+    /// 最高速率（rps），> 0。
+    #[serde(default)]
+    pub max_rate_rps: Option<f64>,
+    /// goodput 429 硬上限，0~1。
+    #[serde(default)]
+    pub goodput_hard_ceiling: Option<f64>,
+    /// goodput 失控保险丝：rate 绝对上限（rps），> 0。
+    #[serde(default)]
+    pub goodput_sanity_max_rps: Option<f64>,
+    /// overflow-on-busy 子配置补丁（嵌套，全 Option）。
+    #[serde(default)]
+    pub overflow_on_busy: Option<OverflowOnBusyPatch>,
+}
+
+impl AdaptiveConfigPatch {
+    /// 是否一个字段都没传（用于「至少给一个字段」校验）。
+    pub fn is_empty(&self) -> bool {
+        self.additive_step_rps.is_none()
+            && self.increase_interval_secs.is_none()
+            && self.successes_per_increase.is_none()
+            && self.max_rate_rps.is_none()
+            && self.goodput_hard_ceiling.is_none()
+            && self.goodput_sanity_max_rps.is_none()
+            && self
+                .overflow_on_busy
+                .as_ref()
+                .map(|o| o.is_empty())
+                .unwrap_or(true)
+    }
+}
+
+/// overflow-on-busy 配置的运行时热改补丁（全 Option）。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverflowOnBusyPatch {
+    /// 是否开启整-Thread 健康度迁移。
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 触发门槛①：5 分钟上游 429 率阈值，0~1。
+    #[serde(default)]
+    pub upstream429_rate_threshold: Option<f64>,
+    /// 触发门槛②：goodput 占健康上界比例阈值，0~1。
+    #[serde(default)]
+    pub goodput_ratio_threshold: Option<f64>,
+    /// 迁移后防抖窗口（秒）。
+    #[serde(default)]
+    pub migrate_debounce_secs: Option<u64>,
+}
+
+impl OverflowOnBusyPatch {
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.upstream429_rate_threshold.is_none()
+            && self.goodput_ratio_threshold.is_none()
+            && self.migrate_debounce_secs.is_none()
+    }
 }
 
 /// 账号熔断器配置。
@@ -712,6 +824,18 @@ fn default_rebalance_min_gap() -> usize {
 }
 fn default_rebalance_utilization_gap() -> f64 {
     0.3
+}
+
+fn default_overflow_upstream429_rate_threshold() -> f64 {
+    0.2
+}
+
+fn default_overflow_goodput_ratio_threshold() -> f64 {
+    0.5
+}
+
+fn default_overflow_migrate_debounce_secs() -> u64 {
+    60
 }
 
 fn default_circuit_breaker_enabled() -> bool {

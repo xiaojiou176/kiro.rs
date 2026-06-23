@@ -26,7 +26,8 @@ use super::types::{
     GitHubRateLimitInfo, ImageUpdateResponse, KamExportAccount, KamExportResponse,
     LoadBalancingModeResponse, LogGovernanceConfigResponse, PollIdcLoginResponse,
     ProxyCheckAllResponse, ProxyCheckResponse, ProxyPoolEntry, ProxyPoolResponse,
-    QuotaExceededResult, SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
+    OverflowOnBusyConfigDto, QuotaExceededResult, RateLimitConfigResponse,
+    SetAccountThrottleConfigRequest, SetLoadBalancingModeRequest,
     SetLogGovernanceConfigRequest, SetUpdateConfigRequest, StartIdcLoginRequest,
     StartIdcLoginResponse, StartSocialLoginRequest, StartSocialLoginResponse, UpdateCheckInfo,
     UpdateConfigResponse, UpdateCredentialRequest, UpdateRefreshTokenRequest,
@@ -1868,6 +1869,61 @@ impl AdminService {
             .save()
             .with_context(|| format!("持久化日志治理配置失败: {}", config_path.display()))?;
         Ok(())
+    }
+
+    /// 读当前限速器运行时配置（GET /config/rate-limit）。读热替换后的 live 值。
+    pub fn get_rate_limit_config(&self) -> RateLimitConfigResponse {
+        let cfg = self.token_manager.current_adaptive_config();
+        let ov = self.token_manager.current_overflow_config();
+        Self::rate_limit_response(&cfg, &ov, true)
+    }
+
+    /// 热改限速器全参数 + 落盘（PUT /config/rate-limit）。
+    /// patch 直接用 model 层的 `AdaptiveConfigPatch`（全 Option，camelCase）。
+    pub fn set_rate_limit_config(
+        &self,
+        patch: crate::model::config::AdaptiveConfigPatch,
+    ) -> Result<RateLimitConfigResponse, AdminServiceError> {
+        match self.token_manager.update_adaptive_config(patch) {
+            Ok(outcome) => Ok(Self::rate_limit_response(
+                &outcome.config,
+                &outcome.overflow,
+                outcome.persisted,
+            )),
+            Err(e) => {
+                let msg = e.to_string();
+                // 落盘失败=服务端错误(500)；校验/参数错=客户端错误(400)。
+                if msg.contains("持久化") || msg.contains("重新加载") || msg.contains("序列化") {
+                    Err(AdminServiceError::InternalError(msg))
+                } else {
+                    Err(AdminServiceError::InvalidCredential(msg))
+                }
+            }
+        }
+    }
+
+    /// 把运行时 `AdaptiveConfig` + overflow 配置组装成 HTTP 响应 DTO。
+    fn rate_limit_response(
+        cfg: &crate::kiro::rate_limiter::AdaptiveConfig,
+        ov: &crate::model::config::OverflowOnBusyConfig,
+        persisted: bool,
+    ) -> RateLimitConfigResponse {
+        RateLimitConfigResponse {
+            additive_step_rps: cfg.additive_step_rps,
+            increase_interval_secs: cfg.increase_interval.as_secs(),
+            successes_per_increase: cfg.successes_per_increase,
+            max_rate_rps: cfg.max_rate_rps,
+            goodput_hard_ceiling: cfg.goodput_hard_ceiling,
+            goodput_sanity_max_rps: cfg.goodput_sanity_max_rps,
+            overflow_on_busy: OverflowOnBusyConfigDto {
+                enabled: ov.enabled,
+                upstream429_rate_threshold: ov.upstream429_rate_threshold,
+                goodput_ratio_threshold: ov.goodput_ratio_threshold,
+                migrate_debounce_secs: ov.migrate_debounce_secs,
+            },
+            hard_max_inflight: cfg.hard_max_inflight,
+            persisted,
+        }
     }
 
     /// 更新指定凭据的 refreshToken（仅限已禁用凭据）

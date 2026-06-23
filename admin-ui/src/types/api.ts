@@ -636,3 +636,45 @@ export interface ObservabilitySnapshot {
   /** 调度模式，如 multi_account_affinity / single_account */
   schedulingMode?: string
 }
+
+/** Overflow-on-busy（撞墙迁移）子配置（GET /config/rate-limit 内嵌 + PUT 回显） */
+export interface OverflowOnBusyConfigDto {
+  enabled: boolean
+  upstream429RateThreshold: number
+  goodputRatioThreshold: number
+  migrateDebounceSecs: number
+}
+
+/** 限速器运行时配置（GET /config/rate-limit 响应 + PUT 回显） */
+export interface RateLimitConfigResponse {
+  additiveStepRps: number
+  increaseIntervalSecs: number
+  successesPerIncrease: number
+  maxRateRps: number
+  goodputHardCeiling: number
+  goodputSanityMaxRps: number
+  overflowOnBusy: OverflowOnBusyConfigDto
+  /** 只读：信号量容量构造时定死，不可热改（不要给输入框） */
+  hardMaxInflight: number
+  /** PUT 时 true=已落盘 config.json；false=仅内存生效、重启会丢 */
+  persisted: boolean
+}
+
+/** Overflow 子配置补丁（全可选，只传要改的） */
+export interface OverflowOnBusyPatch {
+  enabled?: boolean
+  upstream429RateThreshold?: number
+  goodputRatioThreshold?: number
+  migrateDebounceSecs?: number
+}
+
+/** PUT /config/rate-limit 请求体（全可选，只传要改的；不含 hardMaxInflight） */
+export interface RateLimitConfigPatch {
+  additiveStepRps?: number
+  increaseIntervalSecs?: number
+  successesPerIncrease?: number
+  maxRateRps?: number
+  goodputHardCeiling?: number
+  goodputSanityMaxRps?: number
+  overflowOnBusy?: OverflowOnBusyPatch
+}

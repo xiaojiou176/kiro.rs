@@ -534,6 +534,25 @@ pub async fn set_log_governance_config(
     }
 }
 
+/// GET /api/admin/config/rate-limit
+/// 获取限速器运行时配置全字段（AdaptiveConfig 数值参数 + overflow-on-busy）
+pub async fn get_rate_limit_config(State(state): State<AdminState>) -> impl IntoResponse {
+    Json(state.service.get_rate_limit_config())
+}
+
+/// PUT /api/admin/config/rate-limit
+/// 运行时热改限速器参数（不重启即生效 + 持久化 config.json，落盘失败回滚）。
+/// 收全 Option 的 patch：只改传入字段，其余保留。
+pub async fn set_rate_limit_config(
+    State(state): State<AdminState>,
+    Json(payload): Json<crate::model::config::AdaptiveConfigPatch>,
+) -> impl IntoResponse {
+    match state.service.set_rate_limit_config(payload) {
+        Ok(response) => Json(response).into_response(),
+        Err(e) => (e.status_code(), Json(e.into_response())).into_response(),
+    }
+}
+
 /// POST /api/admin/auth/idc/start
 /// 发起 IdC 设备授权登录
 pub async fn start_idc_login(

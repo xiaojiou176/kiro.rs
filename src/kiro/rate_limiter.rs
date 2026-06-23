@@ -7,6 +7,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::time::Instant;
@@ -355,7 +356,14 @@ struct State {
 /// 单 scope 自适应限速 + 熔断 + 学习。
 pub struct AdaptiveLimiter {
     credential_id: Option<u64>,
-    cfg: AdaptiveConfig,
+    /// 运行时配置的共享原子热替换句柄。registry 与它建出的所有 limiter 共享**同一个**
+    /// `ArcSwap`，因此 `LimiterRegistry::reconfigure_all` 只 `store` 一次，全员立即读到新值
+    /// （无需重启、无需逐个 limiter 改）。读路径用 `self.cfg()` 取一份快照。
+    ///
+    /// ⚠️ 边界：`hard_max_inflight`（下方 `inflight` 信号量容量）在构造时定死，**不随热替换变化**
+    /// （Semaphore 容量无法原子改）。热替换只对纯数值参数（rate/step/间隔/goodput 带等）生效；
+    /// 改 `hard_max_inflight` 需重启。见 `LimiterRegistry::reconfigure_all` 注释与 patch 校验层。
+    cfg_swap: Arc<ArcSwap<AdaptiveConfig>>,
     pub(crate) state: Mutex<State>,
     inflight: Arc<Semaphore>,
     notify: Notify,
@@ -364,11 +372,36 @@ pub struct AdaptiveLimiter {
 }
 
 impl AdaptiveLimiter {
+    /// 读路径统一入口：取一份当前配置快照（`Guard` deref 成 `&AdaptiveConfig`，可直接读字段或
+    /// 传给收 `&AdaptiveConfig` 的静态 fn）。**注意**：`Guard` 非 `Send`，不可跨 `.await` 持有；
+    /// async 方法请改用 `self.cfg_swap.load_full()` 取 owned `Arc` 快照。
+    #[inline]
+    fn cfg(&self) -> arc_swap::Guard<Arc<AdaptiveConfig>> {
+        self.cfg_swap.load()
+    }
+
     pub fn new_with_context(
         cfg: AdaptiveConfig,
         credential_id: Option<u64>,
         learning: Option<Arc<LearningStore>>,
     ) -> Arc<Self> {
+        // 独立 limiter（非 registry 建）：自建一个 ArcSwap。registry 路径走
+        // `new_with_shared_cfg` 共享同一个 swap。
+        Self::new_with_shared_cfg(
+            Arc::new(ArcSwap::from_pointee(cfg)),
+            credential_id,
+            learning,
+        )
+    }
+
+    /// registry 专用：所有 scope 的 limiter 共享传入的同一个 `cfg_swap`，使热替换一处生效全员。
+    pub fn new_with_shared_cfg(
+        cfg_swap: Arc<ArcSwap<AdaptiveConfig>>,
+        credential_id: Option<u64>,
+        learning: Option<Arc<LearningStore>>,
+    ) -> Arc<Self> {
+        // 构造期读一次快照算初始值（hard_max_inflight / initial_rate / burst / beta）。
+        let cfg = cfg_swap.load_full();
         let now = Instant::now();
         let hard = cfg.hard_max_inflight;
         let effective = cfg.min_inflight.min(hard);
@@ -405,7 +438,7 @@ impl AdaptiveLimiter {
         };
         Arc::new(Self {
             credential_id,
-            cfg,
+            cfg_swap,
             state: Mutex::new(state),
             inflight,
             notify: Notify::new(),
@@ -421,25 +454,27 @@ impl AdaptiveLimiter {
     fn learned_bounds_if_mature(&self) -> Option<(f64, f64)> {
         let id = self.credential_id?;
         let store = self.learning.as_ref()?;
-        if !store.learning_is_mature(id, self.cfg.learning_min_samples_for_floor) {
+        if !store.learning_is_mature(id, self.cfg().learning_min_samples_for_floor) {
             return None;
         }
         Some(normalize_learned_bounds(store.learned_safe_rps(id)))
     }
 
     fn effective_rate_floor(&self) -> f64 {
-        let absolute = self.cfg.absolute_min_rate_rps.max(0.001);
+        let cfg = self.cfg();
+        let absolute = cfg.absolute_min_rate_rps.max(0.001);
         if let Some((lo, _)) = self.learned_bounds_if_mature() {
-            return (lo * self.cfg.learned_floor_factor).max(absolute);
+            return (lo * cfg.learned_floor_factor).max(absolute);
         }
-        self.cfg.min_rate_rps
+        cfg.min_rate_rps
     }
 
     fn learned_probe_cap(&self) -> f64 {
+        let cfg = self.cfg();
         if let Some((_, hi)) = self.learned_bounds_if_mature() {
-            hi.min(self.cfg.max_rate_rps)
+            hi.min(cfg.max_rate_rps)
         } else {
-            self.cfg.max_rate_rps
+            cfg.max_rate_rps
         }
     }
 
@@ -478,7 +513,7 @@ impl AdaptiveLimiter {
 
     pub fn account_state(&self) -> (AccountState, String, u64) {
         let mut st = self.state.lock();
-        Self::circuit_snapshot(&self.cfg, &mut st)
+        Self::circuit_snapshot(&self.cfg(), &mut st)
     }
 
     pub fn is_open(&self) -> bool {
@@ -486,7 +521,7 @@ impl AdaptiveLimiter {
     }
 
     pub fn current_inflight(&self) -> usize {
-        self.cfg.hard_max_inflight - self.inflight.available_permits()
+        self.cfg().hard_max_inflight - self.inflight.available_permits()
     }
 
     pub fn current_max_inflight(&self) -> usize {
@@ -498,7 +533,7 @@ impl AdaptiveLimiter {
     }
 
     pub fn upstream_429_rate(&self) -> f64 {
-        rate_429_locked(&self.state.lock().upstream_events, self.cfg.probe_window)
+        rate_429_locked(&self.state.lock().upstream_events, self.cfg().probe_window)
     }
 
     /// 恢复探测条件的单一判定源(持锁版)：电路 Healthy、已冷却、rate 未到 max、
@@ -530,6 +565,7 @@ impl AdaptiveLimiter {
     /// rate 受 `goodput_sanity_max_rps`(失控保险丝)封顶，不再受日常 `max_rate_rps` 封。
     /// 返回是否实际改动了 rate。
     pub fn goodput_control_tick(&self) -> bool {
+        let cfg = self.cfg();
         let mut st = self.state.lock();
         let now = Instant::now();
         // 门 1：仅 Healthy + 已冷却时由本控制器调速；其余状态交给熔断/退避。
@@ -537,18 +573,18 @@ impl AdaptiveLimiter {
         if !matches!(st.circuit, CircuitState::Healthy) || !cooled {
             return false;
         }
-        Self::refill_locked(&self.cfg, &mut st);
+        Self::refill_locked(&cfg, &mut st);
 
-        let window = self.cfg.probe_window;
+        let window = cfg.probe_window;
         let throttle_rate = rate_429_locked(&st.upstream_events, window);
         let goodput = goodput_rps_locked(&st.goodput_events, window);
         let floor = self.effective_rate_floor();
-        let sanity_max = self.cfg.goodput_sanity_max_rps;
-        let step = self.cfg.additive_step_rps.max(0.0);
+        let sanity_max = cfg.goodput_sanity_max_rps;
+        let step = cfg.additive_step_rps.max(0.0);
         let before = st.rate_rps;
 
         // 门 2：429 硬上限——强制降速，无视 goodput（防升级惩罚）。
-        if throttle_rate > self.cfg.goodput_hard_ceiling {
+        if throttle_rate > cfg.goodput_hard_ceiling {
             st.rate_rps = (st.rate_rps - step).max(floor);
             st.probe_climbing = false;
             st.last_probe_goodput = goodput;
@@ -558,7 +594,7 @@ impl AdaptiveLimiter {
                     event = "goodput_hard_ceiling_hit",
                     credential_id = ?self.credential_id,
                     throttle_rate = throttle_rate,
-                    ceiling = self.cfg.goodput_hard_ceiling,
+                    ceiling = cfg.goodput_hard_ceiling,
                     "429 超硬上限，强制降速（可能的升级惩罚信号）"
                 );
                 self.notify.notify_waiters();
@@ -581,7 +617,7 @@ impl AdaptiveLimiter {
         } else {
             st.app_limited_streak = 0;
         }
-        if app_limited_now && st.app_limited_streak >= self.cfg.app_limited_debounce_ticks {
+        if app_limited_now && st.app_limited_streak >= cfg.app_limited_debounce_ticks {
             // 连续多拍确认需求不足 → 记录基线但不动 rate、保留 probe_climbing（需求回来接着爬）。
             st.last_probe_goodput = goodput;
             st.last_probe_rate = st.rate_rps;
@@ -590,7 +626,7 @@ impl AdaptiveLimiter {
 
         // 门 4a：带上沿以上、硬上限以下 [band_high, hard_ceiling] → 偏热，轻微抑制：
         // 退一档让 429 回落进带内，但不像硬上限那样强降（区别于门 2）。
-        if throttle_rate > self.cfg.goodput_band_high {
+        if throttle_rate > cfg.goodput_band_high {
             st.rate_rps = (st.rate_rps - step).max(floor);
             st.probe_climbing = false;
             st.last_probe_goodput = goodput;
@@ -602,7 +638,7 @@ impl AdaptiveLimiter {
             return changed;
         }
         // 门 4b：护栏带内 [band_low, band_high] → 贴着天花板的理想稳态，保持不动。
-        if throttle_rate >= self.cfg.goodput_band_low {
+        if throttle_rate >= cfg.goodput_band_low {
             st.probe_climbing = false;
             st.last_probe_goodput = goodput;
             st.last_probe_rate = st.rate_rps;
@@ -624,7 +660,7 @@ impl AdaptiveLimiter {
         if st.probe_climbing {
             // regressed：goodput 比上次探测时明显回落（跌破 1 - epsilon）= 抬过头了。
             let regressed =
-                goodput < st.last_probe_goodput * (1.0 - self.cfg.goodput_rise_epsilon);
+                goodput < st.last_probe_goodput * (1.0 - cfg.goodput_rise_epsilon);
             if regressed {
                 // 抬 rate 反而吞吐降 → 回退一档并停爬，停在上一个更优点。
                 st.rate_rps = (st.rate_rps - step).max(floor);
@@ -653,8 +689,9 @@ impl AdaptiveLimiter {
     }
 
     pub fn observe_full(&self) -> LimiterObservation {
+        let cfg = self.cfg();
         let mut st = self.state.lock();
-        let (state, reason, reopen_ms) = Self::circuit_snapshot(&self.cfg, &mut st);
+        let (state, reason, reopen_ms) = Self::circuit_snapshot(&cfg, &mut st);
         let (safe_lo, safe_hi) = self
             .credential_id
             .and_then(|id| {
@@ -675,17 +712,17 @@ impl AdaptiveLimiter {
             .credential_id
             .and_then(|id| {
                 self.learning.as_ref().map(|s| {
-                    s.optimal_quarantine(id, self.cfg.initial_quarantine.as_secs())
+                    s.optimal_quarantine(id, cfg.initial_quarantine.as_secs())
                         .as_secs()
                 })
             })
-            .unwrap_or(self.cfg.initial_quarantine.as_secs());
+            .unwrap_or(cfg.initial_quarantine.as_secs());
         LimiterObservation {
             state,
             state_reason: reason,
             reopen_in_ms: reopen_ms,
             current_max_inflight: st.effective_max_inflight,
-            current_inflight: self.cfg.hard_max_inflight - self.inflight.available_permits(),
+            current_inflight: cfg.hard_max_inflight - self.inflight.available_permits(),
             current_rate_rps: st.rate_rps,
             effective_rate_floor_rps: self.effective_rate_floor(),
             learned_safe_rps_lo: safe_lo,
@@ -693,13 +730,18 @@ impl AdaptiveLimiter {
             p80_held_ms: p80,
             learned_optimal_t_secs: optimal_t,
             bottleneck_dimension: bottleneck,
-            upstream_429_rate_5m: rate_429_locked(&st.upstream_events, self.cfg.probe_window),
+            upstream_429_rate_5m: rate_429_locked(&st.upstream_events, cfg.probe_window),
             consecutive_throttles: st.consecutive_throttles,
             cooldown_remaining_ms: Self::cooldown_remaining_from_state(&st).as_millis() as u64,
-            recovery_eligible: Self::recovery_eligible_locked(&self.cfg, &st),
-            goodput_rps: goodput_rps_locked(&st.goodput_events, self.cfg.probe_window),
-            app_limited: (self.cfg.hard_max_inflight - self.inflight.available_permits()) + 1
+            recovery_eligible: Self::recovery_eligible_locked(&cfg, &st),
+            goodput_rps: goodput_rps_locked(&st.goodput_events, cfg.probe_window),
+            app_limited: (cfg.hard_max_inflight - self.inflight.available_permits()) + 1
                 < st.effective_max_inflight,
+            // 去抖版：瞬时 app-limited 且连续拍数已达阈值才为真（streak 在 step() 里维护）。
+            app_limited_debounced: (cfg.hard_max_inflight - self.inflight.available_permits())
+                + 1
+                < st.effective_max_inflight
+                && st.app_limited_streak >= cfg.app_limited_debounce_ticks,
             adaptive_beta: st.adaptive_beta,
         }
     }
@@ -787,8 +829,9 @@ impl AdaptiveLimiter {
     }
 
     pub fn acquire_shadow(&self) -> AcquireOutcome {
+        let cfg = self.cfg();
         let mut st = self.state.lock();
-        Self::refill_locked(&self.cfg, &mut st);
+        Self::refill_locked(&cfg, &mut st);
         let now = Instant::now();
         let cd = st
             .cooldown_until
@@ -798,7 +841,7 @@ impl AdaptiveLimiter {
         let token_wait = if st.tokens >= 1.0 {
             0
         } else {
-            ((1.0 - st.tokens) / st.rate_rps.max(self.cfg.absolute_min_rate_rps) * 1000.0) as u64
+            ((1.0 - st.tokens) / st.rate_rps.max(cfg.absolute_min_rate_rps) * 1000.0) as u64
         };
         AcquireOutcome::ShadowProceed {
             would_wait_ms: cd.max(token_wait),
@@ -807,7 +850,10 @@ impl AdaptiveLimiter {
     }
 
     pub async fn acquire(self: &Arc<Self>) -> AcquireOutcome {
-        if !self.cfg.enforce {
+        // async：用 load_full() 取 owned Arc 快照，可安全跨 .await 持有（Guard 非 Send）。
+        // 本次 acquire 全程用这一份一致视图。
+        let cfg = self.cfg_swap.load_full();
+        if !cfg.enforce {
             return self.acquire_shadow();
         }
 
@@ -847,12 +893,12 @@ impl AdaptiveLimiter {
             .expect("semaphore never closed");
         let mut permit = LimiterPermit::new(Arc::clone(self), raw_permit);
 
-        let absorb_deadline = Instant::now() + self.cfg.max_absorb_wait;
-        let mut slice_deadline = Instant::now() + self.cfg.local_queue_timeout;
+        let absorb_deadline = Instant::now() + cfg.max_absorb_wait;
+        let mut slice_deadline = Instant::now() + cfg.local_queue_timeout;
         loop {
             let wait = {
                 let mut st = self.state.lock();
-                Self::refill_locked(&self.cfg, &mut st);
+                Self::refill_locked(&cfg, &mut st);
                 let now = Instant::now();
 
                 if let Some(until) = st.cooldown_until {
@@ -875,7 +921,7 @@ impl AdaptiveLimiter {
                 } else {
                     let missing = 1.0 - st.tokens;
                     let secs = missing
-                        / st.rate_rps.max(self.cfg.absolute_min_rate_rps);
+                        / st.rate_rps.max(cfg.absolute_min_rate_rps);
                     Some((Duration::from_secs_f64(secs), st.rate_rps))
                 }
             };
@@ -894,13 +940,13 @@ impl AdaptiveLimiter {
                         _ = sleep(wait_dur) => {}
                         _ = self.notify.notified() => {}
                     }
-                    slice_deadline = Instant::now() + self.cfg.local_queue_timeout;
+                    slice_deadline = Instant::now() + cfg.local_queue_timeout;
                     continue;
                 }
                 let at_effective_floor =
                     current_rps <= self.effective_rate_floor() + f64::EPSILON;
                 let upstream_hot =
-                    self.upstream_429_rate() > self.cfg.probe_budget_high;
+                    self.upstream_429_rate() > cfg.probe_budget_high;
                 let est_wait_ms = wait_dur.as_millis() as u64;
                 drop(permit);
                 self.clear_half_open_canary();
@@ -924,8 +970,9 @@ impl AdaptiveLimiter {
     }
 
     fn try_acquire_decision(&self) -> Option<AcquireDecision> {
+        let cfg = self.cfg();
         let mut st = self.state.lock();
-        Self::maybe_advance_circuit(&self.cfg, &mut st);
+        Self::maybe_advance_circuit(&cfg, &mut st);
         if let CircuitState::Open { until, .. } = st.circuit {
             let now = Instant::now();
             if now < until {
@@ -946,7 +993,7 @@ impl AdaptiveLimiter {
                 }));
             }
         }
-        let in_flight = self.cfg.hard_max_inflight - self.inflight.available_permits();
+        let in_flight = cfg.hard_max_inflight - self.inflight.available_permits();
         if in_flight >= st.effective_max_inflight {
             return Some(AcquireDecision::WaitInflight);
         }
@@ -993,25 +1040,27 @@ impl AdaptiveLimiter {
     }
 
     pub async fn on_success(&self, rpm_last_60s: usize) {
+        // 本方法体内无 .await，Guard 快照安全（不跨挂起点）。
+        let cfg = self.cfg();
         let mut st = self.state.lock();
-        Self::refill_locked(&self.cfg, &mut st);
+        Self::refill_locked(&cfg, &mut st);
         st.consecutive_throttles = 0;
         st.consecutive_user_429 = 0;
         st.successes_since_increase += 1;
-        record_upstream(&mut st.upstream_events, false, self.cfg.probe_window);
+        record_upstream(&mut st.upstream_events, false, cfg.probe_window);
         // goodput 测量：每次成功完成记一个样本。rate 的升降统一由 goodput_control_tick
         // 驱动（见该函数），on_success 不再直接 AIMD 抬升 rate——目标函数从「429 最低」
         // 改成「goodput 最大」，这是本控制器的核心。
-        record_goodput(&mut st.goodput_events, self.cfg.probe_window);
+        record_goodput(&mut st.goodput_events, cfg.probe_window);
 
         let from = Self::circuit_label(&st);
         if let CircuitState::HalfOpen { canary_in_flight, successes, .. } = &mut st.circuit {
             *canary_in_flight = false;
             *successes += 1;
-            if *successes >= self.cfg.half_open_success_target {
+            if *successes >= cfg.half_open_success_target {
                 self.transition_circuit(&mut st, CircuitState::Healthy, from, "half_open_successes");
                 if let (Some(id), Some(store)) = (self.credential_id, &self.learning) {
-                    store.on_quarantine_probe_stable(id, self.cfg.min_quarantine.as_secs());
+                    store.on_quarantine_probe_stable(id, cfg.min_quarantine.as_secs());
                 }
             }
         }
@@ -1033,12 +1082,14 @@ impl AdaptiveLimiter {
         retry_after: Option<Duration>,
         rpm_last_60s: usize,
     ) {
+        // 本方法体内无 .await，Guard 快照安全（不跨挂起点）。
+        let cfg = self.cfg();
         let mut st = self.state.lock();
-        Self::refill_locked(&self.cfg, &mut st);
+        Self::refill_locked(&cfg, &mut st);
         let now = Instant::now();
         st.consecutive_throttles = st.consecutive_throttles.saturating_add(1);
         st.successes_since_increase = 0;
-        record_upstream(&mut st.upstream_events, true, self.cfg.probe_window);
+        record_upstream(&mut st.upstream_events, true, cfg.probe_window);
 
         if matches!(reason, ThrottleReason::UserRate | ThrottleReason::ServiceRate) {
             st.consecutive_user_429 = st.consecutive_user_429.saturating_add(1);
@@ -1053,10 +1104,10 @@ impl AdaptiveLimiter {
         });
 
         let at_min = st.rate_rps <= self.effective_rate_floor() + f64::EPSILON;
-        let should_open = self.cfg.circuit_breaker_enabled
+        let should_open = cfg.circuit_breaker_enabled
             && (matches!(reason, ThrottleReason::Suspicious)
                 || (at_min && matches!(reason, ThrottleReason::UserRate | ThrottleReason::ServiceRate | ThrottleReason::Unknown))
-                || st.consecutive_user_429 >= self.cfg.open_429_threshold);
+                || st.consecutive_user_429 >= cfg.open_429_threshold);
 
         let from = Self::circuit_label(&st);
         if should_open {
@@ -1081,7 +1132,7 @@ impl AdaptiveLimiter {
             *canary_in_flight = false;
             let quarantine = self.quarantine_duration();
             if let (Some(id), Some(store)) = (self.credential_id, &self.learning) {
-                store.on_quarantine_probe_failed(id, self.cfg.max_quarantine.as_secs());
+                store.on_quarantine_probe_failed(id, cfg.max_quarantine.as_secs());
             }
             self.transition_circuit(
                 &mut st,
@@ -1104,20 +1155,20 @@ impl AdaptiveLimiter {
         let beta = match reason {
             ThrottleReason::Suspicious => 0.1,
             _ => {
-                let beta_min = (self.cfg.beta_user * 0.5).clamp(0.05, 0.9);
+                let beta_min = (cfg.beta_user * 0.5).clamp(0.05, 0.9);
                 let beta_max = 0.9_f64;
                 if let Some(last) = st.last_backoff_at {
                     let since = now.duration_since(last);
-                    if since < self.cfg.probe_window / 4 {
+                    if since < cfg.probe_window / 4 {
                         // 退避后很快又撞 → 退更狠。
                         st.adaptive_beta = (st.adaptive_beta * 0.8).max(beta_min);
-                    } else if since > self.cfg.probe_window {
+                    } else if since > cfg.probe_window {
                         // 隔了很久才撞，上次退过头 → 退更温柔。
                         st.adaptive_beta = (st.adaptive_beta * 1.1).min(beta_max);
                     }
                     // 中间区间：保持当前 adaptive_beta 不变。
                 } else {
-                    st.adaptive_beta = self.cfg.beta_user.clamp(beta_min, beta_max);
+                    st.adaptive_beta = cfg.beta_user.clamp(beta_min, beta_max);
                 }
                 st.adaptive_beta
             }
@@ -1125,25 +1176,25 @@ impl AdaptiveLimiter {
         st.last_backoff_at = Some(now);
         st.rate_rps = (st.rate_rps * beta).max(self.effective_rate_floor());
 
-        if self.cfg.adaptive_concurrency_enabled {
-            let new_eff = ((st.effective_max_inflight as f64) * self.cfg.shrink_factor)
+        if cfg.adaptive_concurrency_enabled {
+            let new_eff = ((st.effective_max_inflight as f64) * cfg.shrink_factor)
                 .round() as usize;
             st.effective_max_inflight = new_eff
-                .max(self.cfg.min_inflight)
-                .min(self.cfg.hard_max_inflight);
+                .max(cfg.min_inflight)
+                .min(cfg.hard_max_inflight);
         }
 
         st.tokens = 0.0;
 
         let local_cd = exp_cooldown(
-            self.cfg.user_cooldown_base,
-            self.cfg.cooldown_cap,
+            cfg.user_cooldown_base,
+            cfg.cooldown_cap,
             st.consecutive_throttles,
         );
         let cooldown = retry_after
-            .map(|d| d.min(self.cfg.cooldown_cap))
+            .map(|d| d.min(cfg.cooldown_cap))
             .unwrap_or(local_cd)
-            .min(self.cfg.local_queue_timeout);
+            .min(cfg.local_queue_timeout);
         let until = now + cooldown;
         st.cooldown_until = Some(match st.cooldown_until {
             Some(old) if old > until => old,
@@ -1153,24 +1204,26 @@ impl AdaptiveLimiter {
     }
 
     fn quarantine_duration(&self) -> Duration {
+        let cfg = self.cfg();
         if let (Some(id), Some(store)) = (self.credential_id, &self.learning) {
-            store.optimal_quarantine(id, self.cfg.initial_quarantine.as_secs())
+            store.optimal_quarantine(id, cfg.initial_quarantine.as_secs())
         } else {
-            self.cfg.initial_quarantine
+            cfg.initial_quarantine
         }
-        .max(self.cfg.min_quarantine)
-        .min(self.cfg.max_quarantine)
+        .max(cfg.min_quarantine)
+        .min(cfg.max_quarantine)
     }
 
     fn recompute_effective_inflight(&self, st: &mut State) {
-        if !self.cfg.adaptive_concurrency_enabled {
+        let cfg = self.cfg();
+        if !cfg.adaptive_concurrency_enabled {
             return;
         }
         let (safe_rps, _) = self
             .credential_id
             .and_then(|id| {
                 self.learning.as_ref().and_then(|s| {
-                    if !s.learning_is_mature(id, self.cfg.learning_min_samples_for_floor) {
+                    if !s.learning_is_mature(id, cfg.learning_min_samples_for_floor) {
                         return None;
                     }
                     let (lo, hi) = normalize_learned_bounds(s.learned_safe_rps(id));
@@ -1183,22 +1236,22 @@ impl AdaptiveLimiter {
             .and_then(|id| self.learning.as_ref().map(|s| s.p80_held_ms(id)))
             .unwrap_or(30_000) as f64;
         let p80_secs = (p80_ms / 1000.0).max(0.1);
-        let desired = (safe_rps * p80_secs * self.cfg.safety_factor).ceil() as usize;
+        let desired = (safe_rps * p80_secs * cfg.safety_factor).ceil() as usize;
         let clamped = desired
-            .clamp(self.cfg.min_inflight, self.cfg.hard_max_inflight);
+            .clamp(cfg.min_inflight, cfg.hard_max_inflight);
         let old = st.effective_max_inflight;
         let new_eff = if clamped > old {
-            ((old as f64) * self.cfg.grow_factor).round() as usize
+            ((old as f64) * cfg.grow_factor).round() as usize
         } else if clamped < old {
-            ((old as f64) * self.cfg.shrink_factor).round() as usize
+            ((old as f64) * cfg.shrink_factor).round() as usize
         } else {
             old
         };
-        st.effective_max_inflight = new_eff.clamp(self.cfg.min_inflight, self.cfg.hard_max_inflight);
+        st.effective_max_inflight = new_eff.clamp(cfg.min_inflight, cfg.hard_max_inflight);
     }
 
     fn record_learning_sample(&self, sample: SendContextSample) {
-        if !self.cfg.learning_enabled {
+        if !self.cfg().learning_enabled {
             return;
         }
         if let (Some(id), Some(store)) = (self.credential_id, &self.learning) {
@@ -1207,7 +1260,7 @@ impl AdaptiveLimiter {
     }
 
     pub fn record_held_duration(&self, held_ms: u64) {
-        if !self.cfg.learning_enabled {
+        if !self.cfg().learning_enabled {
             return;
         }
         if let (Some(id), Some(store)) = (self.credential_id, &self.learning) {
@@ -1256,6 +1309,10 @@ pub struct LimiterObservation {
     pub goodput_rps: f64,
     /// goodput 控制器：当前是否 app-limited（在飞低于并发上限=没活干，非到顶）。
     pub app_limited: bool,
+    /// app-limited 的**去抖版**：连续 `app_limited_debounce_ticks` 拍都判 app-limited 才为真。
+    /// 比瞬时 `app_limited` 稳——单流(串行单请求)选号瞬间常碰巧 inflight 低、瞬时 app_limited=true，
+    /// 但 streak 未达阈值时本字段仍为 false。overflow-on-busy 用它判「真没活干」，避免单流误判。
+    pub app_limited_debounced: bool,
     /// 自适应退避当前学到的 beta（乘性减速系数）。
     pub adaptive_beta: f64,
 }
@@ -1345,7 +1402,9 @@ fn add_small_jitter(d: Duration) -> Duration {
 
 /// 多 scope limiter 容器。
 pub struct LimiterRegistry {
-    cfg: AdaptiveConfig,
+    /// 共享原子热替换句柄：registry 与它 `for_scope` 建出的所有 limiter 共享**同一个** `ArcSwap`。
+    /// `reconfigure_all` 只 `store` 一次，全员立即生效（见该方法注释的 hard_max_inflight 边界）。
+    cfg_swap: Arc<ArcSwap<AdaptiveConfig>>,
     map: Mutex<HashMap<String, Arc<AdaptiveLimiter>>>,
     learning: Option<Arc<LearningStore>>,
 }
@@ -1353,18 +1412,34 @@ pub struct LimiterRegistry {
 impl LimiterRegistry {
     pub fn new(cfg: AdaptiveConfig, learning: Option<Arc<LearningStore>>) -> Self {
         Self {
-            cfg,
+            cfg_swap: Arc::new(ArcSwap::from_pointee(cfg)),
             map: Mutex::new(HashMap::new()),
             learning,
         }
     }
 
     pub fn enabled(&self) -> bool {
-        self.cfg.enabled
+        self.cfg_swap.load().enabled
     }
 
     pub fn learning(&self) -> Option<Arc<LearningStore>> {
         self.learning.clone()
+    }
+
+    /// 读当前配置快照（深拷贝一份返回，供 admin 读端点 / 持久化做基底）。
+    pub fn current_config(&self) -> AdaptiveConfig {
+        (*self.cfg_swap.load_full()).clone()
+    }
+
+    /// 原子热替换全部参数：因 registry 与所有 limiter 共享同一个 `cfg_swap`，
+    /// 这里 `store` 一次，所有已建/将建的 limiter 下次读 `cfg()` 即见新值（无需重启、无需逐个改）。
+    ///
+    /// ⚠️ **hard_max_inflight 边界**：每个 limiter 的 `inflight` 信号量容量在构造时定死，
+    /// Semaphore 容量无法原子改 —— 故本轮**不支持热改 hard_max_inflight**。调用方（patch 校验层）
+    /// 必须拒绝改它；即便这里换进一个 hard_max_inflight 不同的 cfg，已存在 limiter 的信号量容量
+    /// 也不会变（current_inflight/in_flight 仍按旧容量算），只有纯数值参数真正生效。
+    pub fn reconfigure_all(&self, new_cfg: AdaptiveConfig) {
+        self.cfg_swap.store(Arc::new(new_cfg));
     }
 
     pub fn for_scope(&self, scope: &ThrottleScope) -> Arc<AdaptiveLimiter> {
@@ -1374,8 +1449,9 @@ impl LimiterRegistry {
             return l.clone();
         }
         let cred = scope.credential_id();
-        let limiter = AdaptiveLimiter::new_with_context(
-            self.cfg.clone(),
+        // 传共享 cfg_swap.clone()（Arc clone，指向同一 ArcSwap）：reconfigure_all 一处生效全员。
+        let limiter = AdaptiveLimiter::new_with_shared_cfg(
+            self.cfg_swap.clone(),
             cred,
             self.learning.clone(),
         );
@@ -1426,7 +1502,7 @@ impl LimiterRegistry {
                 events.push_back(*e);
             }
         }
-        rate_429_locked(&events, self.cfg.probe_window)
+        rate_429_locked(&events, self.cfg_swap.load().probe_window)
     }
 
     pub fn account_state_counts(&self) -> HashMap<AccountState, usize> {
@@ -1454,6 +1530,11 @@ impl AdaptiveLimiter {
 
     fn test_notify(&self) -> &Notify {
         &self.notify
+    }
+
+    /// 测试专用：读 limiter 当前 live 配置快照（验证热替换是否真传导到了 limiter）。
+    fn test_live_cfg(&self) -> AdaptiveConfig {
+        (*self.cfg_swap.load_full()).clone()
     }
 }
 
@@ -1959,7 +2040,7 @@ mod tests {
             st.upstream_events.clear();
             st.effective_max_inflight = 8; // 无在飞 → current_inflight(0)+1 < 8 → app-limited
         }
-        let debounce = lim.cfg.app_limited_debounce_ticks;
+        let debounce = lim.cfg().app_limited_debounce_ticks;
         // 先跑满去抖阈值（每拍都 app-limited），最后一拍应进入 hold。
         let mut last_raised = true;
         for _ in 0..debounce {
@@ -1988,7 +2069,7 @@ mod tests {
             st.effective_max_inflight = 8; // 无在飞 → app-limited
             st.probe_climbing = true; // 假装正在爬升
         }
-        let debounce = lim.cfg.app_limited_debounce_ticks;
+        let debounce = lim.cfg().app_limited_debounce_ticks;
         for _ in 0..(debounce + 2) {
             lim.goodput_control_tick();
         }
@@ -2042,7 +2123,7 @@ mod tests {
             st.upstream_events.clear();
             st.effective_max_inflight = 8; // 持续 app-limited
         }
-        let debounce = lim.cfg.app_limited_debounce_ticks;
+        let debounce = lim.cfg().app_limited_debounce_ticks;
         // 前 debounce-1 拍：streak 未达阈值 → 仍按 429<band_low 爬升。
         for _ in 0..(debounce - 1) {
             lim.goodput_control_tick();
@@ -2598,5 +2679,113 @@ mod tests {
             AcquireOutcome::Proceed(p) => p,
             other => panic!("expected Proceed, got {other:?}"),
         }
+    }
+
+    // ===== 运行时配置热替换（ArcSwap）测试 =====
+
+    // ① reconfigure_all 后，registry 建出的 limiter 立即读到新值（热传导）。
+    #[test]
+    fn test_reconfigure_propagates_to_limiter() {
+        let reg = LimiterRegistry::new(test_cfg(), None);
+        let lim = reg.for_scope(&ThrottleScope::UserCredential(1));
+        // 改前：limiter 读到的是 test_cfg 的初始值。
+        assert_eq!(lim.test_live_cfg().additive_step_rps, 0.5);
+        assert_eq!(reg.current_config().additive_step_rps, 0.5);
+
+        let mut new_cfg = test_cfg();
+        new_cfg.additive_step_rps = 1.25;
+        new_cfg.max_rate_rps = 9.0;
+        reg.reconfigure_all(new_cfg);
+
+        // 改后：同一个 limiter（建于 reconfigure 之前）立即读到新值，无需重建。
+        assert_eq!(lim.test_live_cfg().additive_step_rps, 1.25);
+        assert_eq!(lim.test_live_cfg().max_rate_rps, 9.0);
+        assert_eq!(reg.current_config().additive_step_rps, 1.25);
+    }
+
+    // ② reconfigure_all 对多个 scope 的 limiter 全部生效（共享同一 ArcSwap）。
+    #[test]
+    fn test_reconfigure_affects_all_scopes() {
+        let reg = LimiterRegistry::new(test_cfg(), None);
+        let l1 = reg.for_scope(&ThrottleScope::UserCredential(1));
+        let l2 = reg.for_scope(&ThrottleScope::UserCredential(2));
+        let l3 = reg.for_scope(&ThrottleScope::ServiceProfile("p".into()));
+
+        let mut new_cfg = test_cfg();
+        new_cfg.goodput_sanity_max_rps = 42.0;
+        reg.reconfigure_all(new_cfg);
+
+        // 三个不同 scope 的 limiter 全部读到新值。
+        for l in [&l1, &l2, &l3] {
+            assert_eq!(l.test_live_cfg().goodput_sanity_max_rps, 42.0);
+        }
+        // reconfigure 之后新建的 scope 同样读到新值。
+        let l4 = reg.for_scope(&ThrottleScope::UserCredential(99));
+        assert_eq!(l4.test_live_cfg().goodput_sanity_max_rps, 42.0);
+    }
+
+    // ③ patch 合并语义：只改传入字段，其余保留（用 AdaptiveLimitConfig 基底走 from_cfg 重建）。
+    #[test]
+    fn test_patch_merge_only_changes_given_fields() {
+        use crate::model::config::{AdaptiveConfigPatch, AdaptiveLimitConfig};
+
+        // 基底：默认 AdaptiveLimitConfig。
+        let mut alc = AdaptiveLimitConfig::default();
+        let base = AdaptiveConfig::from_cfg(&alc);
+        let base_max = base.max_rate_rps;
+        let base_succ = base.successes_per_increase;
+
+        // 只改 additive_step_rps，其余字段不传。
+        let patch = AdaptiveConfigPatch {
+            additive_step_rps: Some(0.77),
+            ..Default::default()
+        };
+        // 复刻 update_adaptive_config 的合并逻辑（apply_patch_to_alc + from_cfg）。
+        if let Some(v) = patch.additive_step_rps {
+            alc.additive_step_rps = v;
+        }
+        let merged = AdaptiveConfig::from_cfg(&alc);
+
+        assert_eq!(merged.additive_step_rps, 0.77, "传入字段被改");
+        assert_eq!(merged.max_rate_rps, base_max, "未传字段保留");
+        assert_eq!(
+            merged.successes_per_increase, base_succ,
+            "未传字段保留"
+        );
+    }
+
+    // ④ hard_max_inflight 不可热改：reconfigure 即便换进不同 hard_max_inflight，
+    //    已存在 limiter 的信号量容量也不变（current_inflight 仍按旧容量算）。
+    //    这验证了「信号量容量构造时定死」的边界承诺。
+    #[test]
+    fn test_hard_max_inflight_semaphore_not_hot_swappable() {
+        let mut cfg = test_cfg();
+        cfg.hard_max_inflight = 8;
+        let reg = LimiterRegistry::new(cfg, None);
+        let lim = reg.for_scope(&ThrottleScope::UserCredential(1));
+        // 信号量初始容量 = 8，无在飞 → available = 8，current_inflight = 8 - 8 = 0。
+        assert_eq!(lim.current_inflight(), 0);
+        let available_before = lim.inflight.available_permits();
+        assert_eq!(available_before, 8);
+
+        // 热替换换进 hard_max_inflight = 99 的 cfg。
+        let mut new_cfg = test_cfg();
+        new_cfg.hard_max_inflight = 99;
+        reg.reconfigure_all(new_cfg);
+
+        // 信号量容量不随热替换变化：仍是 8（构造时定死）。
+        assert_eq!(
+            lim.inflight.available_permits(),
+            8,
+            "信号量容量不可热改，仍为构造时的 8"
+        );
+        // current_inflight 用 cfg().hard_max_inflight(=99) - available(=8) = 91，
+        // 这正是「换进新 cfg 但信号量没变」会产生的不一致——故上层 update_adaptive_config
+        // 强制保留旧 hard_max_inflight，杜绝这种漂移。这里直接验证「信号量本身没变」这一底层事实。
+        assert_eq!(
+            lim.test_live_cfg().hard_max_inflight,
+            99,
+            "cfg 数值确实换了（但信号量容量没跟着变，见上）"
+        );
     }
 }
