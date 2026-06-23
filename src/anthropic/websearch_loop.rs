@@ -96,6 +96,84 @@ fn should_search_round(round_idx: usize, tool_uses: &[DecodedToolUse]) -> bool {
     only_web_search && round_idx < MAX_WEB_SEARCH_ROUNDS
 }
 
+/// Pull any plaintext `<thinking>...</thinking>` blocks out of a round's assistant
+/// text and merge them into the round's thinking, returning `(stripped_text, thinking)`.
+///
+/// Parity-in-spirit with the普通 chat 路径 (`stream.rs` `process_content_with_thinking`):
+/// the model sometimes emits chain-of-thought as literal `<thinking>` text in the body
+/// (kiro-rs even re-wraps prior thinking into this inline form in the upstream history —
+/// see `converter.rs::convert_assistant_message` — priming the model to mirror it). The
+/// web_search loop previously lacked any sniffer, so the tags leaked through as body text
+/// and the App rendered raw `<thinking>` instead of a folded reasoning block.
+///
+/// NOTE on guards: this does its OWN scan rather than reusing
+/// `stream::extract_thinking_from_complete_text`, because that helper's end-tag guard
+/// treats sentence punctuation (`.` is in `QUOTE_CHARS`) immediately before `</thinking>`
+/// as "quoted" and skips it — but real model output ends thinking with a period
+/// (`...statements.</thinking>`), so the shared helper would miss the common case. Here we
+/// only skip tags wrapped in backticks/quotes (genuine "discussion of the tag"), and accept
+/// ordinary text (including a trailing `.`) before `</thinking>`. Loops for multiple blocks;
+/// native reasoning already in `thinking` is preserved and sniffed blocks appended after it.
+fn merge_plaintext_thinking(text: String, mut thinking: String) -> (String, String) {
+    // A `<thinking>`/`</thinking>` occurrence is "real" unless an immediately adjacent
+    // char is a backtick or quote (e.g. discussing `` `<thinking>` ``). Plain sentence
+    // characters — letters, spaces, `.` — do NOT disqualify it.
+    fn is_wrap(b: u8) -> bool {
+        matches!(b, b'`' | b'"' | b'\'')
+    }
+    fn find_unwrapped(hay: &str, tag: &str, from: usize) -> Option<usize> {
+        let bytes = hay.as_bytes();
+        let mut search = from;
+        while let Some(rel) = hay[search..].find(tag) {
+            let pos = search + rel;
+            let before_wrapped = pos > 0 && is_wrap(bytes[pos - 1]);
+            let after_idx = pos + tag.len();
+            let after_wrapped = after_idx < bytes.len() && is_wrap(bytes[after_idx]);
+            if !before_wrapped && !after_wrapped {
+                return Some(pos);
+            }
+            search = pos + 1;
+        }
+        None
+    }
+
+    const OPEN: &str = "<thinking>";
+    const CLOSE: &str = "</thinking>";
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    while let Some(open) = find_unwrapped(&text, OPEN, cursor) {
+        // Closing tag must come after the opening tag.
+        let content_start = open + OPEN.len();
+        let close = match find_unwrapped(&text, CLOSE, content_start) {
+            Some(c) => c,
+            // No matching close -> leave the `<thinking>` (and everything after) as text.
+            None => break,
+        };
+        // Keep text before the block (model rarely puts content before, but be safe).
+        out.push_str(&text[cursor..open]);
+        // Accumulate the thinking content (strip a single leading newline like the
+        // streaming path: model emits `<thinking>\n`).
+        let raw = &text[content_start..close];
+        let content = raw.strip_prefix('\n').unwrap_or(raw).trim_end();
+        if !content.is_empty() {
+            if !thinking.is_empty() {
+                thinking.push('\n');
+            }
+            thinking.push_str(content);
+        }
+        // Skip the close tag and a following blank-line separator if present.
+        let mut after = close + CLOSE.len();
+        if text[after..].starts_with("\n\n") {
+            after += 2;
+        } else if text[after..].starts_with('\n') {
+            after += 1;
+        }
+        cursor = after;
+    }
+    out.push_str(&text[cursor..]);
+    (out, thinking)
+}
+
 /// Buffer-decode one round of the upstream streaming response
 async fn decode_round(
     response: reqwest::Response,
@@ -210,6 +288,18 @@ async fn decode_round(
             });
         }
     }
+
+    // Plaintext `<thinking>` sniffer (parity with普通 chat 路径 `stream.rs`).
+    // Besides native `reasoningContentEvent` (collected above into `thinking`), the
+    // model sometimes emits its chain-of-thought as literal `<thinking>...</thinking>`
+    // text inside the assistant body (kiro-rs even re-wraps prior thinking into this
+    // inline form in the upstream history — see converter.rs convert_assistant_message —
+    // so the model is primed to mirror it). The普通 chat 路径 strips this via
+    // `process_content_with_thinking`; the web_search loop previously had no equivalent,
+    // so the tags leaked into `text` -> client -> rendered as raw `<thinking>` in the App.
+    let (sniffed_text, sniffed_thinking) = merge_plaintext_thinking(text, thinking);
+    text = sniffed_text;
+    thinking = sniffed_thinking;
 
     RoundOutcome {
         text,
@@ -956,6 +1046,62 @@ mod tests {
     /// Empty short->original tool name map for build_flush_content tests.
     fn nomap() -> std::collections::HashMap<String, String> {
         std::collections::HashMap::new()
+    }
+
+    // ---- merge_plaintext_thinking: web_search loop plaintext <thinking> sniffer ----
+    // Regression for "现象 B": model emits its reasoning as literal `<thinking>...</thinking>`
+    // text in the body; the web_search loop must strip it into the thinking channel (parity
+    // with the普通 chat 路径) so the App renders a folded block, not raw `<thinking>` text.
+
+    #[test]
+    fn sniff_extracts_single_plaintext_thinking_block() {
+        // Real model output ends thinking with a period right before the tag
+        // (`...statements.</thinking>`); the strip MUST handle this (the shared
+        // stream.rs extractor cannot, because `.` is in its QUOTE_CHARS guard).
+        let text = "<thinking>Let me check the import statements.</thinking>\n\nHere is the answer.".to_string();
+        let (out_text, out_thinking) = merge_plaintext_thinking(text, String::new());
+        assert_eq!(out_thinking, "Let me check the import statements.");
+        assert!(!out_text.contains("<thinking>") && !out_text.contains("</thinking>"), "tags must be stripped: {out_text:?}");
+        assert_eq!(out_text, "Here is the answer.", "leading separator consumed: {out_text:?}");
+    }
+
+    #[test]
+    fn sniff_extracts_multiple_plaintext_thinking_blocks() {
+        let text = "<thinking>step one</thinking>\n\nmid\n<thinking>step two</thinking>\n\nend".to_string();
+        let (out_text, out_thinking) = merge_plaintext_thinking(text, String::new());
+        assert!(out_thinking.contains("step one") && out_thinking.contains("step two"), "both blocks: {out_thinking:?}");
+        assert!(!out_text.contains("<thinking>"), "no residual tag: {out_text:?}");
+        assert!(out_text.contains("end"));
+    }
+
+    #[test]
+    fn sniff_does_not_grab_backtick_wrapped_tag() {
+        // A `<thinking>` shown inside backticks is discussion text, not real reasoning —
+        // the shared extractor's quote-guard must leave it in the body.
+        let text = "Use the `<thinking>` tag like this.".to_string();
+        let (out_text, out_thinking) = merge_plaintext_thinking(text.clone(), String::new());
+        assert_eq!(out_thinking, "", "must not misgrab quoted tag");
+        assert_eq!(out_text, text, "body unchanged");
+    }
+
+    #[test]
+    fn sniff_preserves_native_reasoning_and_appends_plaintext() {
+        // Native reasoningContentEvent already filled `thinking`; a plaintext block in the
+        // body must be appended, not dropped, and not clobber the native part.
+        let text = "<thinking>plaintext part</thinking>\n\nanswer".to_string();
+        let (out_text, out_thinking) = merge_plaintext_thinking(text, "native part".to_string());
+        assert!(out_thinking.contains("native part") && out_thinking.contains("plaintext part"), "both kept: {out_thinking:?}");
+        assert!(out_thinking.starts_with("native part"), "native stays first: {out_thinking:?}");
+        assert!(!out_text.contains("<thinking>"));
+        assert!(out_text.contains("answer"));
+    }
+
+    #[test]
+    fn sniff_noop_when_no_thinking_tag() {
+        let text = "just a normal answer with no reasoning tags".to_string();
+        let (out_text, out_thinking) = merge_plaintext_thinking(text.clone(), String::new());
+        assert_eq!(out_thinking, "");
+        assert_eq!(out_text, text);
     }
 
     // ---- should_search_round: hit / skip / limit reached ----
