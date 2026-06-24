@@ -261,17 +261,25 @@ export function ObservabilityPage() {
   // ── Thread 视角面板：搜索 + 排序 ──────────────────────────────
   const [threadQuery, setThreadQuery] = useState('')
   const [threadSort, setThreadSort] = useState<ThreadSortKey>('phase')
+  // SubAgent threads（无 threadName，主 Agent 才有命名）默认隐藏——它们噪声大、不是用户主线关注的对话。
+  const [showSubAgents, setShowSubAgents] = useState(false)
 
   const threadRows = useMemo(() => {
     const all = data?.threads ?? []
     const q = threadQuery.trim().toLowerCase()
+    // ① SubAgent 隐藏：默认只显示有 threadName 的主 Agent thread；
+    //    勾选「显示 SubAgent」或用搜索框时才放进无标题的（搜索时仍按关键词过滤）。
+    const base = showSubAgents
+      ? all
+      : all.filter((t) => !!t.threadName || !!t.pinnedAccountId)
+    // ② 搜索过滤（搜索框非空时，跨全部 thread 含 SubAgent 搜，方便按 UUID 找特定 SubAgent）。
     const filtered = q
       ? all.filter((t) => {
           const name = (t.threadName ?? t.sessionId).toLowerCase()
           const acct = accountLabel(t.boundAccountId, t.accountEmail).toLowerCase()
           return name.includes(q) || acct.includes(q) || t.sessionId.toLowerCase().includes(q)
         })
-      : all.slice()
+      : base.slice()
     filtered.sort((a, b) => {
       if (threadSort === 'phase') {
         const d = phaseSeverity(b.phase) - phaseSeverity(a.phase)
@@ -284,7 +292,13 @@ export function ObservabilityPage() {
       return a.lastSeenMs - b.lastSeenMs
     })
     return filtered
-  }, [data?.threads, threadQuery, threadSort])
+  }, [data?.threads, threadQuery, threadSort, showSubAgents])
+
+  // 当前被隐藏的 SubAgent 数量（给开关旁边显示「(N 个 SubAgent 已隐藏)」）。
+  const hiddenSubAgentCount = useMemo(() => {
+    const all = data?.threads ?? []
+    return all.filter((t) => !t.threadName && !t.pinnedAccountId).length
+  }, [data?.threads])
 
   const stateCounts = useMemo(() => {
     const counts = { healthy: 0, halfOpen: 0, open: 0, disabled: 0 }
@@ -375,6 +389,18 @@ export function ObservabilityPage() {
               Thread 视角 · 绑哪个号 / 当前阶段
             </h2>
             <div className="flex items-center gap-2">
+              <label className="flex select-none items-center gap-1.5 text-[12px] text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={showSubAgents}
+                  onChange={(e) => setShowSubAgents(e.target.checked)}
+                  className="h-3.5 w-3.5 accent-primary"
+                />
+                显示 SubAgent
+                {!showSubAgents && hiddenSubAgentCount > 0 ? (
+                  <span className="text-muted-foreground/60">（{hiddenSubAgentCount} 个已隐藏）</span>
+                ) : null}
+              </label>
               <Input
                 value={threadQuery}
                 onChange={(e) => setThreadQuery(e.target.value)}
