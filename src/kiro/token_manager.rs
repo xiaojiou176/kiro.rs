@@ -842,6 +842,10 @@ struct AffinityBinding {
     /// 会话优先级（越高越重要；影响新绑 / 强制切号时的选号偏好）
     #[serde(default)]
     priority: i32,
+    /// 最近一次被「负载再平衡 / 优先级独享驱逐」搬走时的来源号（防回弹：搬走后不许立刻被再平衡迁回原号）。
+    /// 仅 overflow/OPEN 强制切号可破例清除它。None=从未被搬走。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_evicted_from: Option<u64>,
 }
 
 /// 观测面板：单个号的运行态快照。
@@ -891,6 +895,120 @@ pub struct ObservabilitySnapshot {
     pub global_upstream429_rate5m: f64,
     pub account_state_counts: HashMap<String, usize>,
     pub scheduling_mode: String,
+    /// Thread 视角观测：每个活跃会话（TTL 内）一条，含真名占位 / 绑定号 / 推断相位。
+    /// token_manager 只填「纯账号态」能算出的 base 部分；真名 + trace 相关（Errored/throttle/最终状态）
+    /// 由 handler 层用 `thread_names::resolver()` + `TraceStore::latest_status_by_conversations` 回填。
+    pub threads: Vec<ThreadObservation>,
+}
+
+/// Thread 运行相位（六档，serde 成驼峰小写字面量供前端直接用）。
+///
+/// 语义：除 `Idle` 外，**描述的都是该 thread 当前绑定的那个账号**的状态。
+/// 优先级（高→低）：`Errored > RateLimited > JustMigrated > Queued > Running > Idle`。
+/// 其中 `Errored` 依赖 trace 数据，只能在 handler 层判定；其余五档纯账号态即可算出 base。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ThreadPhase {
+    /// 绑定账号 HEALTHY 且最近有活动（last_seen 很近）。
+    Running,
+    /// 绑定账号熔断打开（OPEN / HALF_OPEN）——被限速。
+    RateLimited,
+    /// 绑定账号 HEALTHY 但在飞已满（inflight >= maxInflight）——排队。
+    Queued,
+    /// 该会话刚因 overflow-on-busy 迁移过号，且仍在迁移防抖窗口内。
+    JustMigrated,
+    /// 该 thread 最近一条 trace 是 error / interrupted（handler 层回填）。
+    Errored,
+    /// 长时间无活动（last_seen 超阈值）且账号不在途。
+    Idle,
+}
+
+/// Thread 视角：单个会话的观测条目（前端 Thread 面板一行）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadObservation {
+    /// 原始 session UUID（== Codex thread id == conversationId）；前端兜底显示用。
+    pub session_id: String,
+    /// thread 真名（从 `~/.codex/session_index.jsonl` 解析）；None 则前端显示截断 UUID。
+    pub thread_name: Option<String>,
+    /// 当前绑定的凭据 id。
+    pub bound_account_id: u64,
+    /// 手动 Pin 的目标凭据 id（None=未 Pin）；前端原生显示「已 Pin #N」，不靠侧 join。
+    pub pinned_account_id: Option<u64>,
+    /// 绑定账号的邮箱（可空）。
+    pub account_email: Option<String>,
+    /// 推断相位（六档）。
+    pub phase: ThreadPhase,
+    /// 距上次活动毫秒（now - last_seen）。
+    pub last_seen_ms: i64,
+    /// 最近一条 trace 累计撞到的上游 429 次数（handler 回填，默认 0）。
+    pub recent_throttle_count: u32,
+    /// 最近一条 trace 的最终状态（success/error/interrupted）；handler 回填，默认 None。
+    pub last_final_status: Option<String>,
+    /// 绑定建立时间（RFC3339）。
+    pub bound_at: String,
+}
+
+/// 推断 thread 的 base 相位（**纯账号态**，不含 trace，可独立单测）。
+///
+/// 优先级：`RateLimited > JustMigrated > Queued > Running > Idle`
+/// （`Errored` 由 trace 决定、优先级最高，在 [`phase_with_trace`] 里叠加）。
+///
+/// 参数：
+/// - `state`：绑定账号熔断态；
+/// - `current_inflight` / `current_max_inflight`：账号在飞 / 上限；
+/// - `last_seen_ms`：距上次活动毫秒；
+/// - `last_switch_was_overflow`：最近一次切号是否由 overflow 触发；
+/// - `last_switch_age_ms`：距上次切号毫秒（`None` = 从未切过）；
+/// - `migrate_debounce_ms`：overflow 迁移防抖窗口；
+/// - `idle_threshold_ms`：判定 Idle 的无活动阈值。
+///
+/// 说明：`Disabled` 账号不属于这六档语义里「正常绑定」的任何一种，
+/// 会落到 Queued（若在飞满）/ Idle（久无活动）/ Running（刚有活动）兜底——
+/// 实践中 disabled 号几乎不会持有 TTL 内的活跃绑定，这是边界兜底而非主路径。
+pub fn infer_base_phase(
+    state: AccountState,
+    current_inflight: usize,
+    current_max_inflight: usize,
+    last_seen_ms: i64,
+    last_switch_was_overflow: bool,
+    last_switch_age_ms: Option<i64>,
+    migrate_debounce_ms: i64,
+    idle_threshold_ms: i64,
+) -> ThreadPhase {
+    // 1) RateLimited：绑定账号熔断打开。
+    if matches!(state, AccountState::Open | AccountState::HalfOpen) {
+        return ThreadPhase::RateLimited;
+    }
+    // 2) JustMigrated：刚因 overflow 迁移、仍在防抖窗口内。
+    if last_switch_was_overflow {
+        if let Some(age) = last_switch_age_ms {
+            if age >= 0 && age < migrate_debounce_ms {
+                return ThreadPhase::JustMigrated;
+            }
+        }
+    }
+    // 3) Queued：账号在飞已满。
+    if current_max_inflight > 0 && current_inflight >= current_max_inflight {
+        return ThreadPhase::Queued;
+    }
+    // 4) Idle：久无活动且账号不在途。
+    if last_seen_ms > idle_threshold_ms && current_inflight == 0 {
+        return ThreadPhase::Idle;
+    }
+    // 5) Running：默认（HEALTHY 且最近有活动）。
+    ThreadPhase::Running
+}
+
+/// 在 base 相位上叠加 trace 判定：最近一条 trace 是 error/interrupted → `Errored`（最高优先级，压过一切）。
+/// `trace_status` 为 None（无 trace / trace 关闭）时原样返回 base。
+pub fn phase_with_trace(base: ThreadPhase, trace_status: Option<&str>) -> ThreadPhase {
+    if let Some(s) = trace_status {
+        if s == "error" || s == "interrupted" {
+            return ThreadPhase::Errored;
+        }
+    }
+    base
 }
 
 // ============================================================================
@@ -1517,6 +1635,9 @@ impl MultiTokenManager {
         let mut session_to_account: HashMap<String, u64> = HashMap::new();
         let mut session_priority: HashMap<String, i32> = HashMap::new();
         let mut active_session_total = 0usize;
+        // Thread 视角原料：每条 TTL 内绑定的原始时间/迁移信息（base 相位推断用）。
+        // (session_id, credential_id, last_seen_ms, bound_at_rfc3339, last_switch_was_overflow, last_switch_age_ms)
+        let mut thread_raws: Vec<(String, u64, i64, String, bool, Option<i64>)> = Vec::new();
         {
             let aff = self.affinity.lock();
             for (sid, b) in aff.iter() {
@@ -1530,6 +1651,16 @@ impl MultiTokenManager {
                     *active_counts.entry(b.credential_id).or_default() += 1;
                     active_session_total += 1;
                 }
+                let last_seen_ms = (now - b.last_seen).num_milliseconds();
+                let last_switch_age_ms = b.last_switch_at.map(|t| (now - t).num_milliseconds());
+                thread_raws.push((
+                    sid.clone(),
+                    b.credential_id,
+                    last_seen_ms,
+                    b.bound_at.to_rfc3339(),
+                    b.last_switch_was_overflow,
+                    last_switch_age_ms,
+                ));
             }
         }
 
@@ -1542,8 +1673,43 @@ impl MultiTokenManager {
             }
         }
 
+        // 2c) 三源并集补全 Thread 视角：affinity 已收上面；这里补「被 Pin 但当前无 affinity 绑定」
+        //     和「设了优先级但无绑定」的会话——否则它们在 Thread 面板里彻底消失（用户看着「Pin 没用」）。
+        //     synthetic 条目用 last_seen_ms = i64::MAX 当「该会话自身从未活动」哨兵；构建相位时强制 inflight=0
+        //     → 默认落 Idle；但若 pin 目标账号本身 OPEN/熔断，会如实显示 RateLimited（这对用户有用，不是错）。
+        //     bound_account_id 取 pin 目标号（无 pin 取 0，acct_index 查不到→当 Healthy 兜底）。
+        {
+            let mut seen: std::collections::HashSet<String> =
+                thread_raws.iter().map(|(s, ..)| s.clone()).collect();
+            // 先 pin-only，再 priority-only（pin 目标号优先作为展示绑定）。
+            for (sid, pin_id) in pinned_sessions.iter() {
+                if seen.insert(sid.clone()) {
+                    thread_raws.push((
+                        sid.clone(),
+                        *pin_id,
+                        i64::MAX,
+                        String::new(),
+                        false,
+                        None,
+                    ));
+                }
+            }
+            for sid in session_priority.keys() {
+                if seen.insert(sid.clone()) {
+                    thread_raws.push((
+                        sid.clone(),
+                        0,
+                        i64::MAX,
+                        String::new(),
+                        false,
+                        None,
+                    ));
+                }
+            }
+        }
+
         // 3) 逐号聚合 RPM + limiter（不在持 affinity 锁期间调用）。
-        let accounts = accounts_base
+        let accounts: Vec<AccountObservability> = accounts_base
             .into_iter()
             .map(|(id, email, disabled)| {
                 let scope = ThrottleScope::UserCredential(id);
@@ -1598,6 +1764,56 @@ impl MultiTokenManager {
             })
             .collect();
 
+        // 4) Thread 视角：用上面已算好的 accounts（含 state / inflight / email）+ 原始绑定信息，
+        //    推断每个会话的 base 相位（纯账号态，trace 相关字段留给 handler 回填）。
+        let acct_index: HashMap<u64, &AccountObservability> =
+            accounts.iter().map(|a| (a.id, a)).collect();
+        let migrate_debounce_ms =
+            (ma.overflow_on_busy.migrate_debounce_secs as i64).saturating_mul(1000);
+        // Idle 阈值固定 60s（spec）。
+        const IDLE_THRESHOLD_MS: i64 = 60_000;
+        let mut threads: Vec<ThreadObservation> = thread_raws
+            .into_iter()
+            .map(
+                |(sid, cred_id, last_seen_ms, bound_at, switch_overflow, switch_age_ms)| {
+                    let acct = acct_index.get(&cred_id);
+                    let state = acct.map(|a| a.state).unwrap_or(AccountState::Healthy);
+                    // 合成会话（pin-only / priority-only，无 affinity 绑定）用 last_seen_ms==MAX 哨兵标识：
+                    // 它自己没有在途请求，不能借绑定账号的 inflight 判 Queued（否则账号一忙就误显「排队中」）。
+                    // 强制 inflight=0 → 走 Idle 分支（它确实从未活动）。
+                    let is_synthetic = last_seen_ms == i64::MAX;
+                    let inflight = if is_synthetic { 0 } else { acct.map(|a| a.current_inflight).unwrap_or(0) };
+                    let max_inflight = if is_synthetic { 0 } else { acct.map(|a| a.current_max_inflight).unwrap_or(0) };
+                    let email = acct.and_then(|a| a.email.clone());
+                    let pinned_account_id = pinned_sessions.get(&sid).copied();
+                    let phase = infer_base_phase(
+                        state,
+                        inflight,
+                        max_inflight,
+                        last_seen_ms,
+                        switch_overflow,
+                        switch_age_ms,
+                        migrate_debounce_ms,
+                        IDLE_THRESHOLD_MS,
+                    );
+                    ThreadObservation {
+                        session_id: sid,
+                        thread_name: None, // handler 回填真名
+                        bound_account_id: cred_id,
+                        pinned_account_id,
+                        account_email: email,
+                        phase,
+                        last_seen_ms,
+                        recent_throttle_count: 0, // handler 回填
+                        last_final_status: None,  // handler 回填
+                        bound_at,
+                    }
+                },
+            )
+            .collect();
+        // 稳定排序：按 session_id，便于前端 diff / 测试可重复。
+        threads.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+
         let scheduling_mode = if ma.enabled {
             "multi_account_affinity".to_string()
         } else {
@@ -1620,6 +1836,7 @@ impl MultiTokenManager {
                 .map(|(s, c)| (format!("{s:?}"), c))
                 .collect(),
             scheduling_mode,
+            threads,
         }
     }
 
@@ -1805,6 +2022,28 @@ impl MultiTokenManager {
             .is_account_open(&ThrottleScope::UserCredential(id))
     }
 
+    /// 该号当前是否「可被手动 Pin」：必须 **存在、未禁用、且未处于限流/熔断(OPEN/HALF_OPEN)**。
+    /// 供 admin pin 入口校验——不健康的号不允许 Pin（避免 pin 上去也只会软回退、形同虚设）。
+    ///
+    /// 返回 `Err(原因)` 说明为何不能 pin；`Ok(())` 表示可 pin。
+    pub fn check_pinnable(&self, id: u64) -> Result<(), String> {
+        // 1) 号必须存在 + 2) 未被禁用（在锁内取所需标志，不 clone 整个 entry）。
+        let exists_and_disabled = {
+            let entries = self.entries.lock();
+            entries.iter().find(|e| e.id == id).map(|e| e.disabled)
+        };
+        match exists_and_disabled {
+            None => return Err(format!("凭据 #{id} 不存在")),
+            Some(true) => return Err(format!("凭据 #{id} 已被禁用，不能 Pin")),
+            Some(false) => {}
+        }
+        // 3) 未处于限流/熔断（OPEN / HALF_OPEN）
+        if self.is_account_open(id) {
+            return Err(format!("凭据 #{id} 正被限流/熔断（静养中），暂不能 Pin"));
+        }
+        Ok(())
+    }
+
     fn rpm(&self, id: u64) -> usize {
         let now = Instant::now();
         let mut win = self.request_window.lock();
@@ -1860,6 +2099,12 @@ impl MultiTokenManager {
         exclude: Option<u64>,
         prefer_healthy: bool,
     ) -> Option<(u64, KiroCredentials)> {
+        // 预算各号「绑定会话存量(含睡眠)」一次：避免把新活全压到「RPM=0 但挂了一堆睡眠会话」的号上
+        // （那种号一旦睡眠会话集体唤醒会瞬间打满）。作为 RPM 之后的排序维度（RPM 平局时按绑定存量少的优先）。
+        let ttl = Duration::seconds(
+            self.config.adaptive_limit.multi_account.affinity_ttl_secs as i64,
+        );
+        let bound_counts = self.bound_session_counts(available, ttl);
         available
             .iter()
             .filter(|(id, _)| Some(*id) != exclude)
@@ -1881,7 +2126,8 @@ impl MultiTokenManager {
                 } else {
                     0
                 };
-                (headroom, cd_ms, self.rpm(*id), c.priority, *id)
+                let bound = *bound_counts.get(id).unwrap_or(&0);
+                (headroom, cd_ms, self.rpm(*id), bound, c.priority, *id)
             })
             .map(|(id, c)| (*id, c.clone()))
     }
@@ -1949,13 +2195,354 @@ impl MultiTokenManager {
         counts
     }
 
+    /// 统计各号「绑定会话数」：affinity map 中 `last_seen` 在 `ttl` 内（含睡着的）、且绑到 `available` 内号的会话。
+    /// 与 `active_session_counts` 的区别：这里统计 **TTL 内全部绑定（含睡眠）**，用于「睡眠会话堆弱号」的提前疏散，
+    /// 不只看 5 分钟活跃窗口。只读 affinity 快照，不调 rpm/limiters（避免锁交叉）。
+    fn bound_session_counts(
+        &self,
+        available: &[(u64, KiroCredentials)],
+        ttl: Duration,
+    ) -> HashMap<u64, usize> {
+        let now = Utc::now();
+        let mut counts: HashMap<u64, usize> = available.iter().map(|(id, _)| (*id, 0)).collect();
+        let aff = self.affinity.lock();
+        for b in aff.values() {
+            if (now - b.last_seen) <= ttl {
+                if let Some(c) = counts.get_mut(&b.credential_id) {
+                    *c += 1;
+                }
+            }
+        }
+        counts
+    }
+
+    /// 后台主动巡检调度器：不依赖 Thread 自己发请求，**主动**把「压力最小/睡眠会话」从过载号疏散到最空号。
+    /// 根治 reviewer 揪出的盲点：被动路径下睡眠会话永不被挪、肇事 Thread 赖着原号。
+    ///
+    /// 设计（owner 拍板「平时轻度均衡 + 边搬边重算逐个分散」）：**每 tick 最多迁 1 个会话**，迁完下个 tick
+    /// 重新算全局快照——温和、自纠正、不一次性把空号填爆。优先级栈：Pin（跳过被 pin 会话）> overflow/OPEN
+    /// 紧急（rebalance_target 内已排除 OPEN 目标）> RPM 均衡 > bound 睡眠疏散 > 会话数均衡。
+    /// 返回本 tick 迁移的会话数（0 或 1）。
+    pub fn rebalance_tick(&self) -> usize {
+        let ma = &self.config.adaptive_limit.multi_account;
+        // 总闸：未开多号、或巡检关 → 不动（owner 红线：默认行为零变化）。
+        if !ma.enabled || ma.scheduler_tick_secs == 0 {
+            return 0;
+        }
+        // 优先级栈：先跑「优先级独享」（最高优先 active 会话拿最优号、赶低优先），再跑温和均衡。
+        // 每 tick 最多一个动作——独享有动作就先做、本 tick 不再跑均衡（下个 tick 重算）。
+        // ⚠️ exclusive 独立闸门（Reviewer Finding #4）：只要存在 priority>0 会话就跑，**不挂在
+        // rebalance_signal_enabled 上**——否则 owner「只要独享、关掉被动均摊」(四 gap 全 0) 会顺带杀掉独享。
+        if self.exclusive_tick() > 0 {
+            return 1;
+        }
+        // 温和均衡：四个 rebalance 信号全关时才跳过（独享已在上面跑过）。
+        if !Self::rebalance_signal_enabled(ma) {
+            return 0;
+        }
+        let pool = self.available_credentials(None, None);
+        if pool.len() < 2 {
+            return 0;
+        }
+        // 独享归属号（当前 TTL 内绑有 priority>0 会话的号）：温和均衡的目标号**必须排除**它们，
+        // 否则会把普通 squatter 搬进独享号、下个 tick exclusive 又赶走 = 反向 churn（Reviewer Finding #2）。
+        let exclusive_owned = self.exclusive_owned_accounts();
+        // 阶段一（不持 affinity 锁）：把所有「想卸载」的源号按 RPM 降序排出候选序列。rebalance_target
+        // 内部会锁 affinity/limiters，故此处绝不持 affinity 锁（防锁交叉死锁）。
+        let mut candidates: Vec<(u64, u64, usize)> = Vec::new(); // (src, target, src_rpm)
+        for (src, _) in &pool {
+            if let Some((target, _)) =
+                self.rebalance_target_excl(&pool, *src, ma, None, &exclusive_owned)
+            {
+                candidates.push((*src, target, self.rpm(*src)));
+            }
+        }
+        // RPM 高的源优先卸载；但**不止试最忙那个**——它若没可搬会话（全 pin/全高优先/全防抖），
+        // 回退到次忙的源（修 Reviewer Finding #1 队头阻塞活锁）。
+        candidates.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        let pinned = self.pinned_sessions();
+        let now = Utc::now();
+        let debounce = Duration::seconds(ma.switch_debounce_secs as i64);
+        // 阶段二（持 affinity 锁）：依次试每个候选源，找到第一个有可搬会话的 (src, target, victim)。
+        let mut chosen: Option<(String, u64, u64, i32)> = None; // (sid, src, target, prio)
+        {
+            let aff = self.affinity.lock();
+            'outer: for (src, target, _) in &candidates {
+                let mut victim: Option<(String, i32)> = None;
+                let mut oldest = now;
+                for (sid, b) in aff.iter() {
+                    if b.credential_id != *src {
+                        continue;
+                    }
+                    if pinned.contains_key(sid) {
+                        continue; // Pin 凌驾一切，不被巡检搬
+                    }
+                    if b.priority > 0 {
+                        continue; // 高优先会话只由 exclusive_tick 管，温和均衡绝不碰（防乒乓，Reviewer 向量6）
+                    }
+                    if b.last_evicted_from == Some(*target) {
+                        continue; // 防回弹：刚从 target 搬来，不许立刻搬回
+                    }
+                    if let Some(ls) = b.last_switch_at {
+                        if (now - ls) < debounce {
+                            continue; // 切号防抖窗口内，不搬
+                        }
+                    }
+                    // 压力最小 = last_seen 最老（最久没活动 / 睡得最沉）。
+                    if victim.is_none() || b.last_seen < oldest {
+                        oldest = b.last_seen;
+                        victim = Some((sid.clone(), b.priority));
+                    }
+                }
+                if let Some((sid, prio)) = victim {
+                    chosen = Some((sid, *src, *target, prio));
+                    break 'outer;
+                }
+            }
+        }
+        // 阶段三（重取 affinity 锁落定迁移）：二次确认会话仍绑在 src，再改 credential_id。
+        if let Some((sid, src, target, prio)) = chosen {
+            let mut aff = self.affinity.lock();
+            if let Some(b) = aff.get_mut(&sid) {
+                // 二次确认仍绑在 src（期间可能被并发改动）
+                if b.credential_id == src
+                    && !pinned.contains_key(&sid)
+                    && b.last_evicted_from != Some(target)
+                {
+                    b.credential_id = target;
+                    b.last_switch_at = Some(now);
+                    b.last_switch_was_overflow = false;
+                    b.last_evicted_from = Some(src);
+                    drop(aff);
+                    self.save_affinity_debounced();
+                    Self::log_select(
+                        "scheduler_rebalance",
+                        target,
+                        self.rpm(target),
+                        0,
+                        Some(&sid),
+                        prio,
+                    );
+                    return 1;
+                }
+            }
+        }
+        0
+    }
+
+    /// 返回「当前被 **active** 高优先会话独享」的号集合。温和均衡的目标号要排除它们，
+    /// 防止把普通 squatter 搬进独享号、下个 tick exclusive 又赶走 = 反向 churn（Reviewer Finding #2）。
+    ///
+    /// ⚠️ 只算 **active**（idle ≤ exclusive_borrow_idle_secs）的高优先会话——**睡着的高优先号故意不算**，
+    /// 这样它睡着时普通会话能被均衡进去「借号」用（owner 规则：睡>借号阈值就借出、不浪费全局吞吐）；
+    /// 它一醒变 active，下个 tick 这个号就重新进集合、exclusive_tick 把蹭进来的普通会话赶走（夺回）。
+    fn exclusive_owned_accounts(&self) -> std::collections::HashSet<u64> {
+        let ma = &self.config.adaptive_limit.multi_account;
+        let borrow_idle = ma.exclusive_borrow_idle_secs as i64;
+        let now = Utc::now();
+        let aff = self.affinity.lock();
+        aff.values()
+            .filter(|b| b.priority > 0 && (now - b.last_seen).num_seconds() <= borrow_idle)
+            .map(|b| b.credential_id)
+            .collect()
+    }
+
+    /// 账号「真实安全上界」learned_safe_rps_hi（天花板），无 limiter 数据返回 0。用于独享挑「天花板最高的号」。
+    fn account_safe_rps_hi(&self, id: u64) -> f64 {
+        self.limiters
+            .observe_full(&ThrottleScope::UserCredential(id))
+            .map(|o| o.learned_safe_rps_hi)
+            .unwrap_or(0.0)
+    }
+
+    /// 账号余量比例 = (safe_rps_hi − current_rate) / safe_rps_hi。越大越空闲（1=全空，≤0=贴墙/过载）。
+    /// 用于独享「活跃留富余才让低负载普通会话蹭」的判定。无 limiter 数据返回 1.0（视为全空）。
+    fn account_headroom_ratio(&self, id: u64) -> f64 {
+        match self.limiters.observe_full(&ThrottleScope::UserCredential(id)) {
+            Some(o) => {
+                let hi = o.learned_safe_rps_hi.max(1e-6);
+                ((hi - o.current_rate_rps) / hi).clamp(0.0, 1.0)
+            }
+            None => 1.0,
+        }
+    }
+
+    /// 优先级独享一步（rebalance_tick 内最先跑，每 tick 最多一个动作）。
+    /// 目的（owner 拍板）：**最大化高优先 Thread 吞吐**，「独享」是手段不是目的——
+    /// 高优先 active 会话拿「天花板最高/最空」的号；号产能不够富余时赶走低优先 squatter（活跃留富余才让蹭）；
+    /// 高优先 sleeping（空闲超 borrow 阈值）则**不赶**低优先（借号=不浪费全局吞吐）；
+    /// 独享号 OPEN/熔断时高优先会话自然在「挑最优号」一步被迁到新健康号（级联）。
+    /// 优先级栈：Pin 凌驾一切（被 pin 会话不动、其号视为已占）。返回本步动作数（0 或 1）。
+    fn exclusive_tick(&self) -> usize {
+        let ma = &self.config.adaptive_limit.multi_account;
+        // 自带 enabled 门（防未来新增调用者绕过 rebalance_tick 的总闸）：未开多号绝不跑独享调度。
+        if !ma.enabled {
+            return 0;
+        }
+        let pool = self.available_credentials(None, None);
+        if pool.len() < 2 {
+            return 0;
+        }
+        let pinned = self.pinned_sessions();
+        let now = Utc::now();
+        let borrow_idle = ma.exclusive_borrow_idle_secs as i64;
+        // 独享迁移用 reclaim_debounce_secs（专门防「醒来夺回→又睡→又借」抖动，Reviewer Finding #3）；
+        // 它若设 0 则回退到通用 switch_debounce_secs（不至于完全无防抖）。
+        let reclaim_debounce = Duration::seconds(
+            if ma.reclaim_debounce_secs > 0 {
+                ma.reclaim_debounce_secs
+            } else {
+                ma.switch_debounce_secs
+            } as i64,
+        );
+        // 快照高优先会话（priority>0），按 priority 降序（数字大=更优先）、再 active 优先、再 key 稳定。
+        let mut high_pri: Vec<(String, AffinityBinding)> = {
+            let aff = self.affinity.lock();
+            aff.iter()
+                .filter(|(_, b)| b.priority > 0)
+                .map(|(k, b)| (k.clone(), b.clone()))
+                .collect()
+        };
+        if high_pri.is_empty() {
+            return 0;
+        }
+        high_pri.sort_by(|(ka, a), (kb, b)| {
+            b.priority
+                .cmp(&a.priority)
+                .then(a.last_seen.cmp(&b.last_seen).reverse())
+                .then(ka.cmp(kb))
+        });
+        // 已被「更高/同等优先 + Pin」占用的号（处理顺序靠前者先占，靠后者避开）。
+        let mut reserved: std::collections::HashSet<u64> = pinned.values().copied().collect();
+        for (sid, b) in &high_pri {
+            if pinned.contains_key(sid) {
+                reserved.insert(b.credential_id);
+                continue; // Pin 凌驾优先级，pin 会话不参与独享调度，其号视为已占
+            }
+            let idle = (now - b.last_seen).num_seconds();
+            let active = idle <= borrow_idle;
+            if !active {
+                // sleeping：借号给普通会话——不赶 squatter、不抢占新号，留给后续 tick / 唤醒后处理。
+                continue;
+            }
+            // 挑「天花板最高 + 最空」的理想号：排除 reserved/pinned-occupied/OPEN。
+            // 防回弹（Reviewer Finding #5）：在 reclaim_debounce 窗口内，排除「刚把本会话搬离的源号」
+            // (last_evicted_from)，否则等天花板号场景下 ideal 会在 A↔B 之间每个 debounce 翻一次（永动）。
+            let exclude_bounce = match (b.last_evicted_from, b.last_switch_at) {
+                (Some(from), Some(ls)) if (now - ls) < reclaim_debounce => Some(from),
+                _ => None,
+            };
+            let ideal = pool
+                .iter()
+                .map(|(id, _)| *id)
+                .filter(|id| !reserved.contains(id))
+                .filter(|id| Some(*id) != exclude_bounce)
+                .filter(|id| !self.is_account_open(*id))
+                .max_by(|a, c| {
+                    self.account_safe_rps_hi(*a)
+                        .partial_cmp(&self.account_safe_rps_hi(*c))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        // ⚠️ 不把 rpm 放进独享 tiebreak（修真永动·第二轮 Reviewer 反例3）：rpm 会"跟着会话走"
+                        // ——P 迁到哪、哪的 rpm 就升 → 若按 rpm 选 ideal 会 A↔B 反复翻。独享只认「天花板最高」，
+                        // 天花板相等时按 **id 稳定**选（小 id 优），确定性、零 churn；号上的竞争由下面赶 squatter 清。
+                        .then(c.cmp(a)) // id 小者更优（max_by 里 reverse：小 id 视为"更大/更优"）
+                });
+            let target = match ideal {
+                Some(t) => t,
+                None => continue, // 没有可用理想号（全被占/全 OPEN）→ 高优先间共享，跳过
+            };
+            // ① 高优先不在理想号 → 迁过去（含级联：原号 OPEN 时理想号必是别的健康号）。
+            if b.credential_id != target {
+                // 防抖：刚切过的不立刻再切。
+                let in_debounce = b
+                    .last_switch_at
+                    .map(|t| (now - t) < reclaim_debounce)
+                    .unwrap_or(false);
+                if !in_debounce {
+                    let mut aff = self.affinity.lock();
+                    if let Some(bb) = aff.get_mut(sid) {
+                        let from = bb.credential_id;
+                        bb.credential_id = target;
+                        bb.last_switch_at = Some(now);
+                        bb.last_switch_was_overflow = false;
+                        bb.last_evicted_from = Some(from);
+                        drop(aff);
+                        self.save_affinity_debounced();
+                        Self::log_select(
+                            "exclusive_acquire",
+                            target,
+                            self.rpm(target),
+                            0,
+                            Some(sid),
+                            b.priority,
+                        );
+                        return 1;
+                    }
+                }
+            }
+            // 高优先已在理想号 → 占住它。
+            reserved.insert(target);
+            // ② 减少竞争：仅当号「不够富余」(headroom ≤ ratio) 时，赶走该号上「最活跃的」低优先 squatter。
+            //    富余够（headroom > ratio）则允许低负载普通会话蹭（owner：活跃留富余才让蹭）。
+            if self.account_headroom_ratio(target) > ma.exclusive_headroom_ratio {
+                continue;
+            }
+            // 找该号上 priority==0 的 squatter，挑「最活跃(last_seen 最新)」的赶走（它最占竞争）。
+            let victim: Option<String> = {
+                let aff = self.affinity.lock();
+                aff.iter()
+                    .filter(|(vk, vb)| {
+                        vb.credential_id == target
+                            && vb.priority == 0
+                            && !pinned.contains_key(*vk)
+                    })
+                    .max_by_key(|(_, vb)| vb.last_seen)
+                    .map(|(vk, _)| vk.clone())
+            };
+            if let Some(vk) = victim {
+                // 把 squatter 赶到「最空的别的号」（排除 target/reserved/OPEN）。
+                let dest = pool
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .filter(|id| *id != target && !reserved.contains(id) && !self.is_account_open(*id))
+                    .min_by_key(|id| (self.rpm(*id), *id));
+                if let Some(dest) = dest {
+                    let mut aff = self.affinity.lock();
+                    if let Some(vb) = aff.get_mut(&vk) {
+                        if vb.credential_id == target && vb.priority == 0 {
+                            vb.credential_id = dest;
+                            vb.last_switch_at = Some(now);
+                            vb.last_switch_was_overflow = false;
+                            vb.last_evicted_from = Some(target);
+                            drop(aff);
+                            self.save_affinity_debounced();
+                            Self::log_select(
+                                "exclusive_evict",
+                                dest,
+                                self.rpm(dest),
+                                0,
+                                Some(&vk),
+                                0,
+                            );
+                            return 1;
+                        }
+                    }
+                }
+            }
+        }
+        0
+    }
+
     /// 被动负载再平衡是否启用：利用率信号 或 会话数信号 任一开启即启用（P2-b）。
     /// 抽成纯函数便于单测，并消除调用门处的内联布尔魔法。
     /// - util_gap > 0 → 利用率信号开（rebalance_target 内 util 分支优先）；
     /// - min_gap > 0 → 会话数信号开（util 未触发时的 fallback）；
     /// - 两者都 0 → 完全关闭被动再平衡。
     fn rebalance_signal_enabled(ma: &crate::model::config::MultiAccountConfig) -> bool {
-        ma.rebalance_utilization_gap > 0.0 || ma.rebalance_min_gap > 0
+        ma.rebalance_rpm_gap > 0.0
+            || ma.rebalance_utilization_gap > 0.0
+            || ma.rebalance_bound_gap > 0
+            || ma.rebalance_min_gap > 0
     }
 
     /// 被动负载再平衡：若 `current` 号的活跃会话数比最空号多 ≥ `rebalance_min_gap`，
@@ -1966,9 +2553,45 @@ impl MultiTokenManager {
         available: &[(u64, KiroCredentials)],
         current: u64,
         ma: &crate::model::config::MultiAccountConfig,
+        exclude_evicted: Option<u64>,
+    ) -> Option<(u64, KiroCredentials)> {
+        // 兼容旧调用（无独享归属号视图）：转发到带排除集的全量版本。
+        let empty: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        self.rebalance_target_excl(available, current, ma, exclude_evicted, &empty)
+    }
+
+    /// `rebalance_target` 的全量版本：额外排除 `exclude_owned`（独享归属号）当迁移目标，
+    /// 防止温和均衡把普通 squatter 搬进独享号引发反向 churn（Reviewer Finding #2）。
+    fn rebalance_target_excl(
+        &self,
+        available: &[(u64, KiroCredentials)],
+        current: u64,
+        ma: &crate::model::config::MultiAccountConfig,
+        exclude_evicted: Option<u64>,
+        exclude_owned: &std::collections::HashSet<u64>,
     ) -> Option<(u64, KiroCredentials)> {
         if available.len() < 2 {
             return None;
+        }
+        // ⓪ RPM 纯负载信号（修「忙但没撞墙」盲区，第一优先级，**不挂 util 的 SATURATED 门**）。
+        //    根因：原有 util 信号要 cur_util≥1.0 才触发，而号「发得勤(rpm 高)但没真撞墙(cd=0/429=0)」
+        //    时 util 不到 1.0 → 永远不迁 → 会话黏死。这里直接比真实 RPM：本号 rpm 比全局最空号高出
+        //    rebalance_rpm_gap 就迁到最空号（最空=rpm 最低，平局按 priority/id 稳定）。
+        if ma.rebalance_rpm_gap > 0.0 {
+            let cur_rpm = self.rpm(current) as f64;
+            if let Some((tid, tcreds)) = available
+                .iter()
+                .filter(|(id, _)| *id != current)
+                .filter(|(id, _)| Some(*id) != exclude_evicted)
+                .filter(|(id, _)| !exclude_owned.contains(id))
+                .filter(|(id, _)| !self.is_account_open(*id))
+                .min_by_key(|(id, _)| (self.rpm(*id), *id))
+            {
+                let target_rpm = self.rpm(*tid) as f64;
+                if cur_rpm - target_rpm >= ma.rebalance_rpm_gap {
+                    return Some((*tid, tcreds.clone()));
+                }
+            }
         }
         // ① 利用率信号（Task 7 根治：会话数 ≠ 真实负载）。利用率 = current_rate / safe_rps_hi
         //    （≥1=贴墙/过载，<1=有余量）+ 429 率叠加。一个号会话少但每个都在撞墙(利用率高)，
@@ -1983,6 +2606,9 @@ impl MultiTokenManager {
                 if let Some((tid, tcreds)) = available
                     .iter()
                     .filter(|(id, _)| *id != current)
+                    .filter(|(id, _)| Some(*id) != exclude_evicted)
+                    .filter(|(id, _)| !exclude_owned.contains(id))
+                    .filter(|(id, _)| !self.is_account_open(*id))
                     .min_by(|(a, _), (b, _)| {
                         self.account_utilization(*a)
                             .partial_cmp(&self.account_utilization(*b))
@@ -1997,7 +2623,27 @@ impl MultiTokenManager {
                 }
             }
         }
-        // ② 会话数信号（回退/补充）：原号活跃会话数比最空号多 ≥ rebalance_min_gap。
+        // ② 绑定数信号（睡眠疏散）：原号 TTL 内绑定会话数（含睡着的）比最空号多 ≥ rebalance_bound_gap。
+        //    专治「睡眠会话堆弱号、唤醒后瞬间打满」——active 窗口看不见睡着的，这里用 bound 计数补。
+        if ma.rebalance_bound_gap > 0 {
+            let ttl = Duration::seconds(ma.affinity_ttl_secs as i64);
+            let bcounts = self.bound_session_counts(available, ttl);
+            let cur_bound = *bcounts.get(&current).unwrap_or(&0);
+            if let Some(target) = available
+                .iter()
+                .filter(|(id, _)| *id != current)
+                .filter(|(id, _)| Some(*id) != exclude_evicted)
+                .filter(|(id, _)| !exclude_owned.contains(id))
+                .filter(|(id, _)| !self.is_account_open(*id))
+                .min_by_key(|(id, c)| (*bcounts.get(id).unwrap_or(&0), c.priority, *id))
+            {
+                let target_bound = *bcounts.get(&target.0).unwrap_or(&0);
+                if cur_bound >= target_bound + ma.rebalance_bound_gap {
+                    return Some((target.0, target.1.clone()));
+                }
+            }
+        }
+        // ③ 会话数信号（回退/补充）：原号活跃会话数比最空号多 ≥ rebalance_min_gap。
         if ma.rebalance_min_gap == 0 {
             return None;
         }
@@ -2008,6 +2654,9 @@ impl MultiTokenManager {
         let target = available
             .iter()
             .filter(|(id, _)| *id != current)
+            .filter(|(id, _)| Some(*id) != exclude_evicted)
+            .filter(|(id, _)| !exclude_owned.contains(id))
+            .filter(|(id, _)| !self.is_account_open(*id))
             .min_by_key(|(id, c)| (*counts.get(id).unwrap_or(&0), c.priority, *id))?;
         let target_load = *counts.get(&target.0).unwrap_or(&0);
         if current_load >= target_load + ma.rebalance_min_gap {
@@ -2144,15 +2793,50 @@ impl MultiTokenManager {
         if all_available.is_empty() {
             return None;
         }
+        // 本会话优先级（决定独享号排除策略）：priority>0 自己就是独享主，迁到自己理想号天经地义、不排除；
+        // priority==0 普通会话**绝不该被任何选号路径甩进 active 高优先独享号**（修第三轮 Reviewer Finding 1：
+        // 反向 churn 不止均衡分支，cd 强切/overflow/OPEN 强切 三条路同样会甩——根因是它们都从 pick_pool 选号，
+        // 所以这里**一次性**把独享号从 pick_pool 软排除，三条路全覆盖；只算一次也修了 Finding 3 的每请求全表扫）。
+        let session_prio_for_pool = {
+            let existing0 = self.affinity.lock().get(session_key.unwrap_or("")).cloned();
+            self.session_priority_for(session_key.unwrap_or(""), existing0.as_ref())
+        };
+        let owned_excl: std::collections::HashSet<u64> = if session_prio_for_pool > 0 {
+            std::collections::HashSet::new()
+        } else {
+            self.exclusive_owned_accounts()
+        };
+        // 健康池：先排 OPEN，再为普通会话**软排除** active 独享号（软=排完若空则回退不排除版，保证有号可用）。
         let healthy_available: Vec<(u64, KiroCredentials)> = all_available
             .iter()
             .filter(|(id, _)| !self.is_account_open(*id))
             .map(|(id, c)| (*id, c.clone()))
             .collect();
-        let pick_pool = if healthy_available.is_empty() {
-            &all_available
-        } else {
+        let healthy_non_excl: Vec<(u64, KiroCredentials)> = healthy_available
+            .iter()
+            .filter(|(id, _)| !owned_excl.contains(id))
+            .map(|(id, c)| (*id, c.clone()))
+            .collect();
+        // pick_pool 优先级：健康且非独享 > 健康 > 全部（全 OPEN 兜底由下游 shortest_cooldown_fallback 处理）。
+        let pick_pool = if !healthy_non_excl.is_empty() {
+            &healthy_non_excl
+        } else if !healthy_available.is_empty() {
             &healthy_available
+        } else {
+            &all_available
+        };
+        // all_available 的「软排除独享号」版本：给各兜底链最后一跳 `lowest_load(&all_available,…)` 用，
+        // 否则普通会话会绕过 pick_pool 的软排除、被甩进 active 独享号（修第四轮 Reviewer Finding 1 corner case：
+        // 兜底链最后一跳漏排 owned_excl）。空时回退 all_available（保证有号可用，软排除语义）。
+        let all_avail_non_excl: Vec<(u64, KiroCredentials)> = all_available
+            .iter()
+            .filter(|(id, _)| !owned_excl.contains(id))
+            .map(|(id, c)| (*id, c.clone()))
+            .collect();
+        let all_pool: &Vec<(u64, KiroCredentials)> = if !all_avail_non_excl.is_empty() {
+            &all_avail_non_excl
+        } else {
+            &all_available
         };
 
         let ma = &self.config.adaptive_limit.multi_account;
@@ -2169,7 +2853,7 @@ impl MultiTokenManager {
             Some(k) if !k.is_empty() => k.to_string(),
             _ => {
                 let pick = self.lowest_load(pick_pool, None).or_else(|| {
-                    self.lowest_load(&all_available, None)
+                    self.lowest_load(all_pool, None)
                 })
                 // M2 全 OPEN 兜底：无会话的纯负载选号同样别在全 OPEN 时返回 None。
                 .or_else(|| self.shortest_cooldown_fallback(&all_available))?;
@@ -2204,6 +2888,22 @@ impl MultiTokenManager {
                         prio,
                     );
                     return Some((pinned_id, creds));
+                    } else {
+                        // pin 目标号正 OPEN/熔断：之前这里静默穿透到普通 affinity 选号、无任何结构化事件，
+                        // owner 从日志/UI 完全看不到「pin 这次被跳过了」。补一条结构化决策日志（与 affinity_pin
+                        // 同事件名、action=pin_skipped_open），让「pin 了却跑别号」可观测、可在 WebUI 看出原因。
+                        let cd = self
+                            .limiters
+                            .cooldown_remaining(&ThrottleScope::UserCredential(pinned_id));
+                        let prio = self.session_priority_for(&key, existing.as_ref());
+                        Self::log_select(
+                            "pin_skipped_open",
+                            pinned_id,
+                            self.rpm(pinned_id),
+                            cd.as_millis() as u64,
+                            Some(&key),
+                            prio,
+                        );
                     }
                 }
                 tracing::warn!(
@@ -2225,14 +2925,16 @@ impl MultiTokenManager {
 
         let pick_from_pool = |exclude: Option<u64>| {
             self.lowest_load_prioritized(pick_pool, exclude, prefer_healthy)
-                .or_else(|| self.lowest_load_prioritized(&all_available, exclude, prefer_healthy))
+                .or_else(|| self.lowest_load_prioritized(all_pool, exclude, prefer_healthy))
                 // M2 全 OPEN 兜底：上面两步会过滤掉 OPEN 号，全 OPEN 时返回 None。
                 // 这里退到「cooldown 最短的号」，保证有号可用而非整体 bail。
                 .or_else(|| self.shortest_cooldown_fallback(&all_available))
         };
 
         // 第 4 元 = 本次切号是否由 overflow 触发（写进 last_switch_was_overflow，供 debounce 区分迁移类型）。
-        let (act, mut chosen, cd_ms, switch_is_overflow) = match &existing {
+        // 第 5 元 = 本次是否「被迫逃离不可用原号」（OPEN/禁用/分组失配）——决策点显式定，**不在落定点重读推导**
+        // （修第三轮 Reviewer Finding 2 的 TOCTOU：原号状态在决策→落定之间可能翻转，反推会错）。
+        let (act, mut chosen, cd_ms, switch_is_overflow, forced_unavailable) = match &existing {
             Some(b) if (now - b.last_seen) <= ttl => {
                 let bound_in_pool = all_available
                     .iter()
@@ -2277,7 +2979,7 @@ impl MultiTokenManager {
                         let cd_pick = cd_overflow_pick.or_else(|| {
                             self.lowest_load(pick_pool, Some(b.credential_id))
                                 .or_else(|| {
-                                    self.lowest_load(&all_available, Some(b.credential_id))
+                                    self.lowest_load(all_pool, Some(b.credential_id))
                                 })
                         });
                         match cd_pick {
@@ -2292,14 +2994,14 @@ impl MultiTokenManager {
                                         session_prio,
                                     );
                                 }
-                                (Act::Switch, pick, cd.as_millis() as u64, cd_is_overflow)
+                                (Act::Switch, pick, cd.as_millis() as u64, cd_is_overflow, false)
                             }
                             None => {
                                 let creds = all_available
                                     .iter()
                                     .find(|(id, _)| *id == b.credential_id)
                                     .map(|(_, c)| c.clone())?;
-                                (Act::Stick, (b.credential_id, creds), cd.as_millis() as u64, false)
+                                (Act::Stick, (b.credential_id, creds), cd.as_millis() as u64, false, false)
                             }
                         }
                     } else {
@@ -2326,7 +3028,15 @@ impl MultiTokenManager {
                             // 故普通切号/rebalance 迁过的会话不受影响——修 Finding A 的误伤面)。
                             && !in_overflow_debounce
                         {
-                            self.rebalance_target(pick_pool, b.credential_id, ma)
+                            // 复用入口算好的 owned_excl（priority==0 才非空）——不再每请求重算（修 Finding 3）。
+                            // pick_pool 本身已软排除独享号，这里再传一份给 rebalance_target_excl 双保险。
+                            self.rebalance_target_excl(
+                                pick_pool,
+                                b.credential_id,
+                                ma,
+                                b.last_evicted_from,
+                                &owned_excl,
+                            )
                         } else {
                             None
                         };
@@ -2342,14 +3052,14 @@ impl MultiTokenManager {
                                         session_prio,
                                     );
                                 }
-                                (Act::Switch, pick, cd.as_millis() as u64, is_overflow)
+                                (Act::Switch, pick, cd.as_millis() as u64, is_overflow, false)
                             }
                             None => {
                                 let creds = all_available
                                     .iter()
                                     .find(|(id, _)| *id == b.credential_id)
                                     .map(|(_, c)| c.clone())?;
-                                (Act::Stick, (b.credential_id, creds), cd.as_millis() as u64, false)
+                                (Act::Stick, (b.credential_id, creds), cd.as_millis() as u64, false, false)
                             }
                         }
                     }
@@ -2363,13 +3073,13 @@ impl MultiTokenManager {
                     }
                     // 原号已不可用（禁用/OPEN/分组等）→ 强制切号；高优先级会话偏好最健康号。
                     let pick = pick_from_pool(None)?;
-                    (Act::Switch, pick, 0, false)
+                    (Act::Switch, pick, 0, false, true)
                 }
             }
             // 无绑定或绑定已过 TTL → 新会话：最低负载落号并绑定。
             _ => {
                 let pick = pick_from_pool(None)?;
-                (Act::NewBind, pick, 0, false)
+                (Act::NewBind, pick, 0, false, false)
             }
         };
 
@@ -2394,11 +3104,15 @@ impl MultiTokenManager {
                                 last_switch_at: None,
                                 last_switch_was_overflow: false,
                                 priority: bind_priority,
+                                last_evicted_from: None,
                             },
                         );
                     }
                 }
                 Act::Switch => {
+                    // 防回弹：记下「从哪个号被搬走」（非 overflow 切号才记——overflow 是逃离撞墙号、
+                    // 本就不该回且有自己的 debounce；OPEN 强制切号同理可破例）。
+                    let prev_id = aff.get(&key).map(|b| b.credential_id);
                     let e = aff.entry(key.clone()).or_insert_with(|| AffinityBinding {
                         credential_id: chosen.0,
                         bound_at: now,
@@ -2406,12 +3120,27 @@ impl MultiTokenManager {
                         last_switch_at: Some(now),
                         last_switch_was_overflow: switch_is_overflow,
                         priority: bind_priority,
+                        last_evicted_from: None,
                     });
                     e.credential_id = chosen.0;
                     e.last_switch_at = Some(now);
                     e.last_switch_was_overflow = switch_is_overflow;
                     e.last_seen = now;
                     e.priority = bind_priority;
+                    if let Some(old) = prev_id {
+                        // 防回弹仅用于「自愿负载搬迁」(cd 强切/rebalance)——记下源号、短期不许搬回。
+                        // 但「逃离不可用号」(overflow 撞墙 / OPEN 熔断 / 禁用/分组失配 = 原号当前不可用)是
+                        // **被迫逃**，原号恢复后本该能回去（尤其高优先要夺回最优主号），故破例**清除**防回弹标记。
+                        // (对齐 last_evicted_from 字段注释「仅 overflow/OPEN 强制切号可破例清除它」。)
+                        // ⚠️ 用决策点定的 forced_unavailable，**不在此处重读 is_account_open**（修 TOCTOU：
+                        // 决策→落定之间原号熔断可能恰好恢复，重读会把「被迫逃」误判成「自愿」、错装 60s 防回弹）。
+                        let old_unavailable = switch_is_overflow || forced_unavailable;
+                        if old != chosen.0 && !old_unavailable {
+                            e.last_evicted_from = Some(old);
+                        } else if old_unavailable {
+                            e.last_evicted_from = None;
+                        }
+                    }
                 }
                 Act::NewBind => {
                     // H3 串号竞态根治（check-and-adopt）：本请求开头读 existing=None 走到这里，
@@ -2457,6 +3186,7 @@ impl MultiTokenManager {
                                 last_switch_at: None,
                                 last_switch_was_overflow: false,
                                 priority: bind_priority,
+                                last_evicted_from: None,
                             },
                         );
                     }
@@ -4702,6 +5432,160 @@ mod tests {
         assert!(is_token_expired(&credentials));
     }
 
+    // ── Thread 视角 base 相位推断真值表（纯账号态，infer_base_phase） ──
+    // 公共默认入参：HEALTHY、不在飞满、刚有活动、没切过号；各用例只改要验证的那一维。
+    const DEBOUNCE_MS: i64 = 60_000;
+    const IDLE_MS: i64 = 60_000;
+
+    #[test]
+    fn phase_open_account_is_rate_limited() {
+        // 账号 OPEN → RateLimited
+        let p = infer_base_phase(
+            AccountState::Open,
+            0,
+            4,
+            100,
+            false,
+            None,
+            DEBOUNCE_MS,
+            IDLE_MS,
+        );
+        assert_eq!(p, ThreadPhase::RateLimited);
+        // HALF_OPEN 同样 RateLimited
+        let p2 = infer_base_phase(
+            AccountState::HalfOpen,
+            0,
+            4,
+            100,
+            false,
+            None,
+            DEBOUNCE_MS,
+            IDLE_MS,
+        );
+        assert_eq!(p2, ThreadPhase::RateLimited);
+    }
+
+    #[test]
+    fn phase_inflight_full_is_queued() {
+        // HEALTHY 但在飞满（inflight >= max）→ Queued
+        let p = infer_base_phase(
+            AccountState::Healthy,
+            4,
+            4,
+            100,
+            false,
+            None,
+            DEBOUNCE_MS,
+            IDLE_MS,
+        );
+        assert_eq!(p, ThreadPhase::Queued);
+    }
+
+    #[test]
+    fn phase_stale_last_seen_is_idle() {
+        // last_seen 距今 > 60s 且不在飞 → Idle
+        let p = infer_base_phase(
+            AccountState::Healthy,
+            0,
+            4,
+            61_000,
+            false,
+            None,
+            DEBOUNCE_MS,
+            IDLE_MS,
+        );
+        assert_eq!(p, ThreadPhase::Idle);
+    }
+
+    #[test]
+    fn phase_recent_healthy_is_running() {
+        // HEALTHY、不在飞满、刚有活动 → Running
+        let p = infer_base_phase(
+            AccountState::Healthy,
+            1,
+            4,
+            500,
+            false,
+            None,
+            DEBOUNCE_MS,
+            IDLE_MS,
+        );
+        assert_eq!(p, ThreadPhase::Running);
+    }
+
+    #[test]
+    fn phase_overflow_recent_switch_is_just_migrated() {
+        // last_switch_was_overflow + 切号距今 < 防抖窗口 → JustMigrated
+        let p = infer_base_phase(
+            AccountState::Healthy,
+            0,
+            4,
+            100,
+            true,
+            Some(5_000),
+            DEBOUNCE_MS,
+            IDLE_MS,
+        );
+        assert_eq!(p, ThreadPhase::JustMigrated);
+        // 切号已超过防抖窗口 → 不再 JustMigrated，退回 Running
+        let p2 = infer_base_phase(
+            AccountState::Healthy,
+            0,
+            4,
+            100,
+            true,
+            Some(120_000),
+            DEBOUNCE_MS,
+            IDLE_MS,
+        );
+        assert_eq!(p2, ThreadPhase::Running);
+    }
+
+    #[test]
+    fn phase_rate_limited_beats_just_migrated_and_queued() {
+        // 优先级验证：账号 OPEN 同时「刚 overflow 迁移」「在飞满」→ 仍应是 RateLimited（最高的 base 档）。
+        let p = infer_base_phase(
+            AccountState::Open,
+            4,
+            4,
+            100,
+            true,
+            Some(1_000),
+            DEBOUNCE_MS,
+            IDLE_MS,
+        );
+        assert_eq!(p, ThreadPhase::RateLimited);
+    }
+
+    #[test]
+    fn phase_trace_error_overrides_and_beats_rate_limited() {
+        // trace 最近一条 error → Errored，且压过 RateLimited（验最高优先级）。
+        let base = infer_base_phase(
+            AccountState::Open, // base 会算成 RateLimited
+            0,
+            4,
+            100,
+            false,
+            None,
+            DEBOUNCE_MS,
+            IDLE_MS,
+        );
+        assert_eq!(base, ThreadPhase::RateLimited);
+        assert_eq!(
+            phase_with_trace(base, Some("error")),
+            ThreadPhase::Errored,
+            "error trace 应压过 RateLimited"
+        );
+        assert_eq!(
+            phase_with_trace(base, Some("interrupted")),
+            ThreadPhase::Errored,
+            "interrupted 同样判 Errored"
+        );
+        // success / None 不改 base。
+        assert_eq!(phase_with_trace(base, Some("success")), ThreadPhase::RateLimited);
+        assert_eq!(phase_with_trace(base, None), ThreadPhase::RateLimited);
+    }
+
     // ── B1: 个人 Builder ID profileArn 解析「确定性不支持 vs 瞬态错」区分 ──
     #[test]
     fn definitive_unsupported_true_on_403_forbidden() {
@@ -6110,6 +6994,7 @@ mod tests {
             &available,
             busy,
             &manager.config.adaptive_limit.multi_account,
+            None,
         );
         assert!(
             target.is_some(),
@@ -6146,12 +7031,30 @@ mod tests {
         ma.rebalance_min_gap = 2;
         ma.rebalance_utilization_gap = 0.3;
         assert!(MultiTokenManager::rebalance_signal_enabled(&ma));
-        // ④ 两个信号都关：彻底关闭。
+        // ③b 只有 RPM 信号（新）：必须启用——这是修「忙但没撞墙」盲区的第一优先级信号。
         ma.rebalance_min_gap = 0;
         ma.rebalance_utilization_gap = 0.0;
+        ma.rebalance_rpm_gap = 8.0;
+        ma.rebalance_bound_gap = 0;
+        assert!(
+            MultiTokenManager::rebalance_signal_enabled(&ma),
+            "只有 rpm_gap>0 必须启用（修忙而未撞墙盲区的核心信号）"
+        );
+        // ③c 只有 bound 信号（新）：必须启用——睡眠会话疏散。
+        ma.rebalance_rpm_gap = 0.0;
+        ma.rebalance_bound_gap = 4;
+        assert!(
+            MultiTokenManager::rebalance_signal_enabled(&ma),
+            "只有 bound_gap>0 必须启用（睡眠会话疏散）"
+        );
+        // ④ 四个信号全关：彻底关闭。
+        ma.rebalance_min_gap = 0;
+        ma.rebalance_utilization_gap = 0.0;
+        ma.rebalance_rpm_gap = 0.0;
+        ma.rebalance_bound_gap = 0;
         assert!(
             !MultiTokenManager::rebalance_signal_enabled(&ma),
-            "两个信号都为 0 时必须完全关闭被动再平衡"
+            "四个信号全为 0 时必须完全关闭被动再平衡"
         );
     }
 
@@ -6183,6 +7086,7 @@ mod tests {
             &available,
             busy,
             &manager.config.adaptive_limit.multi_account,
+            None,
         );
         assert!(
             target.is_some(),
@@ -6287,6 +7191,7 @@ mod tests {
                     last_switch_at: None,
                     last_switch_was_overflow: false,
                     priority: 0,
+                    last_evicted_from: None,
                 },
             );
         }
@@ -6346,6 +7251,118 @@ mod tests {
             .select_with_affinity(None, None, Some("sess-fallback"))
             .unwrap();
         assert_eq!(pick.0, 1, "pin 目标禁用后应回退到可用号");
+    }
+
+    // check_pinnable：限流/熔断(OPEN)的号应被拒绝 Pin（bug1 核心）。
+    #[tokio::test]
+    async fn test_check_pinnable_rejects_open_account() {
+        let mut config = Config::default();
+        config.adaptive_limit.circuit_breaker.open_429_threshold = 1;
+        config.adaptive_limit.user_cooldown_base_secs = 30;
+        let manager = affinity_manager(config);
+        // 健康时可 pin
+        assert!(manager.check_pinnable(1).is_ok(), "健康号应可 Pin");
+        // 把 #1 打成 OPEN
+        let lim = manager.limiters().for_scope(&ThrottleScope::UserCredential(1));
+        for _ in 0..3 {
+            lim.on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None, 0)
+                .await;
+        }
+        assert!(manager.is_account_open(1), "前置：#1 应已 OPEN");
+        // OPEN 时拒绝 pin
+        let res = manager.check_pinnable(1);
+        assert!(res.is_err(), "限流/熔断的号应被拒绝 Pin");
+        assert!(
+            res.unwrap_err().contains("限流"),
+            "拒绝原因应说明限流/熔断"
+        );
+    }
+
+    // check_pinnable：禁用号 + 不存在号都应被拒。
+    #[test]
+    fn test_check_pinnable_rejects_disabled_and_missing() {
+        let manager = affinity_manager(Config::default());
+        manager.set_disabled(2, true).unwrap();
+        let disabled_err = manager.check_pinnable(2).expect_err("禁用号应被拒绝 Pin");
+        assert!(disabled_err.contains("禁用"), "拒绝原因应说明禁用: {disabled_err}");
+        let missing_err = manager.check_pinnable(999).expect_err("不存在的号应被拒绝 Pin");
+        assert!(missing_err.contains("不存在"), "拒绝原因应说明不存在: {missing_err}");
+        assert!(manager.check_pinnable(1).is_ok(), "健康号 #1 应可 Pin");
+    }
+
+    // observability_snapshot：被 Pin 但无 affinity 绑定的会话也应进 threads[]（bug2 核心）。
+    #[test]
+    fn test_threads_includes_pin_only_session() {
+        let manager = affinity_manager(Config::default());
+        // pin 一个全新会话（无 affinity 绑定、没发过请求）
+        manager.pin_session("sess-pin-only", 2);
+        let snap = manager.observability_snapshot();
+        let t = snap
+            .threads
+            .iter()
+            .find(|t| t.session_id == "sess-pin-only");
+        assert!(
+            t.is_some(),
+            "被 Pin 但无 affinity 绑定的会话也应出现在 threads[]（三源并集）"
+        );
+        let t = t.unwrap();
+        assert_eq!(
+            t.pinned_account_id,
+            Some(2),
+            "pin-only 会话应带 pinnedAccountId=2"
+        );
+        assert_eq!(t.bound_account_id, 2, "展示绑定取 pin 目标号");
+        assert!(
+            matches!(t.phase, ThreadPhase::Idle),
+            "无活动的 pin-only 会话相位应为 Idle"
+        );
+    }
+
+    // 回归盲区(Reviewer 头号缺口): affinity 会话 + pin 会话应同时在 threads[]，且各自字段正确。
+    #[test]
+    fn test_threads_affinity_and_pin_coexist() {
+        let manager = affinity_manager(Config::default());
+        // 1) 建一个 affinity 绑定会话（真实选号）
+        let aff = manager
+            .select_with_affinity(None, None, Some("sess-affinity"))
+            .unwrap();
+        // 2) pin 另一个全新会话到健康号 2
+        manager.pin_session("sess-pinned", 2);
+        let snap = manager.observability_snapshot();
+        // affinity 会话在、且绑定到它真实选中的号、未被 pin
+        let a = snap
+            .threads
+            .iter()
+            .find(|t| t.session_id == "sess-affinity")
+            .expect("affinity 会话必须仍在 threads[]（三源并集别打掉 affinity 源）");
+        assert_eq!(a.bound_account_id, aff.0, "affinity 会话应绑到它真实选中的号");
+        assert_eq!(a.pinned_account_id, None, "affinity 会话未被 pin → pinned_account_id=None");
+        // pin-only 会话在、带正确 pinnedAccountId
+        let p = snap
+            .threads
+            .iter()
+            .find(|t| t.session_id == "sess-pinned")
+            .expect("pin-only 会话必须在 threads[]");
+        assert_eq!(p.pinned_account_id, Some(2));
+    }
+
+    // 既被 affinity 绑定、又被 pin 的同一会话：bound 取真实绑定、pinned 取 pin 目标，两者都对。
+    #[test]
+    fn test_threads_affinity_session_with_pin_both_fields() {
+        let manager = affinity_manager(Config::default());
+        let aff = manager
+            .select_with_affinity(None, None, Some("sess-both"))
+            .unwrap();
+        let other = if aff.0 == 1 { 2 } else { 1 };
+        manager.pin_session("sess-both", other);
+        let snap = manager.observability_snapshot();
+        let t = snap
+            .threads
+            .iter()
+            .find(|t| t.session_id == "sess-both")
+            .expect("会话应在 threads[]");
+        assert_eq!(t.bound_account_id, aff.0, "bound_account_id 取 affinity 真实绑定");
+        assert_eq!(t.pinned_account_id, Some(other), "pinned_account_id 取 pin 目标");
     }
 
     // 高优先级新会话优先选无冷却号。
@@ -6633,5 +7650,509 @@ mod tests {
         let pick2 = manager.select_with_affinity(None, None, Some("sess-ab"));
         // overflow 窗口内 → 不该被 cd 强切走，应黏回原号(或至少不 panic)。
         assert!(pick2.is_some(), "overflow 切过的会话在窗口内 select 仍应正常返回");
+    }
+
+    // ===== 后台主动巡检调度器 rebalance_tick 测试 =====
+
+    /// 3 号 manager（巡检测试用）：multiAccount 开、debounce=0 便于即时迁移。
+    fn scheduler_manager() -> MultiTokenManager {
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.enabled = true;
+        config.adaptive_limit.multi_account.switch_debounce_secs = 0;
+        MultiTokenManager::new(
+            config,
+            vec![
+                grouped_cred("t1", &[]),
+                grouped_cred("t2", &[]),
+                grouped_cred("t3", &[]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap()
+    }
+
+    fn insert_binding(m: &MultiTokenManager, sid: &str, cred: u64, idle_secs: i64) {
+        let now = Utc::now();
+        let mut aff = m.affinity.lock();
+        aff.insert(
+            sid.to_string(),
+            AffinityBinding {
+                credential_id: cred,
+                bound_at: now - Duration::seconds(idle_secs),
+                last_seen: now - Duration::seconds(idle_secs),
+                last_switch_at: None,
+                last_switch_was_overflow: false,
+                priority: 0,
+                last_evicted_from: None,
+            },
+        );
+    }
+
+    fn insert_binding_prio(m: &MultiTokenManager, sid: &str, cred: u64, idle_secs: i64, prio: i32) {
+        let now = Utc::now();
+        let mut aff = m.affinity.lock();
+        aff.insert(
+            sid.to_string(),
+            AffinityBinding {
+                credential_id: cred,
+                bound_at: now - Duration::seconds(idle_secs),
+                last_seen: now - Duration::seconds(idle_secs),
+                last_switch_at: None,
+                last_switch_was_overflow: false,
+                priority: prio,
+                last_evicted_from: None,
+            },
+        );
+    }
+
+    // ① 睡眠会话堆弱号：#1 绑 5 个睡眠会话、#2/#3 空 → 巡检按 bound_gap 疏散 1 个到最空号。
+    #[test]
+    fn test_scheduler_evacuates_sleeping_sessions_from_overloaded() {
+        let m = scheduler_manager();
+        for i in 0..5 {
+            insert_binding(&m, &format!("sleep-{i}"), 1, 120); // 都睡 2 分钟、绑 #1
+        }
+        // #1 bound=5，#2/#3 bound=0，gap=5 ≥ rebalance_bound_gap(默认4) → 应迁 1 个。
+        let moved = m.rebalance_tick();
+        assert_eq!(moved, 1, "睡眠会话堆 #1 应被巡检疏散 1 个");
+        // 迁移后 #1 名下应剩 4 个。
+        let aff = m.affinity.lock();
+        let on1 = aff.values().filter(|b| b.credential_id == 1).count();
+        assert_eq!(on1, 4, "应从 #1 疏散走 1 个会话");
+    }
+
+    // ② 防回弹：会话刚从 #2 被搬到 #1（last_evicted_from=2），即便 #1 过载也不许把它搬回 #2。
+    #[test]
+    fn test_scheduler_anti_bounce_does_not_move_back() {
+        let m = scheduler_manager();
+        // #1 绑 5 个，其中 4 个普通睡眠，1 个刚从 #2 搬来（标 last_evicted_from=2）。
+        for i in 0..4 {
+            insert_binding(&m, &format!("sleep-{i}"), 1, 120);
+        }
+        {
+            let now = Utc::now();
+            let mut aff = m.affinity.lock();
+            aff.insert(
+                "just-moved".to_string(),
+                AffinityBinding {
+                    credential_id: 1,
+                    bound_at: now - Duration::seconds(600), // 最老 → 否则会被优先选中
+                    last_seen: now - Duration::seconds(600),
+                    last_switch_at: None,
+                    last_switch_was_overflow: false,
+                    priority: 0,
+                    last_evicted_from: Some(2),
+                },
+            );
+        }
+        // 强制只有 #2 是候选最空号：给 #3 塞满使其不是最空（让 target 落在 #2，触发防回弹跳过该会话）。
+        for i in 0..5 {
+            insert_binding(&m, &format!("filler3-{i}"), 3, 120);
+        }
+        m.rebalance_tick();
+        // just-moved 这条不该被搬回 #2（防回弹）；它要么还在 #1，要么被搬去 #3，但绝不回 #2。
+        let aff = m.affinity.lock();
+        let b = aff.get("just-moved").unwrap();
+        assert_ne!(b.credential_id, 2, "防回弹：刚从 #2 搬来的会话不该被搬回 #2");
+    }
+
+    // ③ Pin 凌驾一切：被 pin 的会话即便在过载号上，也不被巡检搬走。
+    #[test]
+    fn test_scheduler_never_moves_pinned_session() {
+        let m = scheduler_manager();
+        // #1 绑 5 个睡眠会话，其中 "pinned-one" 被 pin 到 #1。
+        for i in 0..4 {
+            insert_binding(&m, &format!("sleep-{i}"), 1, 300); // 这 4 个更老 → 正常会先被选
+        }
+        insert_binding(&m, "pinned-one", 1, 999); // 最老，正常最先被搬
+        m.pin_session("pinned-one", 1);
+        // 连续巡检多轮，pinned-one 永远不该离开 #1。
+        for _ in 0..5 {
+            m.rebalance_tick();
+        }
+        let aff = m.affinity.lock();
+        let b = aff.get("pinned-one").unwrap();
+        assert_eq!(b.credential_id, 1, "Pin 凌驾一切：被 pin 的会话不被巡检搬走");
+    }
+
+    // ===== 优先级独享 exclusive_tick 测试 =====
+
+    // ④ 高优先 active 会话不在理想号 → 迁到理想号（独享获取）。
+    #[test]
+    fn test_exclusive_high_priority_acquires_ideal_account() {
+        let m = scheduler_manager();
+        // 高优先会话现绑 #1（active=刚活动）；理想号默认按 safe_rps_hi(均0)→rpm 低→id 小，#1 已是其一。
+        // 先把高优先放 #3，制造「不在理想号」。给 #1/#2 都不动(rpm 0)，理想号=最空+id小=#1。
+        insert_binding_prio(&m, "vip", 3, 0, 5); // active, priority 5, 现在 #3
+        let moved = m.exclusive_tick();
+        assert_eq!(moved, 1, "高优先 active 会话应被迁到理想号");
+        let aff = m.affinity.lock();
+        let b = aff.get("vip").unwrap();
+        assert_ne!(b.credential_id, 3, "应离开非理想号 #3");
+    }
+
+    // ⑤ 高优先 sleeping（空闲超 borrow 阈值）→ 不赶低优先（借号给普通会话、不浪费全局吞吐）。
+    #[test]
+    fn test_exclusive_sleeping_does_not_evict() {
+        let m = scheduler_manager();
+        // 高优先会话睡了很久（idle 大于 exclusive_borrow_idle_secs 默认 300），且已在理想号 #1。
+        insert_binding_prio(&m, "vip-asleep", 1, 9999, 5);
+        // #1 上有个普通活跃 squatter。
+        insert_binding_prio(&m, "squatter", 1, 0, 0);
+        let moved = m.exclusive_tick();
+        assert_eq!(moved, 0, "高优先睡着时不赶低优先（借号）");
+        let aff = m.affinity.lock();
+        assert_eq!(aff.get("squatter").unwrap().credential_id, 1, "睡着期间 squatter 不被赶");
+    }
+
+    // ⑥ Pin 凌驾优先级：被 pin 的会话不参与独享调度、其号视为已占，高优先避开它。
+    #[test]
+    fn test_exclusive_pin_overrides_priority() {
+        let m = scheduler_manager();
+        // #1 被一个 pin 会话占住。
+        insert_binding(&m, "pinned", 1, 0);
+        m.pin_session("pinned", 1);
+        // 高优先 active 会话在 #2，理想号本会挑 #1（id 小），但 #1 被 pin 占 → 应避开、不抢 #1。
+        insert_binding_prio(&m, "vip", 2, 0, 5);
+        for _ in 0..3 {
+            m.exclusive_tick();
+        }
+        let aff = m.affinity.lock();
+        // pin 会话纹丝不动在 #1；vip 绝不会被放到 #1（被 pin 占）。
+        assert_eq!(aff.get("pinned").unwrap().credential_id, 1, "Pin 会话不被独享调度搬动");
+        assert_ne!(aff.get("vip").unwrap().credential_id, 1, "高优先避开被 pin 占的号");
+    }
+
+    // ⑦ 独享号不够富余 → 赶走低优先 squatter（用超高 headroom_ratio 强制「永远不够富余」触发驱逐）。
+    #[test]
+    fn test_exclusive_evicts_low_priority_when_not_enough_headroom() {
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.enabled = true;
+        config.adaptive_limit.multi_account.switch_debounce_secs = 0;
+        // ratio=2.0：headroom_ratio 最大才 1.0，永远 ≤ 2.0 → 视为"不够富余" → 必赶 squatter。
+        config.adaptive_limit.multi_account.exclusive_headroom_ratio = 2.0;
+        let m = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("t1", &[]), grouped_cred("t2", &[]), grouped_cred("t3", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // 高优先 active 已在理想号 #1；#1 上有个活跃普通 squatter。
+        insert_binding_prio(&m, "vip", 1, 0, 5);
+        insert_binding_prio(&m, "squatter", 1, 0, 0);
+        let moved = m.exclusive_tick();
+        assert_eq!(moved, 1, "不够富余应赶走 squatter");
+        let aff = m.affinity.lock();
+        assert_eq!(aff.get("vip").unwrap().credential_id, 1, "高优先留在理想号 #1");
+        assert_ne!(aff.get("squatter").unwrap().credential_id, 1, "低优先 squatter 被赶离 #1");
+    }
+
+    // ⑧ 反乒乓（Reviewer 向量6）：温和均衡 rebalance_tick 绝不搬走高优先会话——
+    //    否则会把 exclusive 刚安排好的独享会话又搬走，两机制打架。
+    #[test]
+    fn test_rebalance_never_moves_high_priority_session() {
+        let m = scheduler_manager();
+        // #1 堆一个高优先睡眠会话 + 5 个普通睡眠会话（bound_gap 会想疏散 #1）。
+        insert_binding_prio(&m, "vip-sleep", 1, 9999, 7); // 最老 + 高优先 → 正常最先被选为 victim
+        for i in 0..5 {
+            insert_binding(&m, &format!("plain-{i}"), 1, 120);
+        }
+        // 连续多轮温和均衡（exclusive_tick 对睡眠高优先不动作 → 走到 rebalance）。
+        for _ in 0..8 {
+            m.rebalance_tick();
+        }
+        let aff = m.affinity.lock();
+        // 高优先会话即便最老、在过载号上，也绝不被温和均衡搬走。
+        assert_eq!(
+            aff.get("vip-sleep").unwrap().credential_id,
+            1,
+            "温和均衡绝不搬走高优先会话（防与 exclusive 打架）"
+        );
+    }
+
+    // ⑨ Reviewer Finding #1：队头阻塞活锁——最忙的源号没有可搬会话（全 pin/全高优先）时，
+    //    巡检应回退到次忙的源号继续疏散，而不是 return 0 白跑。
+    #[test]
+    fn test_scheduler_falls_back_to_next_source_when_busiest_has_no_victim() {
+        let m = scheduler_manager();
+        // #1（将成最忙源）：只挂 1 个高优先睡眠 + 1 个 pin 会话 → 无 priority-0 可搬。
+        insert_binding_prio(&m, "vip-1", 1, 9999, 7);
+        insert_binding(&m, "pinned-1", 1, 9999);
+        m.pin_session("pinned-1", 1);
+        // 制造 #1 rpm 最高（最忙）。
+        for _ in 0..30 {
+            m.note_request(1);
+        }
+        // #2（次忙源）：5 个普通睡眠会话——这些才是该疏散的对象。
+        for i in 0..5 {
+            insert_binding(&m, &format!("plain2-{i}"), 2, 120);
+        }
+        for _ in 0..10 {
+            m.note_request(2);
+        }
+        let moved = m.rebalance_tick();
+        assert_eq!(moved, 1, "最忙源无可搬会话时应回退到次忙源疏散（修队头阻塞活锁）");
+        // 疏散的应是 #2 的某个普通会话（#1 的高优先/pin 都不该动）。
+        let aff = m.affinity.lock();
+        assert_eq!(aff.get("vip-1").unwrap().credential_id, 1, "#1 高优先不动");
+        assert_eq!(aff.get("pinned-1").unwrap().credential_id, 1, "#1 pin 不动");
+        let on2 = aff.values().filter(|b| b.credential_id == 2).count();
+        assert_eq!(on2, 4, "应从次忙源 #2 疏散 1 个普通会话");
+    }
+
+    // ⑩ Reviewer Finding #2：温和均衡的目标号必须排除「独享归属号」，
+    //    否则会把普通 squatter 搬进独享号引发反向 churn。
+    #[test]
+    fn test_rebalance_excludes_exclusive_owned_as_target() {
+        let m = scheduler_manager();
+        // #1 = 高优先 H 的独享家（H active），#1 此刻最空（rpm 0）。
+        insert_binding_prio(&m, "vip-home", 1, 0, 7);
+        // #2 很忙、挂普通会话 S → 温和均衡想把 S 迁到最空号；但最空号 #1 是独享家、应被排除，迁到 #3。
+        insert_binding(&m, "squatter-s", 2, 0);
+        for _ in 0..20 {
+            m.note_request(2);
+        }
+        // 连续巡检：S 可能被疏散，但绝不能落到独享家 #1。
+        for _ in 0..6 {
+            m.rebalance_tick();
+        }
+        let aff = m.affinity.lock();
+        assert_ne!(
+            aff.get("squatter-s").unwrap().credential_id,
+            1,
+            "温和均衡绝不把普通会话搬进独享归属号 #1（防反向 churn）"
+        );
+    }
+
+    // ⑪ Reviewer Finding #4：exclusive_tick 独立于 rebalance 信号——四个 gap 全关时独享仍生效。
+    #[test]
+    fn test_exclusive_runs_even_when_rebalance_signals_all_off() {
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.enabled = true;
+        config.adaptive_limit.multi_account.switch_debounce_secs = 0;
+        config.adaptive_limit.multi_account.reclaim_debounce_secs = 0;
+        // 四个 rebalance 信号全关（owner「只要独享、不要被动均摊」）。
+        config.adaptive_limit.multi_account.rebalance_rpm_gap = 0.0;
+        config.adaptive_limit.multi_account.rebalance_utilization_gap = 0.0;
+        config.adaptive_limit.multi_account.rebalance_bound_gap = 0;
+        config.adaptive_limit.multi_account.rebalance_min_gap = 0;
+        let m = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("t1", &[]), grouped_cred("t2", &[]), grouped_cred("t3", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // 高优先 active 在非理想号 #3 → 即便 rebalance 全关，rebalance_tick 也应通过 exclusive 把它迁走。
+        insert_binding_prio(&m, "vip", 3, 0, 5);
+        let moved = m.rebalance_tick();
+        assert_eq!(moved, 1, "rebalance 信号全关时，独享仍应通过 exclusive_tick 生效");
+        let aff = m.affinity.lock();
+        assert_ne!(aff.get("vip").unwrap().credential_id, 3, "高优先应被独享调度迁离非理想号");
+    }
+
+    // ⑫ 借号语义（owner 核心规则 + 自查发现的洞）：高优先睡>borrow_idle 时，它独享的号
+    //    应可被温和均衡借给普通会话（exclusive_owned 只算 active 高优先，睡着的不护着）。
+    #[test]
+    fn test_sleeping_exclusive_account_is_lendable() {
+        let m = scheduler_manager();
+        // #1 = 高优先 H 的独享家，但 H 睡了很久（> exclusive_borrow_idle_secs 默认 300）。
+        insert_binding_prio(&m, "vip-asleep", 1, 9999, 7);
+        // exclusive_owned_accounts 此刻不该包含 #1（H 睡着 → 可借出）。
+        let owned = m.exclusive_owned_accounts();
+        assert!(
+            !owned.contains(&1),
+            "睡着的高优先独享号应可借出（不在 exclusive_owned 集合里），owned={owned:?}"
+        );
+        // 对照：H 若 active，#1 应被护住。
+        insert_binding_prio(&m, "vip-awake", 2, 0, 7);
+        let owned2 = m.exclusive_owned_accounts();
+        assert!(owned2.contains(&2), "active 高优先独享号应被护住（在 exclusive_owned 集合里）");
+    }
+
+    // ⑬ 持久化 round-trip（Reviewer 额外项 A）：last_evicted_from 落盘再读能正确还原；
+    //    且老格式 JSON（无此字段）能 serde default 反序列化、不崩。
+    #[test]
+    fn test_affinity_binding_serde_roundtrip_and_old_format() {
+        let now = Utc::now();
+        // 1) 带 last_evicted_from 的 round-trip。
+        let b = AffinityBinding {
+            credential_id: 7,
+            bound_at: now,
+            last_seen: now,
+            last_switch_at: Some(now),
+            last_switch_was_overflow: false,
+            priority: 3,
+            last_evicted_from: Some(2),
+        };
+        let json = serde_json::to_string(&b).unwrap();
+        let back: AffinityBinding = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.last_evicted_from, Some(2), "last_evicted_from 应 round-trip 还原");
+        assert_eq!(back.credential_id, 7);
+        // 2) 老格式（无 last_evicted_from / last_switch_* 字段）应 default 反序列化为 None/false。
+        let old = r#"{"credential_id":5,"bound_at":"2026-06-23T00:00:00Z","last_seen":"2026-06-23T00:00:00Z","priority":0}"#;
+        let parsed: AffinityBinding = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.credential_id, 5);
+        assert_eq!(parsed.last_evicted_from, None, "老格式无此字段应 default None");
+        assert!(!parsed.last_switch_was_overflow);
+    }
+
+    // ⑭ 第二轮 Reviewer 反例2 修复：原号 OPEN 强制切号后，last_evicted_from 应被**清除**（非 set），
+    //    这样原号恢复后高优先能夺回最优主号，不被防回弹误挡 60s。
+    #[tokio::test]
+    async fn test_open_forced_switch_clears_evicted_from() {
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.enabled = true;
+        config.adaptive_limit.multi_account.switch_debounce_secs = 0;
+        let m = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("t1", &[]), grouped_cred("t2", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // 会话先绑 #1。
+        let c = m.acquire_context(None, None, Some("sess-open")).await.unwrap();
+        let bound = c.id;
+        let other = if bound == 1 { 2 } else { 1 };
+        // 把 bound 号打 OPEN（熔断）。
+        {
+            let lim = m.limiters().for_scope(&ThrottleScope::UserCredential(bound));
+            for _ in 0..10 {
+                lim.on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None, 0)
+                    .await;
+            }
+        }
+        // 🔒 加硬（第三轮 Reviewer：test 半假绿）：先把 last_evicted_from 置 Some(99)，
+        // 这样断言"变 None"才真证明"清除生效"，而不是"初值恰好是 None 恒过"。
+        {
+            let mut aff = m.affinity.lock();
+            if let Some(b) = aff.get_mut("sess-open") {
+                b.last_evicted_from = Some(99);
+            }
+        }
+        // 再选号 → 原号 OPEN → 强制切到 other。
+        let pick = m.select_with_affinity(None, None, Some("sess-open")).unwrap();
+        assert_eq!(pick.0, other, "原号 OPEN 应强制切到另一个号");
+        // 关键断言：强制切号后 last_evicted_from 应是 None（被迫逃，不防回弹），不是 Some(bound)。
+        let b = m.affinity.lock().get("sess-open").cloned().unwrap();
+        assert_eq!(
+            b.last_evicted_from, None,
+            "OPEN 强制切号应清除 last_evicted_from（先置 Some(99) → 切后必须变 None，证明清除真生效）"
+        );
+    }
+
+    // ⑮ 第二轮 Reviewer 反例1 修复：live 请求路径下，priority=0 会话被温和均衡时，
+    //    目标号必须排除「active 高优先独享号」——不能把普通会话搬进独享号（反向 churn）。
+    #[tokio::test]
+    async fn test_live_rebalance_excludes_active_exclusive_account() {
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.enabled = true;
+        config.adaptive_limit.multi_account.switch_debounce_secs = 0;
+        // 让温和均衡易触发：rpm gap 设小。
+        config.adaptive_limit.multi_account.rebalance_rpm_gap = 1.0;
+        let m = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("t1", &[]), grouped_cred("t2", &[]), grouped_cred("t3", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // #1 = active 高优先 H 的独享家（exclusive_owned 应含 #1）。
+        insert_binding_prio(&m, "vip-active", 1, 0, 7);
+        // #2 挂普通会话 S，#2 制造高 rpm 触发均衡。
+        insert_binding(&m, "plain-s", 2, 0);
+        for _ in 0..20 {
+            m.note_request(2);
+        }
+        // 反复 live 选号 S（走 select_with_affinity 的均衡分支）。
+        for _ in 0..8 {
+            let _ = m.select_with_affinity(None, None, Some("plain-s"));
+        }
+        // S 即便被均衡走，也绝不能落到 active 独享家 #1。
+        let b = m.affinity.lock().get("plain-s").cloned().unwrap();
+        assert_ne!(
+            b.credential_id, 1,
+            "live 路径：普通会话绝不被均衡进 active 高优先独享号 #1（修反向 churn）"
+        );
+    }
+
+    // ⑯ 第三轮 Reviewer Finding 1：cd 强制切号路径（最高频）也绝不能把普通会话甩进 active 独享号。
+    //    根因修法=pick_pool 软排除独享号，三条路（cd强切/overflow/均衡）共用，这里专测 cd 强切那条。
+    #[tokio::test]
+    async fn test_cd_force_switch_excludes_active_exclusive_account() {
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.enabled = true;
+        config.adaptive_limit.multi_account.switch_debounce_secs = 0;
+        config.adaptive_limit.multi_account.switch_threshold_secs = 1; // 冷却 >1s 即触发 cd 强切
+        config.adaptive_limit.user_cooldown_base_secs = 10; // 撞一次冷却 ~10s（>1s 阈值，但不 OPEN 熔断）
+        let m = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("t1", &[]), grouped_cred("t2", &[]), grouped_cred("t3", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // #1 = active 高优先 H 独享家（rpm 最低，cd 强切若不排除会优先选它）。
+        insert_binding_prio(&m, "vip-active", 1, 0, 7);
+        // 普通会话 S 绑 #2；**单次** throttle 把 #2 冷却推过阈值但**不 OPEN 熔断**（关键：
+        // 撞 10 次会 OPEN→走 OPEN 强切分支，不是 cd 强切；单次 + cooldown_base=10s 才真撞 cd 强切，
+        // 修第四轮 Reviewer Finding B 假绿=之前测错了分支）。
+        insert_binding(&m, "plain-s", 2, 0);
+        m.limiters()
+            .for_scope(&ThrottleScope::UserCredential(2))
+            .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None, 0)
+            .await;
+        // 前置断言：#2 必须仍 Healthy（没 OPEN），否则就不是在测 cd 强切分支。
+        assert!(!m.is_account_open(2), "前置：#2 应仍 Healthy（单次 throttle 不 OPEN），才是真测 cd 强切");
+        // S 触发 cd 强切——绝不能落到 active 独享家 #1，应去 #3。
+        let pick = m.select_with_affinity(None, None, Some("plain-s")).unwrap();
+        assert_ne!(pick.0, 1, "cd 强切：普通会话绝不被甩进 active 高优先独享号 #1");
+        assert_ne!(pick.0, 2, "cd 强切应离开卡死的原号 #2");
+    }
+
+    // ⑰ 第五轮 Reviewer 承重行覆盖：H_ne={b} corner——唯一健康非独享号就是会话自己的冷却原号时，
+    //    cd 强切应**黏回自己的冷却原号(Stick)**，而绝不被兜底链 `lowest_load(all_pool,Some(b))` 甩进独享号。
+    //    这条直接打 token_manager.rs cd 强切兜底改动行（2号拓扑：#1 独享 active + #2 原号冷却）。
+    #[tokio::test]
+    async fn test_cd_force_switch_sticks_origin_when_only_healthy_nonexcl_is_self() {
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.enabled = true;
+        config.adaptive_limit.multi_account.switch_debounce_secs = 0;
+        config.adaptive_limit.multi_account.switch_threshold_secs = 1; // cd>1s 触发 cd 强切
+        config.adaptive_limit.user_cooldown_base_secs = 10; // 撞一次冷却 ~10s（>阈值但不 OPEN）
+        // 只 2 个号：#1 给高优先独享、#2 给普通会话原号。
+        let m = MultiTokenManager::new(
+            config,
+            vec![grouped_cred("t1", &[]), grouped_cred("t2", &[])],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        // #1 = active 高优先独享家（→ owned_excl 含 #1 → H_ne 把 #1 排掉）。
+        insert_binding_prio(&m, "vip-active", 1, 0, 7);
+        // 普通会话 S 绑 #2，单次 throttle 让 #2 冷却>阈值但仍 Healthy。
+        insert_binding(&m, "plain-s", 2, 0);
+        m.limiters()
+            .for_scope(&ThrottleScope::UserCredential(2))
+            .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None, 0)
+            .await;
+        assert!(!m.is_account_open(2), "前置：#2 仍 Healthy（真测 cd 强切兜底）");
+        // H_ne = {健康且非独享} = {#2}（#1 被独享排除），但 cd 强切 exclude #2 自己 → 兜底链都空
+        // → 应 Stick 黏回 #2，绝不甩进独享家 #1。
+        let pick = m.select_with_affinity(None, None, Some("plain-s")).unwrap();
+        assert_eq!(
+            pick.0, 2,
+            "H_ne={{b}} corner：唯一健康非独享号是自己 → cd 强切应黏回 #2，绝不甩进独享号 #1"
+        );
     }
 }

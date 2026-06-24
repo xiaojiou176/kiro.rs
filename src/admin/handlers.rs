@@ -113,7 +113,39 @@ pub async fn set_credential_disabled(
 /// GET /api/admin/observability
 /// 多号 affinity 观测面板快照
 pub async fn get_observability(State(state): State<AdminState>) -> impl IntoResponse {
-    Json(state.service.observability_snapshot())
+    // base 快照：token_manager 已填好每个 thread 的纯账号态相位 + session_id + 绑定号 + bound_at。
+    let mut snapshot = state.service.observability_snapshot();
+
+    // 1) 真名回填：用 ~/.codex/session_index.jsonl 的进程内单例映射器（mtime 缓存）。
+    let resolver = crate::thread_names::resolver();
+    // 2) trace 回填：一次批量查所有活跃会话最近一条 trace 的 (final_status, throttle_count)。
+    //    trace 关闭时 store 内部短路、这里拿到空 map → 相位退化为纯账号态，真名仍照填。
+    let conv_ids: Vec<String> = snapshot
+        .threads
+        .iter()
+        .map(|t| t.session_id.clone())
+        .collect();
+    let trace_map = if state.trace_store.is_enabled() {
+        state
+            .trace_store
+            // 只用最近 10 分钟的 trace 判 Errored：避免几小时前的旧 error 永久粘住相位
+            // （与 Idle/Running 的 60s 时效对齐；600s 给慢请求留足余量）。
+            .latest_status_by_conversations(&conv_ids, 600)
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    for t in &mut snapshot.threads {
+        t.thread_name = resolver.name_for(&t.session_id);
+        if let Some((status, throttle)) = trace_map.get(&t.session_id) {
+            t.recent_throttle_count = *throttle;
+            t.last_final_status = Some(status.clone());
+            // error/interrupted → Errored（最高优先级，压过 base 的账号态相位）。
+            t.phase = crate::kiro::token_manager::phase_with_trace(t.phase, Some(status.as_str()));
+        }
+    }
+
+    Json(snapshot)
 }
 
 /// POST /api/admin/sessions/pin

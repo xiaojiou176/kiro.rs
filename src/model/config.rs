@@ -329,6 +329,33 @@ pub struct MultiAccountConfig {
     /// 默认 0.3。0 表示关闭按利用率再平衡（回退到纯会话数）。
     #[serde(default = "default_rebalance_utilization_gap")]
     pub rebalance_utilization_gap: f64,
+    /// 后台主动巡检调度器的间隔（秒）：每隔此秒数算一次全局负载快照、按优先级栈做温和搬迁/睡眠疏散。
+    /// 不依赖 Thread 自己发请求——根治「睡眠会话永不被挪、肇事 Thread 赖着原号」。默认 10。
+    /// 0 表示关闭后台巡检（回退到纯被动 select_with_affinity 路径）。
+    #[serde(default = "default_scheduler_tick_secs")]
+    pub scheduler_tick_secs: u64,
+    /// 负载再平衡的「纯 RPM 负载」差距阈值（req/min）：本号 RPM 比全局最空号高出此值即触发温和搬迁。
+    /// 这是修「忙但没撞墙」盲区的核心信号——不挂 util 的 SATURATED 门，作为 rebalance 第一优先级信号。
+    /// 默认 8.0。0 表示关闭按 RPM 再平衡。
+    #[serde(default = "default_rebalance_rpm_gap")]
+    pub rebalance_rpm_gap: f64,
+    /// 睡眠会话疏散的「绑定数」差距阈值：本号 TTL 内绑定会话数（含睡着的）比最空号多 ≥ 此值，
+    /// 后台巡检就把它名下「压力最小/睡眠」的会话提前疏散到最空号。防睡眠会话堆弱号、唤醒后瞬间打满。
+    /// 默认 4。0 表示关闭睡眠疏散。
+    #[serde(default = "default_rebalance_bound_gap")]
+    pub rebalance_bound_gap: usize,
+    /// 优先级独享：高优先 Thread 独享号时，仅当该号余量 headroom 比例 > 此值，才允许「负载特别低的」
+    /// priority=0 Thread 蹭进来填空（蹭的不抢高优先资源、也保持粘性）。默认 0.5（留一半余量才让蹭）。
+    #[serde(default = "default_exclusive_headroom_ratio")]
+    pub exclusive_headroom_ratio: f64,
+    /// 优先级独享：独享 Thread 连续无 inflight 且空闲超此秒数 → 把独享号临时借给普通 Thread。
+    /// 独立于 rebalance_active_window_secs（避免 5 分钟边界振荡）。默认 300。
+    #[serde(default = "default_exclusive_borrow_idle_secs")]
+    pub exclusive_borrow_idle_secs: u64,
+    /// 优先级独享：借出的独享号被高优先 Thread 夺回后的防抖窗口（秒），防「醒来夺回→又睡→又借」抖动。
+    /// 默认 60。
+    #[serde(default = "default_reclaim_debounce_secs")]
+    pub reclaim_debounce_secs: u64,
     /// overflow-on-busy：当**绑定号真撞墙**（429 频发 + 吞吐被压低且不是「没活干」）时，
     /// 把**整个会话(Thread)** 迁移到池里更健康的号。与负载再平衡的区别：再平衡是「均摊负载」，
     /// 这是「逃离正在烧的号」——优先级更高、判定更严（要同时满足 429 率高 + goodput 低 + 非 app_limited）。
@@ -379,6 +406,12 @@ impl Default for MultiAccountConfig {
             rebalance_active_window_secs: default_rebalance_active_window_secs(),
             rebalance_min_gap: default_rebalance_min_gap(),
             rebalance_utilization_gap: default_rebalance_utilization_gap(),
+            scheduler_tick_secs: default_scheduler_tick_secs(),
+            rebalance_rpm_gap: default_rebalance_rpm_gap(),
+            rebalance_bound_gap: default_rebalance_bound_gap(),
+            exclusive_headroom_ratio: default_exclusive_headroom_ratio(),
+            exclusive_borrow_idle_secs: default_exclusive_borrow_idle_secs(),
+            reclaim_debounce_secs: default_reclaim_debounce_secs(),
             overflow_on_busy: OverflowOnBusyConfig::default(),
         }
     }
@@ -824,6 +857,30 @@ fn default_rebalance_min_gap() -> usize {
 }
 fn default_rebalance_utilization_gap() -> f64 {
     0.3
+}
+
+fn default_scheduler_tick_secs() -> u64 {
+    10
+}
+
+fn default_rebalance_rpm_gap() -> f64 {
+    8.0
+}
+
+fn default_rebalance_bound_gap() -> usize {
+    4
+}
+
+fn default_exclusive_headroom_ratio() -> f64 {
+    0.5
+}
+
+fn default_exclusive_borrow_idle_secs() -> u64 {
+    300
+}
+
+fn default_reclaim_debounce_secs() -> u64 {
+    60
 }
 
 fn default_overflow_upstream429_rate_threshold() -> f64 {

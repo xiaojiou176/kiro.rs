@@ -7,6 +7,7 @@ mod image_resize;
 mod kiro;
 mod model;
 mod observability;
+mod thread_names;
 pub mod token;
 
 use std::collections::HashMap;
@@ -375,6 +376,37 @@ async fn main() {
                             "recovery_probe 已连续约 1 小时未抬升任何 scope：可能全员已达 max(正常)，"
                         );
                     }
+                }
+            }
+        });
+    }
+
+    // 后台主动巡检调度器：每 scheduler_tick_secs 秒主动把「压力最小/睡眠会话」从过载号疏散到最空号，
+    // 不依赖 Thread 自己发请求（根治睡眠会话永不被挪、肇事 Thread 赖着原号）。每 tick 最多迁 1 个、
+    // 迁完下个 tick 重算（温和、自纠正）。受 multiAccount.enabled + scheduler_tick_secs 双闸约束，
+    // 关闭时 rebalance_tick 内部直接返回 0（默认行为零变化）。panic 捕获不杀循环（对齐 recovery_probe）。
+    {
+        let tm = token_manager.clone();
+        let tick_secs = config
+            .adaptive_limit
+            .multi_account
+            .scheduler_tick_secs
+            .max(1);
+        tokio::spawn(async move {
+            let interval = std::time::Duration::from_secs(tick_secs);
+            loop {
+                tokio::time::sleep(interval).await;
+                let moved = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    tm.rebalance_tick()
+                })) {
+                    Ok(n) => n,
+                    Err(_) => {
+                        tracing::error!("rebalance_tick panic，已捕获本轮，循环继续");
+                        continue;
+                    }
+                };
+                if moved > 0 {
+                    tracing::debug!(moved, "scheduler 主动巡检疏散会话");
                 }
             }
         });

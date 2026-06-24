@@ -709,14 +709,11 @@ impl AdminService {
 
     /// 将会话 pin 到指定凭据
     pub fn pin_session(&self, session: &str, credential_id: u64) -> Result<(), AdminServiceError> {
-        let snapshot = self.token_manager.snapshot();
-        if !snapshot
-            .entries
-            .iter()
-            .any(|entry| entry.id == credential_id)
-        {
-            return Err(AdminServiceError::NotFound { id: credential_id });
-        }
+        // 号必须存在、未禁用、且未限流/熔断才允许 Pin。
+        // 不健康的号 pin 上去只会在选号时软回退、形同虚设——直接拒绝、给出原因。
+        self.token_manager
+            .check_pinnable(credential_id)
+            .map_err(AdminServiceError::InvalidCredential)?;
         self.token_manager.pin_session(session, credential_id);
         Ok(())
     }

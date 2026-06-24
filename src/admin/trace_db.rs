@@ -421,6 +421,67 @@ impl TraceStore {
         }
     }
 
+    /// 批量取一组 conversation_id 各自**最近一条** trace 的 `(final_status, throttle_count)`。
+    ///
+    /// 用于 Thread 视角观测面板：把每个会话最近一次请求的结局回填给前端。
+    /// 一条 SQL：`WHERE conversation_id IN (...)` + 按 `ts_epoch DESC` 取每个会话首次出现（=最新）那条。
+    /// 查询失败 / 空入参 → 返回空 map（调用方降级为纯账号态推断）。
+    pub fn latest_status_by_conversations(
+        &self,
+        conv_ids: &[String],
+        recent_secs: i64,
+    ) -> std::collections::HashMap<String, (String, u32)> {
+        let mut out: std::collections::HashMap<String, (String, u32)> =
+            std::collections::HashMap::new();
+        if conv_ids.is_empty() {
+            return out;
+        }
+        let conn = self.conn.lock();
+        let placeholders: Vec<&str> = conv_ids.iter().map(|_| "?").collect();
+        // 同一 conversation 可能有多条；按时间倒序读，第一次见到的就是最新，后续同 id 跳过。
+        // 只看最近 recent_secs 内的 trace：避免几小时前的旧 error 永久把会话粘成 Errored
+        // （与 Idle/Running 的 60s 时效口径对齐）。recent_secs<=0 表示不限时间（回退旧行为）。
+        let cutoff = if recent_secs > 0 {
+            chrono::Utc::now().timestamp() - recent_secs
+        } else {
+            i64::MIN
+        };
+        let sql = format!(
+            "SELECT conversation_id, final_status, throttle_count FROM traces \
+             WHERE conversation_id IN ({}) AND ts_epoch >= ? ORDER BY ts_epoch DESC",
+            placeholders.join(",")
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> =
+            conv_ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        params.push(&cutoff as &dyn rusqlite::ToSql);
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("trace latest_status 准备失败: {}", e);
+                return out;
+            }
+        };
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u32,
+            ))
+        });
+        match rows {
+            Ok(iter) => {
+                for r in iter.flatten() {
+                    if let (Some(conv), status, throttle) = r {
+                        // 倒序遍历，只保留每个会话第一次出现（=最新）的那条。
+                        out.entry(conv).or_insert((status, throttle));
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("trace latest_status 查询失败: {}", e),
+        }
+        out
+    }
+
     /// 测试辅助：仅取记录、忽略总数
     #[cfg(test)]
     fn query(&self, q: &TraceQuery) -> Vec<TraceRecord> {
@@ -812,6 +873,82 @@ mod tests {
         assert_eq!(out[0].reasoning_tokens, 256);
         assert_eq!(out[0].effort_requested.as_deref(), Some("xhigh"));
         assert_eq!(out[0].effort_sent.as_deref(), Some("max"));
+    }
+
+    /// `latest_status_by_conversations`：同一 conversation 两条 trace，应取最新（ts 较晚）那条的 status。
+    #[test]
+    fn latest_status_picks_newest_per_conversation() {
+        let store = mem_store();
+        // 同一会话 conv-A：先 success（旧），后 error（新）→ 应返回 error。
+        let mut old = sample(TraceSample {
+            trace_id: "a-old",
+            status: "success",
+            credential_id: 5,
+            model: "m1",
+        });
+        old.conversation_id = Some("conv-A".to_string());
+        old.ts = "2026-06-01T00:00:00Z".to_string();
+        old.throttle_count = 0;
+
+        let mut new = sample(TraceSample {
+            trace_id: "a-new",
+            status: "error",
+            credential_id: 5,
+            model: "m1",
+        });
+        new.conversation_id = Some("conv-A".to_string());
+        new.ts = "2026-06-02T00:00:00Z".to_string();
+        new.throttle_count = 3;
+
+        // 另一个会话 conv-B：单条 success，验证多会话一次查回。
+        let mut other = sample(TraceSample {
+            trace_id: "b-1",
+            status: "success",
+            credential_id: 6,
+            model: "m1",
+        });
+        other.conversation_id = Some("conv-B".to_string());
+        other.ts = "2026-06-01T12:00:00Z".to_string();
+
+        // 故意乱序插入，验证靠 ts 而非插入顺序。
+        store.insert(&new);
+        store.insert(&old);
+        store.insert(&other);
+
+        let map = store.latest_status_by_conversations(&[
+            "conv-A".to_string(),
+            "conv-B".to_string(),
+            "conv-missing".to_string(),
+        ], 0);
+        assert_eq!(map.get("conv-A"), Some(&("error".to_string(), 3)));
+        assert_eq!(map.get("conv-B"), Some(&("success".to_string(), 0)));
+        assert_eq!(map.get("conv-missing"), None);
+
+        // 空入参 → 空 map。
+        assert!(store.latest_status_by_conversations(&[], 0).is_empty());
+    }
+
+    // latest_status_by_conversations：recent_secs 时间窗应过滤掉过旧的 trace。
+    #[test]
+    fn latest_status_recent_window_filters_stale() {
+        let store = mem_store();
+        // 一条很旧的 error（2026-06-01，远超任何小窗口）。
+        let mut stale = sample(TraceSample {
+            trace_id: "s-1",
+            status: "error",
+            credential_id: 9,
+            model: "m1",
+        });
+        stale.conversation_id = Some("conv-stale".to_string());
+        stale.ts = "2026-06-01T00:00:00Z".to_string();
+        stale.throttle_count = 1;
+        store.insert(&stale);
+        // 大窗口(0=不限) → 能查到旧 error。
+        let all = store.latest_status_by_conversations(&["conv-stale".to_string()], 0);
+        assert_eq!(all.get("conv-stale"), Some(&("error".to_string(), 1)));
+        // 小窗口(60s) → 旧 error 被时间窗滤掉、不再粘住相位。
+        let recent = store.latest_status_by_conversations(&["conv-stale".to_string()], 60);
+        assert_eq!(recent.get("conv-stale"), None, "超出时间窗的旧 error 不应被返回");
     }
 
     #[test]
