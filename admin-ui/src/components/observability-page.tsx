@@ -122,6 +122,20 @@ function accountLabel(id: number, email: string | null | undefined): string {
   return `#${id}`
 }
 
+// ── 账号失衡/过载判定（#20）──────────────────────────────────
+/**
+ * 「失衡/过载」= 该号最近 5min 上游 429 率 > 5%（与后端 rebalance429RateThreshold 对齐），
+ * 或 inflight 占满（current >= max，且 max>0 防 0/0 误报）。命中任一即视为出事：
+ * 卡片标红 + 列表置顶 + 影响全局健康灯。阈值集中在此，别散落魔法数。
+ */
+const IMBALANCE_429_RATE = 0.05
+
+function isAccountImbalanced(acct: NormalizedAccountObservability): boolean {
+  if (acct.upstream429Rate5m > IMBALANCE_429_RATE) return true
+  if (acct.currentMaxInflight > 0 && acct.currentInflight >= acct.currentMaxInflight) return true
+  return false
+}
+
 // ── Thread 视角：六档相位 helpers ──────────────────────────────
 type ThreadPhaseT = import('@/types/api').ThreadPhase
 
@@ -249,6 +263,33 @@ export function ObservabilityPage() {
     return m
   }, [data?.accounts])
 
+  // #22：会话 → thread 真名映射（复用 Thread 视角同一数据源 data.threads，别新造一套）。
+  // 账号卡区的「绑定会话」chip 用它把裸 UUID 换成真名；拿不到才回退 shortSessionId。
+  const sessionNameMap = useMemo(() => {
+    const m = new Map<string, string>()
+    for (const t of data?.threads ?? []) {
+      if (t.threadName) m.set(t.sessionId, t.threadName)
+    }
+    return m
+  }, [data?.threads])
+
+  // #20：账号卡列表「失衡优先」排序——出事的号（429率高/inflight 满）浮到最前，其余按 id 稳定排。
+  const sortedAccounts = useMemo(() => {
+    const list = (data?.accounts ?? []).map(normalizeAccount)
+    return list.sort((a, b) => {
+      const ia = isAccountImbalanced(a) ? 1 : 0
+      const ib = isAccountImbalanced(b) ? 1 : 0
+      if (ia !== ib) return ib - ia
+      return a.id - b.id
+    })
+  }, [data?.accounts])
+
+  // #20：存在任一失衡号 → 全局健康那行整体变色（黄/红）。
+  const hasImbalance = useMemo(
+    () => sortedAccounts.some(isAccountImbalanced),
+    [sortedAccounts],
+  )
+
   const sessionRows = useMemo(() => {
     if (!data) return []
     const ids = new Set<string>()
@@ -355,6 +396,7 @@ export function ObservabilityPage() {
           activeSessionTotal={data?.activeSessionTotal ?? 0}
           global429={data?.globalUpstream429Rate5m ?? 0}
           totalThroughput={totalThroughput}
+          hasImbalance={hasImbalance}
           isLoading={isLoading}
         />
 
@@ -370,8 +412,8 @@ export function ObservabilityPage() {
             </Card>
           ) : (
             <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-              {data!.accounts.map((acc) => (
-                <AccountCard key={acc.id} account={normalizeAccount(acc)} />
+              {sortedAccounts.map((acc) => (
+                <AccountCard key={acc.id} account={acc} sessionNameMap={sessionNameMap} />
               ))}
             </div>
           )}
@@ -538,24 +580,60 @@ function GlobalHealthBar({
   activeSessionTotal,
   global429,
   totalThroughput,
+  hasImbalance,
   isLoading,
 }: {
   stateCounts: { healthy: number; halfOpen: number; open: number; disabled: number }
   activeSessionTotal: number
   global429: number
   totalThroughput: number
+  hasImbalance: boolean
   isLoading: boolean
 }) {
   const overBudget = global429 > 0.02
   const nearBudget = global429 > 0.01 && !overBudget
 
+  // #20：全局健康严重度——有失衡号 / 有熔断(OPEN) → 红；有半开恢复中 → 黄；全健康才绿。
+  // isLoading 时保持中性（不误报）。
+  const severity: 'green' | 'amber' | 'red' = isLoading
+    ? 'green'
+    : hasImbalance || stateCounts.open > 0
+      ? 'red'
+      : stateCounts.halfOpen > 0
+        ? 'amber'
+        : 'green'
+  const severityLabel =
+    severity === 'red' ? '有号失衡' : severity === 'amber' ? '恢复中' : '全部健康'
+
   return (
-    <Card className="mb-6 border-border/80">
+    <Card
+      className={cn(
+        'mb-6 transition-colors',
+        severity === 'red' && 'border-red-500/60 bg-red-500/5 dark:bg-red-500/10',
+        severity === 'amber' && 'border-amber-500/60 bg-amber-500/5 dark:bg-amber-500/10',
+        severity === 'green' && 'border-border/80',
+      )}
+    >
       <CardContent className="flex flex-col gap-4 p-4 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex flex-wrap items-center gap-4">
           <div className="flex items-center gap-2">
-            <HeartPulse className="h-5 w-5 text-muted-foreground" />
+            <HeartPulse
+              className={cn(
+                'h-5 w-5',
+                severity === 'red' && 'text-red-600 dark:text-red-400',
+                severity === 'amber' && 'text-amber-600 dark:text-amber-400',
+                severity === 'green' && 'text-emerald-600 dark:text-emerald-400',
+              )}
+            />
             <span className="text-sm font-medium">全局健康</span>
+            <Badge
+              variant={
+                severity === 'red' ? 'destructive' : severity === 'amber' ? 'warning' : 'success'
+              }
+              className="text-[11px]"
+            >
+              {isLoading ? '—' : severityLabel}
+            </Badge>
           </div>
           <div className="flex items-center gap-3 text-sm">
             <span className="flex items-center gap-1.5" title="Healthy">
@@ -603,12 +681,20 @@ function GlobalHealthBar({
   )
 }
 
-function AccountCard({ account }: { account: NormalizedAccountObservability }) {
+function AccountCard({
+  account,
+  sessionNameMap,
+}: {
+  account: NormalizedAccountObservability
+  sessionNameMap: Map<string, string>
+}) {
   const isOpen = account.state === 'OPEN'
   const isHalfOpen = account.state === 'HALF_OPEN'
   const isHealthy = account.state === 'HEALTHY'
   const cooled = account.cooldownRemainingMs > 0
   const reopenMs = useLiveCountdown(account.reopenInMs)
+  // #20：失衡/过载（429率高 或 inflight 满）。即便状态仍是 Healthy 也要醒目标红喊出来。
+  const imbalanced = isAccountImbalanced(account)
   const safeRpsRange =
     account.learnedSafeRpsLo > 0 || account.learnedSafeRpsHi > 0
       ? `${account.learnedSafeRpsLo.toFixed(2)}–${account.learnedSafeRpsHi.toFixed(2)} rps`
@@ -623,6 +709,8 @@ function AccountCard({ account }: { account: NormalizedAccountObservability }) {
         isHalfOpen && 'border-amber-500/50 bg-amber-500/5 dark:bg-amber-500/10',
         isHealthy && !cooled && 'border-emerald-500/20',
         !isOpen && !isHalfOpen && cooled && 'border-amber-500/40 bg-amber-500/5',
+        // 失衡红圈盖在最上层：ring 不与 border 冲突，Healthy 卡也能被一眼揪出来。
+        imbalanced && 'border-red-500/70 bg-red-500/5 ring-2 ring-red-500/70 dark:bg-red-500/10',
       )}
     >
       <CardHeader className="pb-2">
@@ -641,9 +729,17 @@ function AccountCard({ account }: { account: NormalizedAccountObservability }) {
               )}
             </div>
           </div>
-          <Badge variant={stateBadgeVariant(account.state)}>
-            {stateLabel(account.state)}
-          </Badge>
+          <div className="flex shrink-0 flex-col items-end gap-1">
+            <Badge variant={stateBadgeVariant(account.state)}>
+              {stateLabel(account.state)}
+            </Badge>
+            {imbalanced && (
+              <Badge variant="destructive" className="gap-1 text-[10px]">
+                <ShieldAlert className="h-3 w-3" />
+                失衡/过载
+              </Badge>
+            )}
+          </div>
         </div>
         {account.stateReason && (
           <p className="mt-1.5 text-[11px] text-muted-foreground leading-snug">
@@ -692,11 +788,20 @@ function AccountCard({ account }: { account: NormalizedAccountObservability }) {
             <span className="text-[12px] text-muted-foreground">无</span>
           ) : (
             <div className="flex flex-wrap gap-1">
-              {account.boundSessions.map((sid) => (
-                <Badge key={sid} variant="outline" className="font-mono text-[10px]">
-                  {shortSessionId(sid)}
-                </Badge>
-              ))}
+              {account.boundSessions.map((sid) => {
+                // #22：能拿到 thread 真名就显真名（非等宽字体），拿不到才回退 shortSessionId（等宽）。
+                const realName = sessionNameMap.get(sid)
+                return (
+                  <Badge
+                    key={sid}
+                    variant="outline"
+                    className={cn('max-w-[180px] truncate text-[10px]', !realName && 'font-mono')}
+                    title={realName ? `${realName}（${sid}）` : sid}
+                  >
+                    {realName ?? shortSessionId(sid)}
+                  </Badge>
+                )
+              })}
             </div>
           )}
         </div>
@@ -812,34 +917,50 @@ function ThreadRow({
       )}
     >
       <CardContent className="p-0">
-        <button
-          type="button"
-          onClick={() => setExpanded((v) => !v)}
-          className="flex w-full items-center gap-3 px-4 py-3 text-left hover:bg-secondary/30"
-        >
-          <span
-            className={cn('h-2.5 w-2.5 shrink-0 rounded-full', phaseDotColor(thread.phase))}
-            aria-label={phaseLabel(thread.phase)}
-          />
-          <span className="min-w-0 flex-1 truncate text-[13px] font-medium" title={displayName}>
-            {displayName}
-          </span>
-          <span className="hidden shrink-0 text-[12px] text-muted-foreground sm:inline">
-            {accountLabel(thread.boundAccountId, thread.accountEmail)}
-          </span>
-          <Badge variant={phaseBadgeVariant(thread.phase)} className="shrink-0 text-[11px]">
-            {phaseLabel(thread.phase)}
-          </Badge>
-          {thread.pinnedAccountId != null && (
-            <Badge variant="secondary" className="shrink-0 gap-1 text-[11px]">
-              <Pin className="h-3 w-3" />
-              已 Pin #{thread.pinnedAccountId}
+        {/* 折叠行：toggle 按钮 + 解绑按钮作为兄弟节点（避免按钮嵌套），孤儿 Pin 不展开也能一键清。 */}
+        <div className="flex w-full items-center gap-2 pr-3">
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            className="flex min-w-0 flex-1 items-center gap-3 px-4 py-3 text-left hover:bg-secondary/30"
+          >
+            <span
+              className={cn('h-2.5 w-2.5 shrink-0 rounded-full', phaseDotColor(thread.phase))}
+              aria-label={phaseLabel(thread.phase)}
+            />
+            <span className="min-w-0 flex-1 truncate text-[13px] font-medium" title={displayName}>
+              {displayName}
+            </span>
+            <span className="hidden shrink-0 text-[12px] text-muted-foreground sm:inline">
+              {accountLabel(thread.boundAccountId, thread.accountEmail)}
+            </span>
+            <Badge variant={phaseBadgeVariant(thread.phase)} className="shrink-0 text-[11px]">
+              {phaseLabel(thread.phase)}
             </Badge>
+            {thread.pinnedAccountId != null && (
+              <Badge variant="secondary" className="shrink-0 gap-1 text-[11px]">
+                <Pin className="h-3 w-3" />
+                已 Pin #{thread.pinnedAccountId}
+              </Badge>
+            )}
+            <span className="hidden shrink-0 text-[11px] text-muted-foreground tabular-nums md:inline">
+              {formatSince(thread.lastSeenMs)}
+            </span>
+          </button>
+          {isPinned && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 shrink-0 px-2 text-[11px] text-muted-foreground hover:text-foreground"
+              onClick={() => void handleUnpin()}
+              disabled={unpinSession.isPending}
+              title="解除该会话的 Pin 绑定"
+            >
+              <PinOff className="mr-1 h-3.5 w-3.5" />
+              解绑
+            </Button>
           )}
-          <span className="hidden shrink-0 text-[11px] text-muted-foreground tabular-nums md:inline">
-            {formatSince(thread.lastSeenMs)}
-          </span>
-        </button>
+        </div>
 
         {expanded && (
           <div className="border-t border-border/50 px-4 py-3 text-[12px]">

@@ -344,6 +344,17 @@ pub struct MultiAccountConfig {
     /// 默认 4。0 表示关闭睡眠疏散。
     #[serde(default = "default_rebalance_bound_gap")]
     pub rebalance_bound_gap: usize,
+    /// 被限流硬触发疏散：某号最近 5 分钟「上游 429 率」超过此值（且持续撞墙、非单次瞬态）即立刻把它名下
+    /// 压力最小的会话疏散到最健康的号——**绕过 RPM/利用率门槛**，因为「正在被限流」是比「忙」更紧急的信号。
+    /// 这是修「单人低 RPM 场景下号被 429 压垮、却因 RPM 差够不到 rebalance_rpm_gap 而永不疏散」的核心信号。
+    /// 默认 0.05（5%）。0 表示关闭按 429 率硬触发疏散。
+    #[serde(default = "default_rebalance_429_rate_threshold")]
+    pub rebalance_429_rate_threshold: f64,
+    /// 利用率信号的「饱和」前置门：仅当原号利用率 ≥ 此值才考虑按利用率差疏散。
+    /// 原为硬编码 1.0（要真正贴满天花板才动），导致「快撞墙但还没撞满」的中间态永不触发。
+    /// 下调到 0.8 让中间态也能提前疏散。默认 0.8。
+    #[serde(default = "default_rebalance_util_saturated")]
+    pub rebalance_util_saturated: f64,
     /// 优先级独享：高优先 Thread 独享号时，仅当该号余量 headroom 比例 > 此值，才允许「负载特别低的」
     /// priority=0 Thread 蹭进来填空（蹭的不抢高优先资源、也保持粘性）。默认 0.5（留一半余量才让蹭）。
     #[serde(default = "default_exclusive_headroom_ratio")]
@@ -409,6 +420,8 @@ impl Default for MultiAccountConfig {
             scheduler_tick_secs: default_scheduler_tick_secs(),
             rebalance_rpm_gap: default_rebalance_rpm_gap(),
             rebalance_bound_gap: default_rebalance_bound_gap(),
+            rebalance_429_rate_threshold: default_rebalance_429_rate_threshold(),
+            rebalance_util_saturated: default_rebalance_util_saturated(),
             exclusive_headroom_ratio: default_exclusive_headroom_ratio(),
             exclusive_borrow_idle_secs: default_exclusive_borrow_idle_secs(),
             reclaim_debounce_secs: default_reclaim_debounce_secs(),
@@ -864,11 +877,19 @@ fn default_scheduler_tick_secs() -> u64 {
 }
 
 fn default_rebalance_rpm_gap() -> f64 {
-    8.0
+    2.0
 }
 
 fn default_rebalance_bound_gap() -> usize {
     4
+}
+
+fn default_rebalance_429_rate_threshold() -> f64 {
+    0.05
+}
+
+fn default_rebalance_util_saturated() -> f64 {
+    0.8
 }
 
 fn default_exclusive_headroom_ratio() -> f64 {

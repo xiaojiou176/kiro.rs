@@ -554,7 +554,17 @@ mod tests {
     use std::env::temp_dir;
 
     fn store() -> Arc<LearningStore> {
-        let path = temp_dir().join(format!("account_learning_test_{}.json", std::process::id()));
+        // 唯一路径(pid + 进程内原子序号)：旧版只用 pid → 同一测试二进制内所有 store() 共享同一文件，
+        // 并行跑时互相覆盖计数 → test_learning_sample_count_is_per_request 偶发假红(已实测复现)。
+        // 加原子序号根治隔离：并行测试各自独立文件、永不串扰。
+        use std::sync::atomic::AtomicU64;
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = temp_dir().join(format!(
+            "account_learning_test_{}_{}.json",
+            std::process::id(),
+            n
+        ));
         let _ = std::fs::remove_file(&path);
         LearningStore::new(LearningConfig::default(), Some(path))
     }

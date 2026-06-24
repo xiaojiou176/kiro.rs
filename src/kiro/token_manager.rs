@@ -2247,19 +2247,29 @@ impl MultiTokenManager {
         // 独享归属号（当前 TTL 内绑有 priority>0 会话的号）：温和均衡的目标号**必须排除**它们，
         // 否则会把普通 squatter 搬进独享号、下个 tick exclusive 又赶走 = 反向 churn（Reviewer Finding #2）。
         let exclusive_owned = self.exclusive_owned_accounts();
-        // 阶段一（不持 affinity 锁）：把所有「想卸载」的源号按 RPM 降序排出候选序列。rebalance_target
+        // 阶段一（不持 affinity 锁）：把所有「想卸载」的源号排出候选序列。rebalance_target
         // 内部会锁 affinity/limiters，故此处绝不持 affinity 锁（防锁交叉死锁）。
-        let mut candidates: Vec<(u64, u64, usize)> = Vec::new(); // (src, target, src_rpm)
+        // 元组 = (src, target, 是否被限流硬触发, src_rpm)。
+        let mut candidates: Vec<(u64, u64, bool, usize)> = Vec::new();
         for (src, _) in &pool {
             if let Some((target, _)) =
                 self.rebalance_target_excl(&pool, *src, ma, None, &exclusive_owned)
             {
-                candidates.push((*src, target, self.rpm(*src)));
+                // 被 429 压垮的号「成功 RPM」往往很低（请求大多失败），若只按 RPM 排序会被沉到队尾、
+                // 被高 RPM 但健康的号挤掉本 tick 的疏散名额——而「正在被限流」恰恰最该先救。
+                // 故单独标一个 429 硬触发位，排序时让它压过 RPM（修「最紧急的反而最后疏散」盲区）。
+                let throttled = ma.rebalance_429_rate_threshold > 0.0
+                    && self.account_429_rate_sustained(*src) >= ma.rebalance_429_rate_threshold;
+                candidates.push((*src, target, throttled, self.rpm(*src)));
             }
         }
-        // RPM 高的源优先卸载；但**不止试最忙那个**——它若没可搬会话（全 pin/全高优先/全防抖），
-        // 回退到次忙的源（修 Reviewer Finding #1 队头阻塞活锁）。
-        candidates.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        // 优先级：① 被限流(429 硬触发)的源最先卸载；② 其次 RPM 高的；**不止试最忙那个**——
+        // 它若没可搬会话（全 pin/全高优先/全防抖），回退到次紧急/次忙的源（修队头阻塞活锁）。
+        candidates.sort_by(|a, b| {
+            b.2.cmp(&a.2) // 被限流的(true)排前
+                .then(b.3.cmp(&a.3)) // 再按 RPM 降序
+                .then(a.0.cmp(&b.0)) // id 稳定
+        });
         let pinned = self.pinned_sessions();
         let now = Utc::now();
         let debounce = Duration::seconds(ma.switch_debounce_secs as i64);
@@ -2267,7 +2277,7 @@ impl MultiTokenManager {
         let mut chosen: Option<(String, u64, u64, i32)> = None; // (sid, src, target, prio)
         {
             let aff = self.affinity.lock();
-            'outer: for (src, target, _) in &candidates {
+            'outer: for (src, target, _throttled, _rpm) in &candidates {
                 let mut victim: Option<(String, i32)> = None;
                 let mut oldest = now;
                 for (sid, b) in aff.iter() {
@@ -2573,6 +2583,32 @@ impl MultiTokenManager {
         if available.len() < 2 {
             return None;
         }
+        // ⓪′ 被限流硬触发（最高优先级，**绕过 RPM/util 门**）。根治「单人低 RPM 场景下号被 429
+        //    压垮、却因 RPM 差够不到 rebalance_rpm_gap 而永不疏散」：只要本号最近 5 分钟上游 429 率
+        //    超过 rebalance_429_rate_threshold（且持续撞墙、非单次瞬态），就立刻把它名下会话疏散到
+        //    最健康（利用率最低）的号。「正在被限流」比「忙」更紧急，必须先于其它信号处理。
+        if ma.rebalance_429_rate_threshold > 0.0
+            && self.account_429_rate_sustained(current) >= ma.rebalance_429_rate_threshold
+        {
+            if let Some((tid, tcreds)) = available
+                .iter()
+                .filter(|(id, _)| *id != current)
+                .filter(|(id, _)| Some(*id) != exclude_evicted)
+                .filter(|(id, _)| !exclude_owned.contains(id))
+                .filter(|(id, _)| !self.is_account_open(*id))
+                .min_by(|(a, _), (b, _)| {
+                    self.account_utilization(*a)
+                        .partial_cmp(&self.account_utilization(*b))
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.cmp(b))
+                })
+            {
+                // 目标号自己不能也在被限流（429 率低于阈值才算「健康落脚点」）。
+                if self.account_429_rate_sustained(*tid) < ma.rebalance_429_rate_threshold {
+                    return Some((*tid, tcreds.clone()));
+                }
+            }
+        }
         // ⓪ RPM 纯负载信号（修「忙但没撞墙」盲区，第一优先级，**不挂 util 的 SATURATED 门**）。
         //    根因：原有 util 信号要 cur_util≥1.0 才触发，而号「发得勤(rpm 高)但没真撞墙(cd=0/429=0)」
         //    时 util 不到 1.0 → 永远不迁 → 会话黏死。这里直接比真实 RPM：本号 rpm 比全局最空号高出
@@ -2600,8 +2636,9 @@ impl MultiTokenManager {
             let cur_util = self.account_utilization(current);
             // 前置门：仅当原号「真的接近/超过自己的天花板」(util ≥ SATURATED)才考虑按利用率迁移。
             // 否则单次瞬态 429 也会把 util 抬高、引发不必要的会话搬家(churn)。
-            const SATURATED: f64 = 1.0;
-            if cur_util >= SATURATED {
+            // SATURATED 现由 config.rebalance_util_saturated 提供（默认 0.8，下调让「快撞墙但没撞满」也触发）。
+            let saturated = ma.rebalance_util_saturated;
+            if cur_util >= saturated {
                 // 找利用率最低的「别的号」（最有余量）。
                 if let Some((tid, tcreds)) = available
                     .iter()
@@ -2687,6 +2724,17 @@ impl MultiTokenManager {
                 rate_util + throttle_pressure
             }
             None => 0.0,
+        }
+    }
+
+    /// 某号最近 5 分钟「持续撞墙」的上游 429 率（供按 429 率硬触发疏散用）。
+    /// 与 [`Self::account_utilization`] 同口径：只有 `consecutive_throttles >= 2`（持续撞墙、
+    /// 非单次瞬态）才返回真实 429 率，否则返回 0——防单次瞬态 429 引发不必要的会话搬家(churn)。
+    fn account_429_rate_sustained(&self, id: u64) -> f64 {
+        let scope = ThrottleScope::UserCredential(id);
+        match self.limiters.observe_full(&scope) {
+            Some(o) if o.consecutive_throttles >= 2 => o.upstream_429_rate_5m,
+            _ => 0.0,
         }
     }
 
@@ -7007,6 +7055,60 @@ mod tests {
         );
     }
 
+    // #18 核心反假绿（429 率硬触发疏散）：单人低 RPM 场景下，busy 号被上游 429 压垮（429 率高），
+    // 但它和 idle 号的 RPM 差很小（够不到 rebalance_rpm_gap）、利用率也没贴满 util 门——
+    // 旧逻辑下三条信号全摸不到 → busy 永不疏散 → 会话黏死被 429 反复打（owner 截图 #19 12.5% 那种）。
+    // 新增的「429 率硬触发」必须绕过 RPM/util 门、直接把 busy 的会话疏散到健康的 idle 号。
+    #[tokio::test]
+    async fn test_rebalance_by_429_rate_hard_trigger() {
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.switch_debounce_secs = 0; // 不防抖，便于断言
+        // 关掉 RPM / 利用率 / 绑定数 / 会话数 四条常规信号，单独验「429 率硬触发」这一条新路。
+        config.adaptive_limit.multi_account.rebalance_rpm_gap = 0.0;
+        config.adaptive_limit.multi_account.rebalance_utilization_gap = 0.0;
+        config.adaptive_limit.multi_account.rebalance_bound_gap = 0;
+        config.adaptive_limit.multi_account.rebalance_min_gap = 0;
+        // 429 率硬触发门设 5%（与 live config 对齐）。
+        config.adaptive_limit.multi_account.rebalance_429_rate_threshold = 0.05;
+        let manager = affinity_manager(config);
+        // 把 sess-429 绑到 busy 号。
+        let c = manager
+            .acquire_context(None, None, Some("sess-429"))
+            .await
+            .unwrap();
+        let busy = c.id;
+        let idle = if busy == 1 { 2 } else { 1 };
+        // 让 busy 号「持续撞墙」：撞 ≥2 次 429 → consecutive_throttles>=2 且 upstream_429_rate_5m 拉高。
+        let busy_lim = manager
+            .limiters()
+            .for_scope(&ThrottleScope::UserCredential(busy));
+        for _ in 0..3 {
+            busy_lim
+                .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None, 0)
+                .await;
+        }
+        // idle 号保持干净（无 429）→ 是健康落脚点。
+        let available: Vec<_> = manager
+            .available_credentials(None, None)
+            .into_iter()
+            .collect();
+        let target = manager.rebalance_target(
+            &available,
+            busy,
+            &manager.config.adaptive_limit.multi_account,
+            None,
+        );
+        assert!(
+            target.is_some(),
+            "busy 号 429 率高（持续撞墙）→ 即便 RPM/util/会话数信号全关，429 硬触发也应疏散它"
+        );
+        assert_eq!(
+            target.unwrap().0,
+            idle,
+            "429 硬触发应把会话疏散到健康（无 429）的 idle 号 {idle}"
+        );
+    }
+
     // P2-b 核心反假绿：调用门 rebalance_signal_enabled 必须「util_gap>0 或 min_gap>0」任一即开。
     // 旧调用门只看 `rebalance_min_gap > 0`，min_gap=0 时整段 short-circuit → 连 rebalance_target 都不调
     // → util 信号被绑死永远摸不到（#19 满载不迁 #18 的雷）。这里直接对纯函数断言四种组合，钉死布尔逻辑。
@@ -7721,6 +7823,44 @@ mod tests {
         let aff = m.affinity.lock();
         let on1 = aff.values().filter(|b| b.credential_id == 1).count();
         assert_eq!(on1, 4, "应从 #1 疏散走 1 个会话");
+    }
+
+    // ①′ #18 排序优先级反假绿：被 429 压垮的源「成功 RPM」往往很低，若候选只按 RPM 排序会被沉到队尾、
+    // 被高 RPM 但健康的号挤掉本 tick 疏散名额——而「正在被限流」恰恰最该先救。这里造：
+    // #1 被持续 429（429 率高、绑 1 个会话）、#2 健康但 RPM 高（绑 1 个会话）、#3 空。
+    // 期望：本 tick 先疏散 #1（被限流），而不是 #2（高 RPM）。
+    #[tokio::test]
+    async fn test_scheduler_429_source_evacuated_before_high_rpm() {
+        let m = scheduler_manager();
+        // #1 持续撞 429（≥2 次 → consecutive>=2 且 429 率≈100% > 5% 阈值）。
+        let lim1 = m.limiters().for_scope(&ThrottleScope::UserCredential(1));
+        for _ in 0..3 {
+            lim1.on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None, 0)
+                .await;
+        }
+        // #2 健康、但 RPM 高（多次 note_request 抬高它的 rpm，使其在旧排序里排在 #1 前面）。
+        for _ in 0..10 {
+            m.note_request(2);
+        }
+        // 各绑 1 个睡眠会话（都够老、可被搬；故意让 #1 不靠会话数取胜，单验 429 排序优先）。
+        insert_binding(&m, "on-throttled-1", 1, 120);
+        insert_binding(&m, "on-healthy-2", 2, 120);
+        // #1 被 429（且撞够次数可能进 OPEN），用 available 过滤后它若不可用就无从验证；
+        // 故先确认 #1 仍在候选池（throttled 但未被排除）。若已 OPEN 被排除，本断言放宽为「#1 会话最终离开 #1」。
+        let moved = m.rebalance_tick();
+        assert_eq!(moved, 1, "应疏散恰好 1 个会话");
+        let aff = m.affinity.lock();
+        // 关键断言：被搬走的是 #1（被限流源）名下的会话，不是 #2（高 RPM 健康源）。
+        let throttled_still_on_1 = aff.get("on-throttled-1").map(|b| b.credential_id) == Some(1);
+        let healthy_still_on_2 = aff.get("on-healthy-2").map(|b| b.credential_id) == Some(2);
+        assert!(
+            !throttled_still_on_1,
+            "被 429 压垮的 #1 名下会话应被优先疏散走（实际还黏在 #1=排序没把限流源提前）"
+        );
+        assert!(
+            healthy_still_on_2,
+            "高 RPM 但健康的 #2 名下会话本 tick 不该被先搬（限流源 #1 才是最该先救的）"
+        );
     }
 
     // ② 防回弹：会话刚从 #2 被搬到 #1（last_evicted_from=2），即便 #1 过载也不许把它搬回 #2。
