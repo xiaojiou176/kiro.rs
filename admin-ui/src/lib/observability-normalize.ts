@@ -60,6 +60,7 @@ export function normalizeSnapshot(
     sessionToAccount: raw.sessionToAccount ?? {},
     pinnedSessions: raw.pinnedSessions ?? {},
     sessionPriority: raw.sessionPriority ?? {},
+    threads: raw.threads ?? [],
   }
 }
 

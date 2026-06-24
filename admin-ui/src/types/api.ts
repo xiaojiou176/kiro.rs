@@ -635,6 +635,41 @@ export interface ObservabilitySnapshot {
   accountStateCounts?: Record<string, number>
   /** 调度模式，如 multi_account_affinity / single_account */
   schedulingMode?: string
+  /** Thread 视角观测条目（每个活跃会话一条；旧版后端可能缺失） */
+  threads?: ThreadObservation[]
+}
+
+/** Thread 当前相位（六档；状态描述的是「绑定账号」，除 idle 描述 thread 自身） */
+export type ThreadPhase =
+  | 'running'
+  | 'rateLimited'
+  | 'queued'
+  | 'justMigrated'
+  | 'errored'
+  | 'idle'
+
+/** Thread 视角：单个会话的观测条目（Thread 面板一行） */
+export interface ThreadObservation {
+  /** 原始 session UUID（== Codex thread id == conversationId） */
+  sessionId: string
+  /** thread 真名（从 ~/.codex/session_index.jsonl 解析）；null 则前端显示截断 UUID */
+  threadName: string | null
+  /** 当前绑定的凭据 id */
+  boundAccountId: number
+  /** 手动 Pin 的目标凭据 id（null=未 Pin）；前端原生显示「已 Pin #N」 */
+  pinnedAccountId: number | null
+  /** 绑定账号的邮箱（可空） */
+  accountEmail: string | null
+  /** 推断相位（六档） */
+  phase: ThreadPhase
+  /** 距上次活动毫秒（now - last_seen） */
+  lastSeenMs: number
+  /** 最近一条 trace 累计撞到的上游 429 次数 */
+  recentThrottleCount: number
+  /** 最近一条 trace 的最终状态（success/error/interrupted）；可空 */
+  lastFinalStatus: string | null
+  /** 绑定建立时间（RFC3339） */
+  boundAt: string
 }
 
 /** Overflow-on-busy（撞墙迁移）子配置（GET /config/rate-limit 内嵌 + PUT 回显） */
