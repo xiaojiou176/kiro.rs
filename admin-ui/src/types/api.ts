@@ -605,6 +605,10 @@ export interface AccountObservability {
   currentInflight?: number
   /** 当前发送速率 (rps) */
   currentRateRps?: number
+  /** goodput 控制器实测吞吐：窗口内**成功请求/秒**(真实流量，非容量上限)。后端 goodput_rps。 */
+  goodputRps?: number
+  /** goodput 控制器：是否 app-limited(在飞低于并发上限=没活干，不是到顶) */
+  appLimited?: boolean
   /** 学习到的安全 rps 区间下界 */
   learnedSafeRpsLo?: number
   /** 学习到的安全 rps 区间上界 */

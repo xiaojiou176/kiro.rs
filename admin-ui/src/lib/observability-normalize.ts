@@ -18,6 +18,8 @@ export type NormalizedAccountObservability = Required<
     | 'currentMaxInflight'
     | 'currentInflight'
     | 'currentRateRps'
+    | 'goodputRps'
+    | 'appLimited'
     | 'learnedSafeRpsLo'
     | 'learnedSafeRpsHi'
     | 'p80HeldMs'
@@ -38,6 +40,8 @@ export function normalizeAccount(raw: AccountObservability): NormalizedAccountOb
     currentMaxInflight: raw.currentMaxInflight ?? 0,
     currentInflight: raw.currentInflight ?? 0,
     currentRateRps: raw.currentRateRps ?? raw.limiterRateRps ?? 0,
+    goodputRps: raw.goodputRps ?? 0,
+    appLimited: raw.appLimited ?? false,
     learnedSafeRpsLo: raw.learnedSafeRpsLo ?? 0,
     learnedSafeRpsHi: raw.learnedSafeRpsHi ?? 0,
     p80HeldMs: raw.p80HeldMs ?? 0,

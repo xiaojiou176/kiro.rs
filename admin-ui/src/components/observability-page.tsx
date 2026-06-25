@@ -362,7 +362,18 @@ export function ObservabilityPage() {
     return counts
   }, [data?.accounts])
 
+  // 总吞吐 = 各号【实测吞吐 goodputRps】之和（窗口内成功请求/秒，真实流量）。
+  // ⚠️ 不能用 currentRateRps——那是限速器【允许速率上限/容量】，不是真发了多少；
+  //   把容量当吞吐会让面板在系统空闲时也显示「很忙」(一种假绿)。
   const totalThroughput = useMemo(
+    () =>
+      (data?.accounts ?? [])
+        .filter((a) => !a.disabled && normalizeAccount(a).state !== 'DISABLED')
+        .reduce((s, a) => s + normalizeAccount(a).goodputRps, 0),
+    [data?.accounts],
+  )
+  // 容量上限之和（各号限速器当前允许速率）——单独标，给「还能吃多少」参考，不冒充吞吐。
+  const totalCapacity = useMemo(
     () =>
       (data?.accounts ?? [])
         .filter((a) => !a.disabled && normalizeAccount(a).state !== 'DISABLED')
@@ -396,6 +407,7 @@ export function ObservabilityPage() {
           activeSessionTotal={data?.activeSessionTotal ?? 0}
           global429={data?.globalUpstream429Rate5m ?? 0}
           totalThroughput={totalThroughput}
+          totalCapacity={totalCapacity}
           hasImbalance={hasImbalance}
           isLoading={isLoading}
         />
@@ -580,6 +592,7 @@ function GlobalHealthBar({
   activeSessionTotal,
   global429,
   totalThroughput,
+  totalCapacity,
   hasImbalance,
   isLoading,
 }: {
@@ -587,6 +600,7 @@ function GlobalHealthBar({
   activeSessionTotal: number
   global429: number
   totalThroughput: number
+  totalCapacity: number
   hasImbalance: boolean
   isLoading: boolean
 }) {
@@ -656,9 +670,12 @@ function GlobalHealthBar({
             </span>
           </div>
           <div className="text-sm text-muted-foreground">
-            总吞吐{' '}
+            实测吞吐{' '}
             <span className="font-mono font-medium text-foreground tabular-nums">
               {isLoading ? '—' : `${totalThroughput.toFixed(2)} rps`}
+            </span>
+            <span className="ml-1 text-xs text-muted-foreground/70">
+              {isLoading ? '' : `(容量上限 ${totalCapacity.toFixed(2)} rps)`}
             </span>
           </div>
         </div>
@@ -759,7 +776,8 @@ function AccountCard({
         </div>
 
         <div className="grid grid-cols-2 gap-x-3 gap-y-2">
-          <Metric label="当前 rps" value={`${account.currentRateRps.toFixed(2)} rps`} />
+          <Metric label="实测吞吐" value={`${account.goodputRps.toFixed(2)} rps`} />
+          <Metric label="速率上限" value={`${account.currentRateRps.toFixed(2)} rps`} />
           <Metric label="Safe rps" value={safeRpsRange} />
           <Metric label="RPM (60s)" value={String(account.rpm)} />
           <Metric
