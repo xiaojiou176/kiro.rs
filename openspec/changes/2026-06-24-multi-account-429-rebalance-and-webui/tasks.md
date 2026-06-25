@@ -32,3 +32,12 @@
 - [ ] push 三仓
 - [~] 真高并发压测验证「峰值绑死紧急疏散」核心路径 — **部分 live 实证**：2026-06-25 日志抓到 #19 真撞 429（9 次 on_throttle，429率峰值 16.7%），撞墙后 27s 触发 affinity_switch 切号疏散（06:41:35 撞→06:42:02 切），**非绑死、自动切号生效**；但仍非"人为高并发压测"，留 owner 做满负载验证。
 - [ ] 重编后肉眼验 WebUI 四处
+
+## churn 根治②：select-time 环形 churn（2026-06-25，commit 793e93）
+- [x] 翻 live 日志定位第 2 根因：churn 由 scheduler_rebalance(3341)+affinity_switch(2301,select-time 每请求)对半驱动；根因①(771e915)只治了 scheduler 路径
+- [x] AffinityBinding 加环形驱逐历史 recent_evicted_from(Vec<u64>，cap=pool_len-1，#[serde(default)] 兼容旧 session_affinity.json)
+- [x] rebalance_target_excl 的 exclude_evicted: Option<u64> → &[u64]；select-time 传整段 recent_evicted_from（而非单槽 last_evicted_from）→ 排除所有刚离开的号 → 打断 ≥3 号环
+- [x] push_recent_evicted / clear_recent_evicted helper：自愿搬迁压历史(去重+cap)，被迫逃(overflow/OPEN)清空
+- [x] TDD test_select_time_multihop_evict_history_breaks_ring：单槽(c=1) RED 轨迹[1,2,3,1,2,3]绕环；多跳 GREEN 轨迹[1,2,3,4,5]走遍即停 ring_at=None
+- [x] cargo test --release 622 passed/0；连跑 3 次稳；老格式 JSON serde default 空 Vec 不破；无 strand 风险(无 target→Act::Stick 已验)
+- [ ] 重编 binary + 部署让 churn② live 生效(owner 红线，同其它部署项一起)
