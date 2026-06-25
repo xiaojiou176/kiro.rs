@@ -421,6 +421,19 @@ pub fn generate_traceparent(inherited_trace_id: Option<&str>) -> String {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that mutate the **process-global** `KIRO_RS_CAPTURE`
+    /// env var (+ the global `OBS_DIRS` OnceLock). Default `cargo test` runs in
+    /// parallel, so without this lock one test's `remove_var("KIRO_RS_CAPTURE")`
+    /// can fire mid-execution of another's `capture_outbound`/`capture_inbound`
+    /// → it sees capture disabled → writes no file → the `entries.is_empty()`
+    /// assert fails intermittently (flaky). Root-fix = serialize exactly these
+    /// tests (same pattern as `upstream_models::TEST_LOCK`), not `--test-threads=1`.
+    static CAPTURE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_capture_env() -> std::sync::MutexGuard<'static, ()> {
+        CAPTURE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn extract_trace_id_ok() {
         let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
@@ -488,6 +501,8 @@ mod tests {
 
     #[test]
     fn capture_enabled_respects_env() {
+        // Serialize against other KIRO_RS_CAPTURE-mutating tests (parallel race → flaky).
+        let _g = lock_capture_env();
         // SAFETY: tests run in the same process; restore env after asserting.
         unsafe { std::env::set_var("KIRO_RS_CAPTURE", "1") };
         assert!(capture_enabled());
@@ -537,7 +552,9 @@ mod tests {
 
     #[test]
     fn capture_outbound_writes_disk_when_enabled() {
-        // SAFETY: serialized via --test-threads=1 in CI; restore env after.
+        // Serialize against other KIRO_RS_CAPTURE-mutating tests (parallel race → flaky).
+        let _g = lock_capture_env();
+        // SAFETY: env restored after; serialized in-process via CAPTURE_ENV_LOCK.
         unsafe { std::env::set_var("KIRO_RS_CAPTURE", "1") };
         let tmp =
             std::env::temp_dir().join(format!("kiro-rs-cap-test-{}", Utc::now().format("%s%9f")));
@@ -576,7 +593,9 @@ mod tests {
 
     #[test]
     fn capture_inbound_response_redact_and_preserve() {
-        // SAFETY: serialized via --test-threads=1 in CI; restore env after.
+        // Serialize against other KIRO_RS_CAPTURE-mutating tests (parallel race → flaky).
+        let _g = lock_capture_env();
+        // SAFETY: env restored after; serialized in-process via CAPTURE_ENV_LOCK.
         unsafe { std::env::set_var("KIRO_RS_CAPTURE", "1") };
         let tmp = std::env::temp_dir()
             .join(format!("kiro-rs-cap-inresp-{}", Utc::now().format("%s%9f")));
@@ -638,6 +657,8 @@ mod tests {
 
     #[test]
     fn capture_inbound_noop_when_disabled() {
+        // Serialize against other KIRO_RS_CAPTURE-mutating tests (parallel race → flaky).
+        let _g = lock_capture_env();
         unsafe { std::env::remove_var("KIRO_RS_CAPTURE") };
         // capture_enabled() is false -> must early-return without touching disk.
         // We only assert it does not panic and writes nothing observable here.
