@@ -2628,10 +2628,13 @@ impl MultiTokenManager {
         if ma.rebalance_429_rate_threshold > 0.0
             && self.account_429_rate_sustained(current) >= ma.rebalance_429_rate_threshold
         {
+            // ⚠️ 429 硬触发 = 「被限流被迫逃」(同 overflow/OPEN 性质,非自愿均衡),**不受防 churn 历史
+            //    exclude_evicted 约束**:否则一个刚 churn 走遍几号、历史满了的会话,落到的号又被 429 压垮时,
+            //    历史会把所有健康落脚点都排除掉 → 无 target → 会话卡死在被限流号上,反而破坏 #18「号被压爆
+            //    要自动救」的根本目的。紧急疏散只避开「自己/独享号/熔断号」,绝不被防回弹历史挡住。
             if let Some((tid, tcreds)) = available
                 .iter()
                 .filter(|(id, _)| *id != current)
-                .filter(|(id, _)| !exclude_evicted.contains(id))
                 .filter(|(id, _)| !exclude_owned.contains(id))
                 .filter(|(id, _)| !self.is_account_open(*id))
                 .min_by(|(a, _), (b, _)| {
@@ -7149,6 +7152,54 @@ mod tests {
             target.unwrap().0,
             idle,
             "429 硬触发应把会话疏散到健康（无 429）的 idle 号 {idle}"
+        );
+    }
+
+    // #18 边界④（churn② 回归防护）：429 紧急疏散**不该被防 churn 历史 exclude_evicted 挡住**。
+    //    造：busy 号持续撞墙(429 高),唯一健康落脚点 idle 号**恰好在会话的 recent_evicted_from 历史里**
+    //    (模拟「会话刚 churn 走遍几号、历史满了」)。若 429 分支误用 exclude_evicted,会把 idle 也排除
+    //    → 无 target → 会话卡死在被限流号上(破坏 #18 自动救)。根治后:429 = 被迫逃、绕过历史,仍疏散到 idle。
+    #[tokio::test]
+    async fn test_429_emergency_bypasses_evict_history() {
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.switch_debounce_secs = 0;
+        config.adaptive_limit.multi_account.rebalance_rpm_gap = 0.0;
+        config.adaptive_limit.multi_account.rebalance_utilization_gap = 0.0;
+        config.adaptive_limit.multi_account.rebalance_bound_gap = 0;
+        config.adaptive_limit.multi_account.rebalance_min_gap = 0;
+        config.adaptive_limit.multi_account.rebalance_429_rate_threshold = 0.05;
+        let manager = affinity_manager(config); // 2 号
+        let c = manager
+            .acquire_context(None, None, Some("sess-429h"))
+            .await
+            .unwrap();
+        let busy = c.id;
+        let idle = if busy == 1 { 2 } else { 1 };
+        // busy 持续撞墙。
+        let busy_lim = manager
+            .limiters()
+            .for_scope(&ThrottleScope::UserCredential(busy));
+        for _ in 0..3 {
+            busy_lim
+                .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None, 0)
+                .await;
+        }
+        let available: Vec<_> = manager
+            .available_credentials(None, None)
+            .into_iter()
+            .collect();
+        // 关键:把唯一健康落脚点 idle 放进 exclude_evicted(模拟会话防 churn 历史含它)。
+        // 若 429 分支误用此历史,target 会是 None;根治后 429 绕过历史 → 仍返回 idle。
+        let target = manager.rebalance_target(
+            &available,
+            busy,
+            &manager.config.adaptive_limit.multi_account,
+            &[idle],
+        );
+        assert_eq!(
+            target.map(|t| t.0),
+            Some(idle),
+            "429 紧急疏散应绕过防 churn 历史(被迫逃)、仍疏散到唯一健康号 {idle};若 None=被历史误挡=回归"
         );
     }
 
