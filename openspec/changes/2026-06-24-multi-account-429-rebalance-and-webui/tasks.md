@@ -41,3 +41,4 @@
 - [x] TDD test_select_time_multihop_evict_history_breaks_ring：单槽(c=1) RED 轨迹[1,2,3,1,2,3]绕环；多跳 GREEN 轨迹[1,2,3,4,5]走遍即停 ring_at=None
 - [x] cargo test --release 622 passed/0；连跑 3 次稳；老格式 JSON serde default 空 Vec 不破；无 strand 风险(无 target→Act::Stick 已验)
 - [ ] 重编 binary + 部署让 churn② live 生效(owner 红线，同其它部署项一起)
+- [x] churn② 回归修复：429 紧急疏散绕过防 churn 历史(被迫逃,同 overflow/OPEN);TDD test_429_emergency_bypasses_evict_history(带历史 RED 卡死/绕过 GREEN);623 passed/0。自愿均衡仍排除整段历史(4 处),紧急疏散豁免。
