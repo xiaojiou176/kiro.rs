@@ -2297,6 +2297,16 @@ impl MultiTokenManager {
                         if (now - ls) < debounce {
                             continue; // 切号防抖窗口内，不搬
                         }
+                        // churn 根治(根本不变式)：已被温和均衡搬过、且【搬后从未产生真实活动】
+                        // (last_seen 不晚于 last_switch_at)的会话，不许再被温和均衡搬动。
+                        // 否则同一死睡眠会话会在多号间无限横跳(#a→#b→#c→#a)——last_seen 只由真实
+                        // 请求(select_with_affinity)刷新、搬号不刷新，所以搬过的死睡眠会话永远是「最老
+                        // last_seen」候选、被反复挑中。冻结它(直到它真醒来干活刷新 last_seen)即根除 churn，
+                        // 同时不冻结「搬后又真干活」的会话(它 last_seen 会晚于 last_switch_at → 仍可迁)，
+                        // 也不影响「从没被搬过」的睡眠会话首次散堆(last_switch_at=None → 不进此门)。
+                        if b.last_seen <= ls {
+                            continue;
+                        }
                     }
                     // 压力最小 = last_seen 最老（最久没活动 / 睡得最沉）。
                     if victim.is_none() || b.last_seen < oldest {
@@ -7999,6 +8009,99 @@ mod tests {
         let aff = m.affinity.lock();
         let b = aff.get("just-moved").unwrap();
         assert_ne!(b.credential_id, 2, "防回弹：刚从 #2 搬来的会话不该被搬回 #2");
+    }
+
+    // ②′ churn 根治：一个【已被温和均衡搬过、且搬后从没真实活动过】的睡眠会话，
+    //    不该再被温和均衡搬动。否则同一睡眠会话会在 #a→#b→#c→#a 间无限横跳(churn)——
+    //    owner 实测「8 分钟切 8+ 次号、rpm=0/cd=0」的根因(signal③ 反复挑同一最老空闲会话)。
+    //    根本不变式：温和均衡只搬「搬后又真干过活(last_seen 晚于 last_switch_at)」或「从没被搬过」的会话。
+    #[test]
+    fn test_scheduler_idle_session_not_rechurned_after_move() {
+        let m = scheduler_manager();
+        let now = Utc::now();
+        {
+            let mut aff = m.affinity.lock();
+            // #1 上 1 个「已搬过 + 搬后无活动 + 最老 last_seen」的会话——旧逻辑会把它当最优受害者反复搬。
+            aff.insert(
+                "moved-idle".to_string(),
+                AffinityBinding {
+                    credential_id: 1,
+                    bound_at: now - Duration::seconds(600),
+                    last_seen: now - Duration::seconds(600), // 最老 → 旧逻辑必先挑它
+                    last_switch_at: Some(now - Duration::seconds(300)), // 搬过(300s 前)
+                    last_switch_was_overflow: false,
+                    priority: 0,
+                    last_evicted_from: None, // 防回弹槽空 → 旧逻辑唯一拦不住它的
+                },
+            );
+            // #1 再堆 4 个普通睡眠(没搬过)，凑出 bound_gap≥4 让 #1 成疏散源；它们 last_seen 较新。
+            for i in 0..4 {
+                aff.insert(
+                    format!("fresh-sleep-{i}"),
+                    AffinityBinding {
+                        credential_id: 1,
+                        bound_at: now - Duration::seconds(120),
+                        last_seen: now - Duration::seconds(120),
+                        last_switch_at: None,
+                        last_switch_was_overflow: false,
+                        priority: 0,
+                        last_evicted_from: None,
+                    },
+                );
+            }
+        }
+        // 跑 1 tick。根治后：绝不该挑「moved-idle」(它搬过且搬后没活动)，
+        // 该改挑某个 fresh-sleep(从没搬过、可正当散堆)。
+        let moved = m.rebalance_tick();
+        assert_eq!(moved, 1, "源过载应疏散 1 个(挑可搬的 fresh-sleep，不是 moved-idle)");
+        let aff = m.affinity.lock();
+        assert_eq!(
+            aff.get("moved-idle").unwrap().credential_id,
+            1,
+            "churn 根治：搬过且搬后无真实活动的最老睡眠会话不该被再次搬动(应稳在 #1)"
+        );
+    }
+
+    // ②″ churn 根治不误伤：会话被搬后【真的产生了活动】(last_seen 刷新到晚于 last_switch_at)，
+    //    若它所在号又过载，仍应允许被再次疏散——证明根治只掐「死睡眠 churn」、不冻结真实负载迁移。
+    #[test]
+    fn test_scheduler_active_session_still_movable_after_move() {
+        let m = scheduler_manager();
+        let now = Utc::now();
+        {
+            let mut aff = m.affinity.lock();
+            // 在 #1 放一个「搬过、但搬后又真活动过」的会话：last_switch_at=10s前、last_seen=1s前(晚于切号)。
+            aff.insert(
+                "moved-then-active".to_string(),
+                AffinityBinding {
+                    credential_id: 1,
+                    bound_at: now - Duration::seconds(300),
+                    last_seen: now - Duration::seconds(1), // 搬后又真干活了
+                    last_switch_at: Some(now - Duration::seconds(10)),
+                    last_switch_was_overflow: false,
+                    priority: 0,
+                    last_evicted_from: None,
+                },
+            );
+            // 再堆 4 个睡眠会话到 #1 凑出 bound_gap≥4，使 #1 成疏散源。
+            for i in 0..4 {
+                aff.insert(
+                    format!("sleep-{i}"),
+                    AffinityBinding {
+                        credential_id: 1,
+                        bound_at: now - Duration::seconds(120),
+                        last_seen: now - Duration::seconds(120),
+                        last_switch_at: None,
+                        last_switch_was_overflow: false,
+                        priority: 0,
+                        last_evicted_from: None,
+                    },
+                );
+            }
+        }
+        // 至少应能疏散(不被「搬后无活动」门挡住的有：4 个未搬睡眠 + 这个搬后有活动的都可搬)。
+        let moved = m.rebalance_tick();
+        assert_eq!(moved, 1, "源过载时仍应疏散 1 个(根治不冻结真实可搬会话)");
     }
 
     // ③ Pin 凌驾一切：被 pin 的会话即便在过载号上，也不被巡检搬走。
