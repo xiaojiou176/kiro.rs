@@ -20,8 +20,8 @@
 - [x] npm run build exit 0；dist 已含改动(grep「有号失衡」「切换负载均衡模式」命中产物)
 
 ## owner 红线（未做、留 owner）
-- [ ] cargo build --release 重编 binary + cp 到 bin/（dist 已最新，不必再 npm build）
-- [ ] stop.sh && start.sh 重启
+- [x] cargo build --release 重编 binary + cp 到 bin/（2026-06-25 fresh 核：live binary md5 `9a5deeb7`、PID 55426/55451；deploy-and-verify.sh 路径 bug 已修后部署成功）
+- [x] stop.sh && start.sh 重启（live 已起、:8318+:8317 健康、含 #18+#19回退）
 - [ ] push 三仓
-- [ ] 真高并发压测验证「峰值绑死紧急疏散」核心路径(本 change 最大未验缺口)
+- [~] 真高并发压测验证「峰值绑死紧急疏散」核心路径 — **部分 live 实证**：2026-06-25 日志抓到 #19 真撞 429（9 次 on_throttle，429率峰值 16.7%），撞墙后 27s 触发 affinity_switch 切号疏散（06:41:35 撞→06:42:02 切），**非绑死、自动切号生效**；但仍非"人为高并发压测"，留 owner 做满负载验证。
 - [ ] 重编后肉眼验 WebUI 四处
