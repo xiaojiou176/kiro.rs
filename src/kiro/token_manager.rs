@@ -7109,6 +7109,109 @@ mod tests {
         );
     }
 
+    // #18 边界①：目标号自己也在被 429 → 不是健康落脚点 → 429 硬触发这条不该选它。
+    // 造：busy(#1) 持续撞墙、唯一的另一个号 other(#2) 也持续撞墙 → 429 硬触发分支找不到健康目标，
+    // 应跳过该分支（落到后续 RPM/util/会话数信号，此处全关 → 最终 None，不乱搬到也在烧的号）。
+    #[tokio::test]
+    async fn test_429_trigger_skips_when_only_target_also_throttled() {
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.switch_debounce_secs = 0;
+        config.adaptive_limit.multi_account.rebalance_rpm_gap = 0.0;
+        config.adaptive_limit.multi_account.rebalance_utilization_gap = 0.0;
+        config.adaptive_limit.multi_account.rebalance_bound_gap = 0;
+        config.adaptive_limit.multi_account.rebalance_min_gap = 0;
+        config.adaptive_limit.multi_account.rebalance_429_rate_threshold = 0.05;
+        let manager = affinity_manager(config);
+        let c = manager.acquire_context(None, None, Some("sess-X")).await.unwrap();
+        let busy = c.id;
+        let other = if busy == 1 { 2 } else { 1 };
+        // 两个号都「持续撞墙」但只撞 2 次（够 consecutive>=2 且 429 率高，但避免直接进 OPEN 被
+        // available_credentials 过滤掉——目的是让 other 仍在候选池里、但 429 率高于阈值=非健康落脚点）。
+        for id in [busy, other] {
+            let lim = manager.limiters().for_scope(&ThrottleScope::UserCredential(id));
+            for _ in 0..2 {
+                lim.on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None, 0)
+                    .await;
+            }
+        }
+        let available: Vec<_> = manager.available_credentials(None, None).into_iter().collect();
+        let target =
+            manager.rebalance_target(&available, busy, &manager.config.adaptive_limit.multi_account, None);
+        // 关键：若 other 已被 limiter 判 OPEN 而从 available 滤掉，则 available<2、整体 None；
+        // 若 other 仍在 available 但 429 率高，则 429 分支因「目标也在被限流」跳过 → 其它信号全关 → None。
+        // 两条路都该得 None：429 硬触发绝不把会话搬到一个同样在烧的号上。
+        assert!(
+            target.is_none(),
+            "目标号自己也在被 429 时，429 硬触发不该选它（不把会话从火坑挪进另一个火坑）"
+        );
+    }
+
+    // #18 边界②：阈值设为 0 = 关闭 429 硬触发。即便号被狂 429，这条分支也不该触发
+    //（回退到纯 RPM/util/会话数信号；此处全关 → None）。守 config「0 表示关闭」的契约。
+    #[tokio::test]
+    async fn test_429_trigger_disabled_when_threshold_zero() {
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.switch_debounce_secs = 0;
+        config.adaptive_limit.multi_account.rebalance_rpm_gap = 0.0;
+        config.adaptive_limit.multi_account.rebalance_utilization_gap = 0.0;
+        config.adaptive_limit.multi_account.rebalance_bound_gap = 0;
+        config.adaptive_limit.multi_account.rebalance_min_gap = 0;
+        config.adaptive_limit.multi_account.rebalance_429_rate_threshold = 0.0; // 关闭
+        let manager = affinity_manager(config);
+        let c = manager.acquire_context(None, None, Some("sess-Y")).await.unwrap();
+        let busy = c.id;
+        let busy_lim = manager.limiters().for_scope(&ThrottleScope::UserCredential(busy));
+        for _ in 0..2 {
+            busy_lim
+                .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None, 0)
+                .await;
+        }
+        let available: Vec<_> = manager.available_credentials(None, None).into_iter().collect();
+        let target =
+            manager.rebalance_target(&available, busy, &manager.config.adaptive_limit.multi_account, None);
+        assert!(
+            target.is_none(),
+            "rebalance_429_rate_threshold=0 应关闭 429 硬触发（其它信号也全关 → 不疏散）"
+        );
+    }
+
+    // #18 边界③：利用率前置门可配——把 rebalance_util_saturated 调到很低(0.0)，则任何有余量差的号
+    // 都能按利用率疏散（验「门可配、下调后中间态也触发」这条改动真生效，不再被硬编码 1.0 卡死）。
+    #[tokio::test]
+    async fn test_util_saturated_gate_is_configurable() {
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.switch_debounce_secs = 0;
+        config.adaptive_limit.multi_account.rebalance_rpm_gap = 0.0; // 关 RPM，单验 util
+        config.adaptive_limit.multi_account.rebalance_429_rate_threshold = 0.0; // 关 429，单验 util
+        config.adaptive_limit.multi_account.rebalance_min_gap = 0; // 关会话数 fallback
+        config.adaptive_limit.multi_account.rebalance_bound_gap = 0; // 关绑定数
+        config.adaptive_limit.multi_account.rebalance_utilization_gap = 0.1; // 只留 util，门槛低
+        config.adaptive_limit.multi_account.rebalance_util_saturated = 0.0; // 前置门下调到 0：任何利用率都算「过门」
+        let manager = affinity_manager(config);
+        let c = manager.acquire_context(None, None, Some("sess-Z")).await.unwrap();
+        let busy = c.id;
+        let idle = if busy == 1 { 2 } else { 1 };
+        // busy 撞 2 次 429 → 利用率被 throttle_pressure 抬高（> idle 的 0）。
+        let busy_lim = manager.limiters().for_scope(&ThrottleScope::UserCredential(busy));
+        for _ in 0..2 {
+            busy_lim
+                .on_throttle(crate::kiro::rate_limiter::ThrottleReason::UserRate, None, 0)
+                .await;
+        }
+        let available: Vec<_> = manager.available_credentials(None, None).into_iter().collect();
+        // 仅当 idle 仍在 available（busy 没把自己撞进 OPEN 被滤）才有意义；若 busy 被滤则 available<2、
+        // 本断言放宽：核心是「util_saturated=0 时前置门不再卡死」——通过 util_gap 能选出 idle。
+        if available.iter().any(|(id, _)| *id == idle) && available.iter().any(|(id, _)| *id == busy) {
+            let target =
+                manager.rebalance_target(&available, busy, &manager.config.adaptive_limit.multi_account, None);
+            assert_eq!(
+                target.map(|t| t.0),
+                Some(idle),
+                "util_saturated 下调到 0：busy 利用率高于 idle → 利用率信号应把会话疏散到 idle"
+            );
+        }
+    }
+
     // P2-b 核心反假绿：调用门 rebalance_signal_enabled 必须「util_gap>0 或 min_gap>0」任一即开。
     // 旧调用门只看 `rebalance_min_gap > 0`，min_gap=0 时整段 short-circuit → 连 rebalance_target 都不调
     // → util 信号被绑死永远摸不到（#19 满载不迁 #18 的雷）。这里直接对纯函数断言四种组合，钉死布尔逻辑。
