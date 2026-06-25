@@ -21,6 +21,12 @@ WebUI（`src/admin-ui/src/components/`，编进 binary 的 rust_embed `admin-ui/
 
 不做：不改 overflow-on-busy 既有逻辑（与 429 硬触发分层互补：overflow 走整-Thread 逃离三门全满，本信号走更轻的中间态疏散）；不动 Pin 写入/查询链路；不碰 push/重启/换 live（owner 红线）。
 
+## 追加根治（2026-06-25，owner 拍板「最根治」后）
+上面 429 硬触发让「被压垮的号」能自愈疏散，但 2026-06-25 live 实测又暴露两个本 change 域内的真问题，按 owner「永远要最根治」一并根治：
+
+1. **churn：同一会话在多号间无限横跳**（owner 实测「8 分钟切 8+ 次号、rpm=0/cd=0」）。真根因：`rebalance_tick` 受害者选择按「`last_seen` 最老」挑，而 `last_seen` 只由真实请求(`select_with_affinity`)刷新、搬号(`scheduler_rebalance` 落定处)**不刷新** → 被搬过的死睡眠会话永远是「最老 last_seen」候选 → 每过 `switch_debounce_secs` 又被挑 → #a→#b→#c→#a 环;单槽 `last_evicted_from` 只挡 2 号乒乓挡不住 ≥3 号环。根治(不变式)：温和均衡只搬「从没搬过(`last_switch_at`=None)」或「搬后又真干过活(`last_seen` 晚于 `last_switch_at`)」的会话——victim 选择新增门 `last_switch_at.is_some() && last_seen <= last_switch_at` 即跳过。一刀根除 3 个 churn 向量,不冻结真实负载迁移、不误伤 429 紧急疏散、不影响睡眠堆首次散开。
+2. **观测页吞吐显示假绿**（owner 问「这计算准嘛」查出）：顶部「总吞吐」+卡里「当前 rps」= `currentRateRps` = 限速器 `state.rate_rps`(**允许速率上限/容量**,非真流量) → 截图里它正好=Safe rps、系统空闲也显示「29 rps 很忙」。根治(接真实数据源,非改文案)：后端早有 `goodput_rps`(窗口内成功请求/秒=真吞吐,已 populate)但 TS 接口/normalize 没暴露、页面没用。补 `goodputRps`/`appLimited` 字段直达前端;顶部「总吞吐」→「实测吞吐」=Σ goodputRps 并旁标「(容量上限 N rps)」=Σ currentRateRps;卡里「当前 rps」拆成「实测吞吐」(goodputRps)+「速率上限」(currentRateRps),Safe rps/RPM 保留。
+
 ## Impact
 - 受影响：`src/kiro/token_manager.rs`(429 硬触发信号 + 候选排序 + account_429_rate_sustained helper + 测试隔离修)、`src/model/config.rs`(2 新字段 + rpmGap 默认)、live `config/config.json`、`src/admin-ui/src/components/{topbar-tools,observability-page}.tsx`。
 - 风险：低。429 硬触发有 consecutive>=2 + switch_debounce 防 churn；新 config 字段无 `deny_unknown_fields`、旧 binary 误读不崩；阈值改 live 配置重启即生效不必重编（但源码默认也已同步）。
