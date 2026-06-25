@@ -846,6 +846,12 @@ struct AffinityBinding {
     /// 仅 overflow/OPEN 强制切号可破例清除它。None=从未被搬走。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_evicted_from: Option<u64>,
+    /// 最近若干跳被「温和均衡 / cd 自愿切号」搬走时的**来源号环形历史**（最新在尾）。
+    /// 根治「单槽 last_evicted_from 只挡 A→B→A、挡不住 A→B→C→…→A 长环」：温和均衡选 target 时
+    /// 排除**整段**最近来源 → 会话不会绕回任何刚离开的号。上限 = pool_len-1（见 push_recent_evicted），
+    /// 满了淘汰最旧。仅 overflow/OPEN「被迫逃」破例清空（同 last_evicted_from 语义）。空=从未自愿搬过。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    recent_evicted_from: Vec<u64>,
 }
 
 /// 观测面板：单个号的运行态快照。
@@ -2253,7 +2259,7 @@ impl MultiTokenManager {
         let mut candidates: Vec<(u64, u64, bool, usize)> = Vec::new();
         for (src, _) in &pool {
             if let Some((target, _)) =
-                self.rebalance_target_excl(&pool, *src, ma, None, &exclusive_owned)
+                self.rebalance_target_excl(&pool, *src, ma, &[], &exclusive_owned)
             {
                 // 被 429 压垮的号「成功 RPM」往往很低（请求大多失败），若只按 RPM 排序会被沉到队尾、
                 // 被高 RPM 但健康的号挤掉本 tick 的疏散名额——而「正在被限流」恰恰最该先救。
@@ -2332,7 +2338,8 @@ impl MultiTokenManager {
                     b.credential_id = target;
                     b.last_switch_at = Some(now);
                     b.last_switch_was_overflow = false;
-                    b.last_evicted_from = Some(src);
+                    // 环形历史(根治 ≥3 号环):排除整段最近来源,cap=除当前号外所有号。
+                    Self::push_recent_evicted(b, src, pool.len().saturating_sub(1));
                     drop(aff);
                     self.save_affinity_debounced();
                     Self::log_select(
@@ -2565,6 +2572,27 @@ impl MultiTokenManager {
             || ma.rebalance_min_gap > 0
     }
 
+    /// 把「自愿搬迁的来源号 `src`」压进会话的环形驱逐历史 `recent_evicted_from`（最新在尾）。
+    /// 根治 ≥3 号环：温和均衡/cd 自愿切号选 target 时排除**整段**历史 → 会话不绕回任何刚离开的号。
+    /// 上限 = `cap`（调用方传 pool_len-1，即「除当前号外所有号」——满了说明已走遍全部号、
+    /// 再不清就无处可去，故淘汰最旧那跳，保留最近 cap 跳）。同时镜像更新单槽 `last_evicted_from`
+    /// （= 最近一跳）以兼容仍读单槽的旧逻辑（如 exclusive_tick 的 exclude_bounce）。
+    fn push_recent_evicted(b: &mut AffinityBinding, src: u64, cap: usize) {
+        b.last_evicted_from = Some(src); // 兼容旧单槽读者
+        b.recent_evicted_from.retain(|&x| x != src); // 去重：同号只留最近一次
+        b.recent_evicted_from.push(src);
+        let cap = cap.max(1);
+        while b.recent_evicted_from.len() > cap {
+            b.recent_evicted_from.remove(0); // 淘汰最旧
+        }
+    }
+
+    /// 清空环形驱逐历史（+ 单槽）——「被迫逃」(overflow/OPEN/禁用) 时调用，原号恢复后允许回去。
+    fn clear_recent_evicted(b: &mut AffinityBinding) {
+        b.last_evicted_from = None;
+        b.recent_evicted_from.clear();
+    }
+
     /// 被动负载再平衡：若 `current` 号的活跃会话数比最空号多 ≥ `rebalance_min_gap`，
     /// 返回应迁往的最空号（排除 `current`）；否则 `None`（不迁，保持黏定）。
     /// 滞后阈值(≥2)+ 调用方的防抖保证迁移后不会 A↔B 反复横跳。
@@ -2573,7 +2601,7 @@ impl MultiTokenManager {
         available: &[(u64, KiroCredentials)],
         current: u64,
         ma: &crate::model::config::MultiAccountConfig,
-        exclude_evicted: Option<u64>,
+        exclude_evicted: &[u64],
     ) -> Option<(u64, KiroCredentials)> {
         // 兼容旧调用（无独享归属号视图）：转发到带排除集的全量版本。
         let empty: std::collections::HashSet<u64> = std::collections::HashSet::new();
@@ -2587,7 +2615,7 @@ impl MultiTokenManager {
         available: &[(u64, KiroCredentials)],
         current: u64,
         ma: &crate::model::config::MultiAccountConfig,
-        exclude_evicted: Option<u64>,
+        exclude_evicted: &[u64],
         exclude_owned: &std::collections::HashSet<u64>,
     ) -> Option<(u64, KiroCredentials)> {
         if available.len() < 2 {
@@ -2603,7 +2631,7 @@ impl MultiTokenManager {
             if let Some((tid, tcreds)) = available
                 .iter()
                 .filter(|(id, _)| *id != current)
-                .filter(|(id, _)| Some(*id) != exclude_evicted)
+                .filter(|(id, _)| !exclude_evicted.contains(id))
                 .filter(|(id, _)| !exclude_owned.contains(id))
                 .filter(|(id, _)| !self.is_account_open(*id))
                 .min_by(|(a, _), (b, _)| {
@@ -2628,7 +2656,7 @@ impl MultiTokenManager {
             if let Some((tid, tcreds)) = available
                 .iter()
                 .filter(|(id, _)| *id != current)
-                .filter(|(id, _)| Some(*id) != exclude_evicted)
+                .filter(|(id, _)| !exclude_evicted.contains(id))
                 .filter(|(id, _)| !exclude_owned.contains(id))
                 .filter(|(id, _)| !self.is_account_open(*id))
                 .min_by_key(|(id, _)| (self.rpm(*id), *id))
@@ -2653,7 +2681,7 @@ impl MultiTokenManager {
                 if let Some((tid, tcreds)) = available
                     .iter()
                     .filter(|(id, _)| *id != current)
-                    .filter(|(id, _)| Some(*id) != exclude_evicted)
+                    .filter(|(id, _)| !exclude_evicted.contains(id))
                     .filter(|(id, _)| !exclude_owned.contains(id))
                     .filter(|(id, _)| !self.is_account_open(*id))
                     .min_by(|(a, _), (b, _)| {
@@ -2679,7 +2707,7 @@ impl MultiTokenManager {
             if let Some(target) = available
                 .iter()
                 .filter(|(id, _)| *id != current)
-                .filter(|(id, _)| Some(*id) != exclude_evicted)
+                .filter(|(id, _)| !exclude_evicted.contains(id))
                 .filter(|(id, _)| !exclude_owned.contains(id))
                 .filter(|(id, _)| !self.is_account_open(*id))
                 .min_by_key(|(id, c)| (*bcounts.get(id).unwrap_or(&0), c.priority, *id))
@@ -2701,7 +2729,7 @@ impl MultiTokenManager {
         let target = available
             .iter()
             .filter(|(id, _)| *id != current)
-            .filter(|(id, _)| Some(*id) != exclude_evicted)
+            .filter(|(id, _)| !exclude_evicted.contains(id))
             .filter(|(id, _)| !exclude_owned.contains(id))
             .filter(|(id, _)| !self.is_account_open(*id))
             .min_by_key(|(id, c)| (*counts.get(id).unwrap_or(&0), c.priority, *id))?;
@@ -3092,7 +3120,7 @@ impl MultiTokenManager {
                                 pick_pool,
                                 b.credential_id,
                                 ma,
-                                b.last_evicted_from,
+                                &b.recent_evicted_from,
                                 &owned_excl,
                             )
                         } else {
@@ -3163,6 +3191,7 @@ impl MultiTokenManager {
                                 last_switch_was_overflow: false,
                                 priority: bind_priority,
                                 last_evicted_from: None,
+                                recent_evicted_from: Vec::new(),
                             },
                         );
                     }
@@ -3179,6 +3208,7 @@ impl MultiTokenManager {
                         last_switch_was_overflow: switch_is_overflow,
                         priority: bind_priority,
                         last_evicted_from: None,
+                        recent_evicted_from: Vec::new(),
                     });
                     e.credential_id = chosen.0;
                     e.last_switch_at = Some(now);
@@ -3194,9 +3224,11 @@ impl MultiTokenManager {
                         // 决策→落定之间原号熔断可能恰好恢复，重读会把「被迫逃」误判成「自愿」、错装 60s 防回弹）。
                         let old_unavailable = switch_is_overflow || forced_unavailable;
                         if old != chosen.0 && !old_unavailable {
-                            e.last_evicted_from = Some(old);
+                            // 自愿搬迁:压进环形历史(根治 ≥3 号环),cap=除当前号外所有号。
+                            Self::push_recent_evicted(e, old, all_available.len().saturating_sub(1));
                         } else if old_unavailable {
-                            e.last_evicted_from = None;
+                            // 被迫逃:清空整段历史(原号恢复后允许回去)。
+                            Self::clear_recent_evicted(e);
                         }
                     }
                 }
@@ -3245,6 +3277,7 @@ impl MultiTokenManager {
                                 last_switch_was_overflow: false,
                                 priority: bind_priority,
                                 last_evicted_from: None,
+                                recent_evicted_from: Vec::new(),
                             },
                         );
                     }
@@ -7052,7 +7085,7 @@ mod tests {
             &available,
             busy,
             &manager.config.adaptive_limit.multi_account,
-            None,
+            &[],
         );
         assert!(
             target.is_some(),
@@ -7106,7 +7139,7 @@ mod tests {
             &available,
             busy,
             &manager.config.adaptive_limit.multi_account,
-            None,
+            &[],
         );
         assert!(
             target.is_some(),
@@ -7146,7 +7179,7 @@ mod tests {
         }
         let available: Vec<_> = manager.available_credentials(None, None).into_iter().collect();
         let target =
-            manager.rebalance_target(&available, busy, &manager.config.adaptive_limit.multi_account, None);
+            manager.rebalance_target(&available, busy, &manager.config.adaptive_limit.multi_account, &[]);
         // 关键：若 other 已被 limiter 判 OPEN 而从 available 滤掉，则 available<2、整体 None；
         // 若 other 仍在 available 但 429 率高，则 429 分支因「目标也在被限流」跳过 → 其它信号全关 → None。
         // 两条路都该得 None：429 硬触发绝不把会话搬到一个同样在烧的号上。
@@ -7178,7 +7211,7 @@ mod tests {
         }
         let available: Vec<_> = manager.available_credentials(None, None).into_iter().collect();
         let target =
-            manager.rebalance_target(&available, busy, &manager.config.adaptive_limit.multi_account, None);
+            manager.rebalance_target(&available, busy, &manager.config.adaptive_limit.multi_account, &[]);
         assert!(
             target.is_none(),
             "rebalance_429_rate_threshold=0 应关闭 429 硬触发（其它信号也全关 → 不疏散）"
@@ -7213,7 +7246,7 @@ mod tests {
         // 本断言放宽：核心是「util_saturated=0 时前置门不再卡死」——通过 util_gap 能选出 idle。
         if available.iter().any(|(id, _)| *id == idle) && available.iter().any(|(id, _)| *id == busy) {
             let target =
-                manager.rebalance_target(&available, busy, &manager.config.adaptive_limit.multi_account, None);
+                manager.rebalance_target(&available, busy, &manager.config.adaptive_limit.multi_account, &[]);
             assert_eq!(
                 target.map(|t| t.0),
                 Some(idle),
@@ -7301,7 +7334,7 @@ mod tests {
             &available,
             busy,
             &manager.config.adaptive_limit.multi_account,
-            None,
+            &[],
         );
         assert!(
             target.is_some(),
@@ -7407,6 +7440,7 @@ mod tests {
                     last_switch_was_overflow: false,
                     priority: 0,
                     last_evicted_from: None,
+                    recent_evicted_from: Vec::new(),
                 },
             );
         }
@@ -7901,6 +7935,7 @@ mod tests {
                 last_switch_was_overflow: false,
                 priority: 0,
                 last_evicted_from: None,
+                recent_evicted_from: Vec::new(),
             },
         );
     }
@@ -7918,6 +7953,7 @@ mod tests {
                 last_switch_was_overflow: false,
                 priority: prio,
                 last_evicted_from: None,
+                recent_evicted_from: Vec::new(),
             },
         );
     }
@@ -7997,6 +8033,7 @@ mod tests {
                     last_switch_was_overflow: false,
                     priority: 0,
                     last_evicted_from: Some(2),
+                    recent_evicted_from: vec![2],
                 },
             );
         }
@@ -8032,6 +8069,7 @@ mod tests {
                     last_switch_was_overflow: false,
                     priority: 0,
                     last_evicted_from: None, // 防回弹槽空 → 旧逻辑唯一拦不住它的
+                    recent_evicted_from: Vec::new(),
                 },
             );
             // #1 再堆 4 个普通睡眠(没搬过)，凑出 bound_gap≥4 让 #1 成疏散源；它们 last_seen 较新。
@@ -8046,6 +8084,7 @@ mod tests {
                         last_switch_was_overflow: false,
                         priority: 0,
                         last_evicted_from: None,
+                        recent_evicted_from: Vec::new(),
                     },
                 );
             }
@@ -8081,6 +8120,7 @@ mod tests {
                     last_switch_was_overflow: false,
                     priority: 0,
                     last_evicted_from: None,
+                    recent_evicted_from: Vec::new(),
                 },
             );
             // 再堆 4 个睡眠会话到 #1 凑出 bound_gap≥4，使 #1 成疏散源。
@@ -8095,6 +8135,7 @@ mod tests {
                         last_switch_was_overflow: false,
                         priority: 0,
                         last_evicted_from: None,
+                        recent_evicted_from: Vec::new(),
                     },
                 );
             }
@@ -8102,6 +8143,102 @@ mod tests {
         // 至少应能疏散(不被「搬后无活动」门挡住的有：4 个未搬睡眠 + 这个搬后有活动的都可搬)。
         let moved = m.rebalance_tick();
         assert_eq!(moved, 1, "源过载时仍应疏散 1 个(根治不冻结真实可搬会话)");
+    }
+
+    // ②⁗ select-time「单槽 last_evicted_from 挡不住 ≥3 号环」根因证明(确定性,非 false-green)。
+    //    owner live 日志实测:同一会话 511 次切号、走遍 9 号、80 次 A→B→C→A 三号环。机制=select-time
+    //    每请求把 rebalance_target_excl 的 exclude_evicted 只设为「上一次来源」(单槽 last_evicted_from),
+    //    9 号下长环每跳 target≠单槽值 → 全放行。本测试用 5 号 + 模拟「select-time 链式调用只排除上一跳」
+    //    复现这个环:源永远是「会话数最多」的号,每跳只排除上一个来源 → 必然 A→B→C→D→E→A 绕环。
+    //    断言:6 跳内出现「回到已访问过的号」(环),证明单槽不够;修复(多跳环形记忆)落地后此测试该改成断言「不绕环」。
+    #[test]
+    fn test_select_time_multihop_evict_history_breaks_ring() {
+        // 5 号 manager(纯靠 token 数撑起 available pool)。
+        let mut config = Config::default();
+        config.adaptive_limit.multi_account.enabled = true;
+        config.adaptive_limit.multi_account.rebalance_min_gap = 1; // 会话数差≥1 即可迁(便于确定性)
+        let m = MultiTokenManager::new(
+            config,
+            vec![
+                grouped_cred("t1", &[]),
+                grouped_cred("t2", &[]),
+                grouped_cred("t3", &[]),
+                grouped_cred("t4", &[]),
+                grouped_cred("t5", &[]),
+            ],
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let ma = &m.config.adaptive_limit.multi_account;
+        let pool = m.available_credentials(None, None);
+        assert!(pool.len() >= 5, "需要 5 号 pool 才能演示 ≥3 号环");
+        // 模拟 select-time 每请求链式搬迁:cur 永远是「会话数最多」的过载源(每跳把全部会话塞到 cur),
+        // 把「来源号」按修复后的环形历史(push_recent_evicted, cap=pool_len-1)累积、整段传给
+        // rebalance_target_excl 当 exclude——这正是修复后 select-time 走的路。
+        // 根治前传的是单槽(只排上一跳)→ 会绕环;根治后传整段历史 → 走遍号后无处可去即停,绝不绕回。
+        let empty = std::collections::HashSet::new();
+        let cap = pool.len().saturating_sub(1);
+        let mut path = vec![1u64];
+        let mut history: Vec<u64> = Vec::new(); // = 会话的 recent_evicted_from
+        for _ in 0..8 {
+            let cur = *path.last().unwrap();
+            // 让 cur 成为「会话数最多」源:全部会话塞 cur(每跳重建 affinity)。
+            {
+                let mut aff = m.affinity.lock();
+                aff.clear();
+                for k in 0..3 {
+                    aff.insert(
+                        format!("filler-{cur}-{k}"),
+                        AffinityBinding {
+                            credential_id: cur,
+                            bound_at: Utc::now(),
+                            last_seen: Utc::now(),
+                            last_switch_at: None,
+                            last_switch_was_overflow: false,
+                            priority: 0,
+                            last_evicted_from: history.last().copied(),
+                            recent_evicted_from: history.clone(),
+                        },
+                    );
+                }
+            }
+            match m.rebalance_target_excl(&pool, cur, ma, &history, &empty) {
+                Some((tgt, _)) => {
+                    path.push(tgt);
+                    // 落定:把来源 cur 压进环形历史(同 push_recent_evicted 逻辑:去重 + cap)。
+                    history.retain(|&x| x != cur);
+                    history.push(cur);
+                    let c = cap.max(1);
+                    while history.len() > c {
+                        history.remove(0);
+                    }
+                }
+                None => break, // 走遍号、无处可去 → 停(=环被打断,正是根治目标)
+            }
+        }
+        // 检测环:path 里是否出现「回到先前访问过的号」。
+        let mut seen = std::collections::HashSet::new();
+        let mut ring_at = None;
+        for (i, &id) in path.iter().enumerate() {
+            if !seen.insert(id) {
+                ring_at = Some(i);
+                break;
+            }
+        }
+        // 根治断言:传整段环形历史后,轨迹绝不回到任何已访问号(环被打断)。
+        // 没有环 = ring_at == None。根治前(单槽)此处会是 Some(...)。
+        assert!(
+            ring_at.is_none(),
+            "churn 根治:多跳环形历史应打断 ≥3 号环,但轨迹 {path:?} 仍回到了已访问号(环没断)"
+        );
+        // 旁证:确实走了几跳(不是 0 跳就停=没在测真东西),且最终因「无处可去」收敛停下。
+        assert!(path.len() >= 3, "应至少搬几跳才停(轨迹 {path:?})");
+        assert!(
+            path.len() <= pool.len(),
+            "走遍号后应停,不该超过号数(轨迹 {path:?} = 还在绕)"
+        );
     }
 
     // ③ Pin 凌驾一切：被 pin 的会话即便在过载号上，也不被巡检搬走。
@@ -8335,6 +8472,7 @@ mod tests {
             last_switch_was_overflow: false,
             priority: 3,
             last_evicted_from: Some(2),
+            recent_evicted_from: vec![2],
         };
         let json = serde_json::to_string(&b).unwrap();
         let back: AffinityBinding = serde_json::from_str(&json).unwrap();
