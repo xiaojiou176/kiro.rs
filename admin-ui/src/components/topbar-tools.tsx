@@ -12,7 +12,6 @@ import { Switch } from '@/components/ui/switch'
 import {
   Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter, DialogDescription,
 } from '@/components/ui/dialog'
-import { useConfirm } from '@/components/ui/confirm-dialog'
 import {
   DropdownMenu, DropdownMenuTrigger, DropdownMenuContent,
   DropdownMenuItem, DropdownMenuLabel,
@@ -38,7 +37,6 @@ interface TopbarToolsProps {
 
 export function TopbarTools({ compact = false }: TopbarToolsProps) {
   const queryClient = useQueryClient()
-  const confirm = useConfirm()
   const { data: loadBalancingData, isLoading: isLoadingMode } = useLoadBalancingMode()
   const { mutate: setLoadBalancingMode, isPending: isSettingMode } = useSetLoadBalancingMode()
   const { data: throttleConfig, isLoading: isLoadingThrottle } = useAccountThrottleConfig()
@@ -58,21 +56,11 @@ export function TopbarTools({ compact = false }: TopbarToolsProps) {
     toast.success('已刷新')
   }
 
-  const handleToggleLoadBalancing = async () => {
+  const handleToggleLoadBalancing = () => {
     const cur = loadBalancingData?.mode || 'priority'
     const next = cur === 'priority' ? 'balanced' : 'priority'
-    const curLabel = cur === 'priority' ? '优先级模式' : '均衡负载模式'
-    const nextLabel = next === 'priority' ? '优先级模式' : '均衡负载模式'
-    // 二次确认：避免被当成导航 Tab 误触，直接改掉 live 选号策略。
-    const ok = await confirm({
-      title: '切换负载均衡模式',
-      description: `即将把负载均衡模式从「${curLabel}」切换到「${nextLabel}」，这会影响所有 Thread 的选号策略，确定吗？`,
-      confirmText: `切换到${nextLabel}`,
-      cancelText: '取消',
-    })
-    if (!ok) return
     setLoadBalancingMode(next, {
-      onSuccess: () => toast.success(`已切换到${nextLabel}`),
+      onSuccess: () => toast.success(`已切换到${next === 'priority' ? '优先级模式' : '均衡负载模式'}`),
       onError: (err) => toast.error(`切换失败: ${extractErrorMessage(err)}`),
     })
   }
@@ -252,7 +240,7 @@ interface ToolControls {
 function FullTools({ controls }: { controls: ToolControls }) {
   return (
     <>
-      <LoadBalancingSwitch controls={controls} />
+      <LoadBalancingButton controls={controls} />
       <ThrottleConfigButton
         config={controls.throttleConfig}
         loading={controls.isLoadingThrottle}
@@ -312,26 +300,24 @@ function CompactTools({ controls }: { controls: ToolControls }) {
   )
 }
 
-function LoadBalancingSwitch({ controls }: { controls: ToolControls }) {
-  const loading = controls.isLoadingMode
-  const isBalanced = controls.loadBalancingMode === 'balanced'
-  const modeText = loading ? '加载中…' : isBalanced ? '均衡负载' : '优先级'
+function LoadBalancingButton({ controls }: { controls: ToolControls }) {
   return (
-    // 明确的开关控件：带边框 + 文字标签 + Switch，一眼区别于左侧导航 Tab，避免误触。
-    <div
-      className="flex h-8 items-center gap-2 rounded-md border border-input bg-background px-2.5 text-[13px]"
-      title="切换负载均衡模式（切换前需二次确认）"
+    <Button
+      variant="outline"
+      size="sm"
+      onClick={controls.handleToggleLoadBalancing}
+      disabled={controls.isLoadingMode || controls.isSettingMode}
+      title="切换负载均衡模式"
     >
-      <Activity className="h-3.5 w-3.5 text-muted-foreground" />
-      <span className="hidden font-medium md:inline">负载均衡</span>
-      <span className="hidden text-muted-foreground md:inline">{modeText}</span>
-      <Switch
-        aria-label="切换负载均衡模式"
-        checked={isBalanced}
-        disabled={loading || controls.isSettingMode}
-        onCheckedChange={() => controls.handleToggleLoadBalancing()}
-      />
-    </div>
+      <Activity className="h-3.5 w-3.5" />
+      <span className="hidden md:inline">
+        {controls.isLoadingMode
+          ? '加载中…'
+          : controls.loadBalancingMode === 'priority'
+            ? '优先级'
+            : '均衡负载'}
+      </span>
+    </Button>
   )
 }
 

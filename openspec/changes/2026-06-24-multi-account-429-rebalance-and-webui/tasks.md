@@ -13,7 +13,7 @@
 - [x] cargo test --release 619 passed / 0 failed；全量连跑 3 次 0 flaky
 
 ## WebUI 四件（#19-22）
-- [x] #19 topbar-tools.tsx：模式切换改 Switch + useConfirm 二次确认
+- [⮌] #19 topbar-tools.tsx：~~模式切换改 Switch + useConfirm 二次确认~~ **已回退**（owner 决定不要此改动）：还原原 `LoadBalancingButton`（导航 Tab 样按钮、点一下直接切、无确认），不在顶栏做开关/确认。
 - [x] #20 observability-page.tsx：失衡(429率>5%/inflight满)标红 + 置顶 + 全局健康变色
 - [x] #21 observability-page.tsx：孤儿 Pin 折叠态加解绑按钮(调既有 unpin 端点)
 - [x] #22 observability-page.tsx：账号卡会话 chip 接 Thread 真名映射

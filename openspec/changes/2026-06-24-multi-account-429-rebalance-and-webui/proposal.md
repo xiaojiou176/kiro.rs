@@ -16,7 +16,7 @@ kiro-rs 调度（`src/kiro/token_manager.rs` + `src/model/config.rs` + live `con
 - 利用率前置门从硬编码 `1.0` 改为可配 `rebalance_util_saturated`（默认 0.8）。
 
 WebUI（`src/admin-ui/src/components/`，编进 binary 的 rust_embed `admin-ui/dist`）：
-- topbar-tools.tsx：模式切换改 `Switch` 控件 + `useConfirm` 二次确认（防误触改 live 策略）。
+- ~~topbar-tools.tsx：模式切换改 `Switch` 控件 + `useConfirm` 二次确认~~ **⮌ 已回退**（owner 决定不要此改动）：还原原 `LoadBalancingButton`、不在顶栏做开关/确认。本 change 的 WebUI 净改动只剩 observability-page.tsx 三件（#20/#21/#22）。
 - observability-page.tsx：失衡判定（429率>5% 或 inflight 占满）→ 账号卡标红 + 失衡置顶 + 全局健康行变黄/红；孤儿 Pin 折叠态加「解绑」按钮（调既有 unpin 端点 + 自动刷新）；账号卡会话 chip 接 Thread 真名映射、回退 shortSessionId。
 
 不做：不改 overflow-on-busy 既有逻辑（与 429 硬触发分层互补：overflow 走整-Thread 逃离三门全满，本信号走更轻的中间态疏散）；不动 Pin 写入/查询链路；不碰 push/重启/换 live（owner 红线）。
