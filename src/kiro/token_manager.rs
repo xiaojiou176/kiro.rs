@@ -2540,7 +2540,9 @@ impl MultiTokenManager {
                             vb.credential_id = dest;
                             vb.last_switch_at = Some(now);
                             vb.last_switch_was_overflow = false;
-                            vb.last_evicted_from = Some(target);
+                            // priority==0 squatter 被独享赶走 → 它仍受温和均衡管,须记进**整段**环形历史
+                            // (同 push_recent_evicted),否则被赶走后又会绕回 target/已访问号(≥3 号环漏洞)。
+                            Self::push_recent_evicted(vb, target, pool.len().saturating_sub(1));
                             drop(aff);
                             self.save_affinity_debounced();
                             Self::log_select(
